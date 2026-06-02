@@ -1,0 +1,14 @@
+# macOS
+.DS_Store
+
+# agentmux runtime directory (per docs/spec)
+.agentmux/
+
+# Rust (planned workspace)
+/target/
+**/*.rs.bk
+
+# Editor / local
+*.swp
+.idea/
+.vscode/
