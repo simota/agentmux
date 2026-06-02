@@ -1,0 +1,14 @@
+erDiagram
+  PROJECT ||--o{ TASK : has
+  TASK ||--o{ AGENT_SESSION : runs
+  TASK ||--o{ MESSAGE : contains
+  TASK ||--o{ CONTEXT_ITEM : contains
+  TASK ||--o{ WORKTREE : owns
+  TASK ||--o{ ARTIFACT : produces
+  TASK ||--o{ APPROVAL : requires
+  AGENT_SESSION ||--o{ MESSAGE : sends_receives
+  AGENT_SESSION ||--o| WORKTREE : owns
+  MESSAGE }o--o{ CONTEXT_ITEM : references
+  MESSAGE }o--o{ ARTIFACT : references
+  CONTEXT_ITEM }o--o{ ARTIFACT : references
+  WORKTREE ||--o{ ARTIFACT : produces

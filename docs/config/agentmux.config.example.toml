@@ -1,0 +1,80 @@
+[project]
+name = "example"
+root = "."
+default_branch = "main"
+
+[daemon]
+socket_path = "$XDG_RUNTIME_DIR/agentmux/agentmux.sock"
+log_level = "info"
+
+[tui]
+prefix_key = "Ctrl-g"
+status_line = true
+show_agent_overlay = true
+scrollback_lines = 10000
+
+[terminal]
+term = "xterm-256color"
+truecolor = true
+initial_cols = 120
+initial_rows = 40
+
+[automation]
+level = "AutoPrompt"
+auto_inject_messages = true
+auto_approve_safe_prompts = false
+auto_approve_file_edits = false
+auto_approve_shell_commands = false
+auto_full_access = false
+human_input_quiet_ms = 2500
+
+[policy]
+allow_read_only_commands = "Ask"
+allow_workspace_write = "Ask"
+allow_test_commands = "Ask"
+allow_network = "Deny"
+allow_git_commit = "Ask"
+allow_git_push = "Deny"
+allow_delete_files = "Ask"
+allow_secret_access = "Deny"
+allow_full_access = "Deny"
+
+[policy.protected_paths]
+paths = [
+  ".git/**",
+  ".agentmux/state.db",
+  ".agentmux/events.jsonl",
+  ".env",
+  "**/*secret*",
+  "**/*credential*"
+]
+
+[context]
+max_inline_chars = 4000
+max_mailbox_file_bytes = 1048576
+redact_secrets = true
+summarize_before_share = true
+
+[providers.claude]
+enabled = true
+command = "claude"
+supports_hooks = true
+startup_prompt = true
+
+[providers.codex]
+enabled = true
+command = "codex"
+supports_slash_commands = true
+startup_prompt = true
+
+[test]
+default_command = "cargo test"
+
+[team.claude-codex]
+agents = [
+  { name = "planner", provider = "claude", role = "planner", worktree = "main" },
+  { name = "impl-codex", provider = "codex", role = "implementer", worktree = "dedicated" },
+  { name = "impl-claude", provider = "claude", role = "implementer", worktree = "dedicated" },
+  { name = "tester", provider = "shell", role = "tester", worktree = "target" },
+  { name = "reviewer", provider = "codex", role = "reviewer", worktree = "readonly" }
+]

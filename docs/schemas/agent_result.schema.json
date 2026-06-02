@@ -1,0 +1,131 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentmux.local/schemas/agent_result.schema.json",
+  "title": "AGENTMUX_RESULT",
+  "type": "object",
+  "required": ["status", "summary"],
+  "additionalProperties": false,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["completed", "blocked", "needs_input", "failed", "cancelled"]
+    },
+    "summary": {
+      "type": "string",
+      "minLength": 1
+    },
+    "changed_files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "messages": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/outgoing_message" },
+      "default": []
+    },
+    "context_updates": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/context_update" },
+      "default": []
+    },
+    "needs": {
+      "type": "array",
+      "items": { "type": "string" },
+      "default": []
+    },
+    "next": {
+      "type": "string",
+      "description": "Suggested next route. Examples: tester, reviewer, user, none."
+    },
+    "recommendation": {
+      "type": "string",
+      "enum": ["approve", "request_changes", "needs_tests", "continue", "none"]
+    },
+    "risk": {
+      "type": "string",
+      "enum": ["low", "medium", "high", "unknown"]
+    }
+  },
+  "$defs": {
+    "outgoing_message": {
+      "type": "object",
+      "required": ["to", "kind", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "to": { "type": "string" },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "TaskAssignment",
+            "Question",
+            "Finding",
+            "PatchProposal",
+            "ReviewComment",
+            "TestResult",
+            "FailureReport",
+            "Decision",
+            "Handoff",
+            "ApprovalRequest",
+            "ContextUpdate",
+            "StatusProbe"
+          ]
+        },
+        "body": { "type": "string" },
+        "priority": {
+          "type": "string",
+          "enum": ["low", "normal", "high", "urgent"],
+          "default": "normal"
+        },
+        "context_refs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "artifact_refs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        }
+      }
+    },
+    "context_update": {
+      "type": "object",
+      "required": ["kind", "title", "body"],
+      "additionalProperties": false,
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "ProjectSummary",
+            "ArchitectureNote",
+            "CodingRule",
+            "TaskBrief",
+            "FileReference",
+            "DiffSummary",
+            "TestResult",
+            "ErrorLog",
+            "AgentFinding",
+            "Decision",
+            "Risk",
+            "OpenQuestion",
+            "HandoffSummary"
+          ]
+        },
+        "title": { "type": "string" },
+        "body": { "type": "string" },
+        "tags": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": []
+        },
+        "confidence": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "default": 0.8
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentmux.local/schemas/event_log.schema.json",
+  "title": "agentmux JSONL event",
+  "type": "object",
+  "required": ["id", "ts", "type", "payload"],
+  "additionalProperties": false,
+  "properties": {
+    "id": { "type": "string" },
+    "ts": { "type": "string", "format": "date-time" },
+    "type": { "type": "string" },
+    "project_id": { "type": "string" },
+    "task_id": { "type": "string" },
+    "agent_id": { "type": "string" },
+    "payload": { "type": "object" }
+  }
+}

@@ -1,0 +1,29 @@
+sequenceDiagram
+  participant U as User
+  participant C as Client
+  participant D as Daemon
+  participant P as Planner
+  participant I as Implementer
+  participant T as Tester
+  participant R as Reviewer
+
+  U->>C: agentmux task run "..."
+  C->>D: task.run
+  D->>D: create task/team/worktrees
+  D->>P: spawn claude PTY
+  D->>I: spawn codex/claude PTY
+  D->>T: spawn shell PTY
+  D->>R: spawn reviewer PTY
+  D->>P: paste planner prompt
+  P-->>D: AGENTMUX_RESULT plan
+  D->>D: parse result / create messages
+  D->>I: inject TaskAssignment
+  I-->>D: AGENTMUX_RESULT implementation
+  D->>D: capture diff artifact
+  D->>T: inject TestRequest
+  T-->>D: AGENTMUX_RESULT test result
+  D->>D: create TestResult context
+  D->>R: inject ReviewRequest with diff/test paths
+  R-->>D: AGENTMUX_RESULT review
+  D-->>C: final summary event
+  C-->>U: show recommendation

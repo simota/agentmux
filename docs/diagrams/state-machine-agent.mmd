@@ -1,0 +1,24 @@
+stateDiagram-v2
+  [*] --> Starting
+  Starting --> InteractiveReady
+  InteractiveReady --> AwaitingInput
+  AwaitingInput --> RunningTurn: prompt injected / human input
+  RunningTurn --> RunningCommand: agent runs tool/command
+  RunningCommand --> AwaitingApproval: approval requested
+  AwaitingApproval --> RunningCommand: approved
+  AwaitingApproval --> NeedsHuman: rejected or unknown
+  RunningCommand --> CompletedTurn: AGENTMUX_RESULT
+  RunningTurn --> CompletedTurn: AGENTMUX_RESULT
+  CompletedTurn --> AwaitingInput
+  AwaitingInput --> Stalled: timeout uncertain
+  RunningTurn --> Stalled: no activity
+  Stalled --> AwaitingInput: status probe response
+  Stalled --> NeedsHuman: no response
+  NeedsHuman --> AwaitingInput: human resolved
+  Starting --> Failed
+  RunningTurn --> Failed
+  RunningCommand --> Failed
+  AwaitingInput --> Exited
+  RunningTurn --> Exited
+  Exited --> [*]
+  Failed --> [*]

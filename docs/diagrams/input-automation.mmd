@@ -1,0 +1,13 @@
+flowchart TD
+  MSG[Message queued] --> RENDER[Render handoff prompt]
+  RENDER --> SAFETY[Classify input safety]
+  SAFETY --> POLICY{Policy allows?}
+  POLICY -- No --> APPROVAL[Approval Queue]
+  POLICY -- Yes --> READY{Agent likely awaiting input?}
+  READY -- No --> WAIT[Wait / inbox]
+  READY -- Yes --> LOCK{Input lock available?}
+  LOCK -- No --> WAIT
+  LOCK -- Yes --> PASTE[Bracketed paste]
+  PASTE --> ENTER[Optional Enter]
+  ENTER --> EVENT[Write event log]
+  EVENT --> DONE[Delivery status = Delivered]

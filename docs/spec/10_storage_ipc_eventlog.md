@@ -1,0 +1,262 @@
+# 10. Storage / IPC / Event Log設計書
+
+## 1. 目的
+
+agentmuxはdaemonがruntime stateを保持しつつ、metadata、message、context、approval、artifact index、event logを永続化する。本書はSQLite schema、JSONL event log、IPC protocolの設計を定義する。
+
+## 2. 永続化方針
+
+### 2.1 SQLiteに保存するもの
+
+- project
+- task
+- agent session metadata
+- pane layout metadata
+- message
+- context item
+- artifact metadata
+- worktree metadata
+- approval request
+- provider config snapshot
+
+### 2.2 JSONL event logに保存するもの
+
+- 状態遷移
+- 自動入力
+- message delivery
+- context共有
+- approval decision
+- agent result
+- policy denial
+- errors
+
+### 2.3 ファイルとして保存するもの
+
+- artifact body
+- diff patch
+- test log
+- transcript tail
+- mailbox file
+- context bundle
+
+## 3. SQLite schema
+
+DDLは `sql/schema.sql` を参照。
+
+## 4. Migration
+
+`schema_migrations` tableを用意する。
+
+```sql
+CREATE TABLE schema_migrations (
+  version INTEGER PRIMARY KEY,
+  name TEXT NOT NULL,
+  applied_at TEXT NOT NULL
+);
+```
+
+v0.1では単純なembedded migrationsでよい。
+
+## 5. Event Log
+
+### 5.1 形式
+
+1行1JSON。
+
+```json
+{"ts":"2026-06-02T10:00:00Z","type":"task.created","task_id":"task_...","payload":{}}
+```
+
+### 5.2 共通field
+
+```json
+{
+  "id": "evt_...",
+  "ts": "2026-06-02T10:00:00Z",
+  "type": "message.injected",
+  "project_id": "proj_...",
+  "task_id": "task_...",
+  "agent_id": "agent_...",
+  "payload": {}
+}
+```
+
+### 5.3 必須event types
+
+- daemon.started
+- client.attached
+- task.created
+- task.status_changed
+- agent.spawned
+- agent.status_signal
+- agent.status_changed
+- pty.output_chunk
+- terminal.snapshot_saved
+- input_script.created
+- input_script.injected
+- message.created
+- message.delivered
+- context.created
+- mailbox.written
+- artifact.created
+- approval.created
+- approval.decided
+- worktree.created
+- worktree.diff_captured
+- policy.denied
+- error
+
+## 6. IPC Protocol
+
+v0.1はJSON Lines over Unix domain socket。
+
+### 6.1 Request
+
+```json
+{
+  "id": "req_001",
+  "type": "task.run",
+  "payload": {
+    "project_path": ".",
+    "body": "refresh token bugを修正",
+    "team": "claude-codex"
+  }
+}
+```
+
+### 6.2 Response
+
+```json
+{
+  "id": "req_001",
+  "ok": true,
+  "payload": {
+    "task_id": "task_123"
+  }
+}
+```
+
+### 6.3 Event
+
+```json
+{
+  "type": "screen.diff",
+  "payload": {
+    "pane_id": "pane_...",
+    "regions": []
+  }
+}
+```
+
+## 7. IPC Commands
+
+### 7.1 Session/attach
+
+- daemon.status
+- client.attach
+- client.detach
+- layout.get
+- layout.set
+
+### 7.2 Task
+
+- task.run
+- task.pause
+- task.resume
+- task.cancel
+- task.status
+
+### 7.3 Agent
+
+- agent.spawn
+- agent.stop
+- agent.interrupt
+- agent.focus
+- agent.send_input_script
+- agent.snapshot
+
+### 7.4 Message
+
+- message.create
+- message.inject
+- message.list
+- message.show
+
+### 7.5 Context
+
+- context.create
+- context.search
+- context.attach
+- context.inject
+- context.export
+
+### 7.6 Approval
+
+- approval.list
+- approval.approve
+- approval.reject
+
+## 8. Screen diff配信
+
+v0.1では以下のいずれかでよい。
+
+1. pane全体snapshot配信
+2. dirty region配信
+3. terminal bufferをdaemonに保持しclientがpull
+
+推奨初期実装:
+
+- daemonはTerminalBufferを保持。
+- client attach時にsnapshotを受け取る。
+- 更新時はpane全体またはdirty linesを送る。
+
+## 9. Store writer
+
+SQLite writeは専用taskでserializeする。
+
+理由:
+
+- 複数componentからの書き込み競合を避ける。
+- event logとの順序を保ちやすい。
+- backpressureを制御しやすい。
+
+## 10. Consistency
+
+- event logをappendしてからSQLite state更新、またはその逆を統一する。
+- v0.1では「SQLite stateが正、event logが監査用」とする。
+- 将来、event sourcing寄りへ移行可能。
+
+## 11. IPC versioning
+
+各request/eventにprotocol versionを持たせるか、connection handshakeでversionを交渉する。
+
+```json
+{"type":"hello","payload":{"client_version":"0.1.0","protocol":"1"}}
+```
+
+## 12. Error response
+
+```json
+{
+  "id": "req_123",
+  "ok": false,
+  "error": {
+    "code": "AGENT_NOT_FOUND",
+    "message": "agent 'impl-codex' not found",
+    "hint": "agentmux agent ls"
+  }
+}
+```
+
+## 13. File paths
+
+推奨path:
+
+```text
+config: ~/.config/agentmux/config.toml
+runtime socket: $XDG_RUNTIME_DIR/agentmux/agentmux.sock
+project state: <project>/.agentmux/state.db
+project events: <project>/.agentmux/events.jsonl
+```
+
+project-local stateを使うことで、task/context/artifactsをrepository単位で扱いやすくする。ただし`.agentmux`はgitignore必須。

@@ -1,0 +1,44 @@
+flowchart TB
+  Client[agentmux TUI client]
+  IPC[JSONL IPC over Unix socket]
+  Daemon[agentmux daemon]
+
+  subgraph D[Daemon components]
+    SM[Session Manager]
+    PM[Pane Manager]
+    PTY[PTY Supervisor]
+    TERM[Terminal Engine]
+    INPUT[Input Automation Engine]
+    DETECT[Agent State Detector]
+    MSG[Message Bus]
+    CTX[Context Broker]
+    WT[Worktree Manager]
+    POL[Approval/Policy Engine]
+    STORE[SQLite Store]
+    LOG[JSONL Event Log]
+  end
+
+  subgraph AG[Agent processes]
+    Claude[Claude Code TUI]
+    Codex[Codex TUI]
+    Shell[Shell/Test Runner]
+  end
+
+  Client <--> IPC <--> Daemon
+  Daemon --> SM
+  Daemon --> PM
+  Daemon --> PTY
+  PTY <--> Claude
+  PTY <--> Codex
+  PTY <--> Shell
+  PTY --> TERM
+  TERM --> DETECT
+  DETECT --> MSG
+  MSG --> INPUT
+  CTX --> MSG
+  WT --> CTX
+  POL --> INPUT
+  STORE --- SM
+  STORE --- MSG
+  STORE --- CTX
+  LOG --- Daemon
