@@ -1,0 +1,14 @@
+[package]
+name    = "agentmux-ipc"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Request/response/event protocol, JSONL framing, and protocol versioning for agentmux IPC"
+
+[dependencies]
+agentmux-core = { workspace = true }
+serde         = { workspace = true }
+serde_json    = { workspace = true }
+tokio         = { workspace = true }

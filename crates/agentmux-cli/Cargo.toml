@@ -1,0 +1,19 @@
+[package]
+name    = "agentmux-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentmux CLI — user-facing command-line interface and TUI client entry point"
+
+[[bin]]
+name = "agentmux"
+path = "src/main.rs"
+
+[dependencies]
+agentmux-core = { workspace = true }
+agentmux-ipc  = { workspace = true }
+agentmux-tui  = { workspace = true }
+clap          = { workspace = true }
+tokio         = { workspace = true }

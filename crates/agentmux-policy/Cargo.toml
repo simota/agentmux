@@ -1,0 +1,12 @@
+[package]
+name    = "agentmux-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Automation level, approval policy, command classification, and safety guardrails for agentmux"
+
+[dependencies]
+agentmux-core = { workspace = true }
+serde         = { workspace = true }

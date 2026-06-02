@@ -1,0 +1,12 @@
+[package]
+name    = "agentmux-context"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ContextItem CRUD, context pack selection, mailbox file writer, and redaction for agentmux"
+
+[dependencies]
+agentmux-core = { workspace = true }
+serde         = { workspace = true }

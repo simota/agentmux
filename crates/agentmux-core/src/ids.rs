@@ -1,0 +1,64 @@
+//! Prefix-tagged ID newtypes for all domain entities.
+//!
+//! IDs are based on ULID (Universally Unique Lexicographically Sortable
+//! Identifiers), which gives us time-ordering and human-readable prefixes
+//! for log readability (e.g. `proj_01J...`, `task_01J...`).
+//!
+//! Each newtype wraps a `ulid::Ulid` and serialises as `"<prefix><ulid>"`.
+//!
+//! #TODO(agent): add Display / FromStr impls with prefix validation once
+//!               the string format is confirmed final.
+
+use serde::{Deserialize, Serialize};
+use ulid::Ulid;
+
+macro_rules! define_id {
+    ($name:ident, $prefix:literal) => {
+        #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+        pub struct $name(pub Ulid);
+
+        impl $name {
+            /// Generate a new random ID.
+            pub fn new() -> Self {
+                Self(Ulid::new())
+            }
+
+            /// Return the human-readable prefix string (e.g. `"proj_"`).
+            pub const fn prefix() -> &'static str {
+                $prefix
+            }
+        }
+
+        impl Default for $name {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "{}{}", $prefix, self.0)
+            }
+        }
+    };
+}
+
+define_id!(ProjectId,       "proj_");
+define_id!(TaskId,          "task_");
+define_id!(AgentSessionId,  "agent_");
+define_id!(PaneId,          "pane_");
+define_id!(MessageId,       "msg_");
+define_id!(ContextItemId,   "ctx_");
+define_id!(ArtifactId,      "art_");
+define_id!(ApprovalId,      "appr_");
+define_id!(WorktreeId,      "wt_");
+define_id!(PtyId,           "pty_");
+define_id!(TerminalBufferId,"tbuf_");
+define_id!(ClientSessionId, "csess_");
+define_id!(InboxId,         "inbox_");
+define_id!(ContextScopeId,  "cscope_");
+define_id!(InputScriptId,   "iscript_");
+define_id!(JobId,           "job_");
+define_id!(ClientId,        "client_");
+// Generic actor reference used in audit fields (human or orchestrator).
+define_id!(ActorId,         "actor_");

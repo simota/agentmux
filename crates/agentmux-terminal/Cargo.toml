@@ -1,0 +1,12 @@
+[package]
+name    = "agentmux-terminal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ANSI/VT parser integration, screen grid, scrollback, and dirty-region tracking for agentmux"
+
+[dependencies]
+agentmux-core = { workspace = true }
+vte           = { workspace = true }

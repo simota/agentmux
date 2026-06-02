@@ -1,0 +1,25 @@
+[package]
+name    = "agentmux-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "agentmux daemon — owns all agent state, PTY lifecycle, IPC, and persistence"
+
+[[bin]]
+name = "agentmux-daemon"
+path = "src/main.rs"
+
+[dependencies]
+agentmux-core     = { workspace = true }
+agentmux-ipc      = { workspace = true }
+agentmux-pty      = { workspace = true }
+agentmux-terminal = { workspace = true }
+agentmux-agent    = { workspace = true }
+agentmux-message  = { workspace = true }
+agentmux-context  = { workspace = true }
+agentmux-worktree = { workspace = true }
+agentmux-store    = { workspace = true }
+agentmux-policy   = { workspace = true }
+tokio             = { workspace = true }

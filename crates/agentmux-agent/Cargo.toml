@@ -1,0 +1,15 @@
+[package]
+name    = "agentmux-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "AgentSession management, provider adapters, status detection, and result-marker parser"
+
+[dependencies]
+agentmux-core     = { workspace = true }
+agentmux-pty      = { workspace = true }
+agentmux-terminal = { workspace = true }
+async-trait       = { workspace = true }
+serde             = { workspace = true }

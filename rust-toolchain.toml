@@ -1,0 +1,6 @@
+[toolchain]
+channel = "stable"
+# Pinned to a known-good stable release as of 2026-06.
+# Bump when MSRV in Cargo.toml is raised.
+# #TODO(agent): update to latest stable before first release
+components = ["rustfmt", "clippy"]

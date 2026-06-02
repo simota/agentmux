@@ -1,0 +1,12 @@
+[package]
+name    = "agentmux-message"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Typed message bus, inbox, delivery queue, and prompt renderer for agentmux"
+
+[dependencies]
+agentmux-core = { workspace = true }
+serde         = { workspace = true }

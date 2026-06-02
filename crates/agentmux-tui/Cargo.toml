@@ -1,0 +1,13 @@
+[package]
+name    = "agentmux-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ratatui layout, pane rendering, keymap, and overlays for the agentmux TUI client"
+
+[dependencies]
+agentmux-core = { workspace = true }
+ratatui       = { workspace = true }
+crossterm     = { workspace = true }

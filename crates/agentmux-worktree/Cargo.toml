@@ -1,0 +1,15 @@
+[package]
+name    = "agentmux-worktree"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Git worktree wrapper, branch naming, and diff artifact capture for agentmux"
+
+[dependencies]
+agentmux-core = { workspace = true }
+serde         = { workspace = true }
+# No libgit2 / git2 dependency for v0.1 — git operations are shelled out
+# via std::process::Command. Re-evaluate in v0.2.
+# #TODO(agent): consider git2 or gitoxide once shell-out proves too fragile

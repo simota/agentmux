@@ -1,0 +1,83 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agentmux-cli",
+    "crates/agentmux-daemon",
+    "crates/agentmux-core",
+    "crates/agentmux-ipc",
+    "crates/agentmux-pty",
+    "crates/agentmux-terminal",
+    "crates/agentmux-tui",
+    "crates/agentmux-agent",
+    "crates/agentmux-message",
+    "crates/agentmux-context",
+    "crates/agentmux-worktree",
+    "crates/agentmux-store",
+    "crates/agentmux-policy",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shingoimota/agentmux"
+
+# ---------------------------------------------------------------------------
+# Shared dependency versions — all member crates reference these via
+# `{ workspace = true }` so version bumps happen in one place.
+# ---------------------------------------------------------------------------
+[workspace.dependencies]
+# ── Internal crates ─────────────────────────────────────────────────────────
+agentmux-core    = { path = "crates/agentmux-core" }
+agentmux-ipc     = { path = "crates/agentmux-ipc" }
+agentmux-pty     = { path = "crates/agentmux-pty" }
+agentmux-terminal = { path = "crates/agentmux-terminal" }
+agentmux-tui     = { path = "crates/agentmux-tui" }
+agentmux-agent   = { path = "crates/agentmux-agent" }
+agentmux-message = { path = "crates/agentmux-message" }
+agentmux-context = { path = "crates/agentmux-context" }
+agentmux-worktree = { path = "crates/agentmux-worktree" }
+agentmux-store   = { path = "crates/agentmux-store" }
+agentmux-policy  = { path = "crates/agentmux-policy" }
+
+# ── Serialization ────────────────────────────────────────────────────────────
+serde      = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+
+# ── Error handling ───────────────────────────────────────────────────────────
+thiserror = { version = "2.0" }
+
+# ── IDs ──────────────────────────────────────────────────────────────────────
+# ulid provides prefix-friendly sortable IDs (ULIDs).
+# #TODO(agent): evaluate if uuid v7 is preferred once ecosystem matures.
+ulid = { version = "1.1", features = ["serde"] }
+
+# ── Time ─────────────────────────────────────────────────────────────────────
+time = { version = "0.3", features = ["serde", "serde-well-known", "macros"] }
+
+# ── Async runtime ────────────────────────────────────────────────────────────
+tokio = { version = "1.44", features = ["full"] }
+
+# ── Async trait ──────────────────────────────────────────────────────────────
+async-trait = { version = "0.1" }
+
+# ── PTY ──────────────────────────────────────────────────────────────────────
+# portable-pty provides cross-platform PTY creation.
+# #TODO(agent): verify portable-pty 0.8 is the latest stable on crates.io.
+portable-pty = { version = "0.8" }
+
+# ── Terminal parsing ─────────────────────────────────────────────────────────
+# vte is a widely-used VT/ANSI parser; alacritty uses it.
+vte = { version = "0.13" }
+
+# ── TUI ──────────────────────────────────────────────────────────────────────
+ratatui   = { version = "0.29" }
+crossterm = { version = "0.28" }
+
+# ── Storage ──────────────────────────────────────────────────────────────────
+# rusqlite with bundled SQLite so no system libsqlite3 dep is required.
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+clap = { version = "4.5", features = ["derive"] }
