@@ -84,6 +84,7 @@ pub struct TuiSessionState {
     layout: PaneLayout,
     default_terminal_size: TerminalSize,
     last_event: Option<IpcEventKind>,
+    keybinding_help_visible: bool,
 }
 
 impl Default for TuiSessionState {
@@ -99,6 +100,7 @@ impl TuiSessionState {
             layout: PaneLayout::new(split_direction),
             default_terminal_size: TerminalSize::default(),
             last_event: None,
+            keybinding_help_visible: false,
         }
     }
 
@@ -132,6 +134,10 @@ impl TuiSessionState {
 
     pub fn last_event(&self) -> Option<&IpcEventKind> {
         self.last_event.as_ref()
+    }
+
+    pub fn keybinding_help_visible(&self) -> bool {
+        self.keybinding_help_visible
     }
 
     pub fn focus_next(&mut self) {
@@ -174,6 +180,10 @@ impl TuiSessionState {
                 .unwrap_or(CommandEffect::Continue),
             TuiCommand::RotateLayout => {
                 self.layout.toggle_split_direction();
+                CommandEffect::Continue
+            }
+            TuiCommand::Help => {
+                self.keybinding_help_visible = !self.keybinding_help_visible;
                 CommandEffect::Continue
             }
             TuiCommand::Detach => CommandEffect::Detach,
@@ -739,8 +749,14 @@ mod tests {
         assert_eq!(state.apply_command(TuiCommand::Quit), CommandEffect::Quit);
         assert_eq!(
             state.apply_command(TuiCommand::Help),
-            CommandEffect::Unhandled(TuiCommand::Help)
+            CommandEffect::Continue
         );
+        assert!(state.keybinding_help_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::Help),
+            CommandEffect::Continue
+        );
+        assert!(!state.keybinding_help_visible());
     }
 
     #[test]

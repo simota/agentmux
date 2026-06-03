@@ -145,7 +145,7 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Char('A') => Some(TuiCommand::ShowApprovalQueue),
         KeyCode::Char('%') => Some(TuiCommand::SplitVertical),
         KeyCode::Char('"') => Some(TuiCommand::SplitHorizontal),
-        KeyCode::Char('x') => Some(TuiCommand::Quit),
+        KeyCode::Char('x') => Some(TuiCommand::ClosePane),
         KeyCode::Char('r') => Some(TuiCommand::ResizeMode),
         KeyCode::Char(' ') => Some(TuiCommand::RotateLayout),
         KeyCode::Char('p') => Some(TuiCommand::PasteQueuedMessage),
@@ -237,6 +237,16 @@ mod tests {
     }
 
     #[test]
+    fn prefixed_question_mark_maps_to_help_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Help));
+    }
+
+    #[test]
     fn bare_q_is_forwarded_to_focused_pane() {
         let mut dispatcher = KeymapDispatcher::default();
 
@@ -246,13 +256,13 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_x_maps_to_quit_command() {
+    fn prefixed_x_maps_to_close_pane_command() {
         let mut dispatcher = KeymapDispatcher::default();
         dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
 
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('x'), KeyModifiers::NONE));
 
-        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Quit));
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ClosePane));
     }
 
     #[test]
