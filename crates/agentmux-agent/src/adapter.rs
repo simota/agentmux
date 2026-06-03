@@ -9,10 +9,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use agentmux_core::{
-    AgentProvider, AgentRole, ProjectId, TaskId,
-    error::Result,
-};
+use agentmux_core::{AgentProvider, AgentRole, ProjectId, TaskId, error::Result};
 use agentmux_pty::TerminalSize;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -88,7 +85,28 @@ pub struct InputScript {
     pub id: agentmux_core::InputScriptId,
     pub target_agent_id: agentmux_core::AgentSessionId,
     pub reason: String,
+    pub preconditions: Vec<InputPrecondition>,
     pub actions: Vec<InputAction>,
+    pub safety: InputSafety,
+    pub created_at: agentmux_core::DateTimeUtc,
+}
+
+/// A precondition that must hold before automated input is sent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputPrecondition {
+    AgentIdle,
+    InputLockAvailable,
+    QuietFor(std::time::Duration),
+}
+
+/// Coarse safety classification for automated input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InputSafety {
+    Safe,
+    NeedsApproval,
+    Dangerous,
 }
 
 /// Atomic input action the adapter can send to the PTY.
@@ -133,27 +151,16 @@ pub trait InteractiveAgentAdapter: Send + Sync {
     /// Send an `InputScript` (sequence of key actions) to the agent's PTY.
     ///
     /// Callers must hold the input lock before calling this method.
-    async fn send_input_script(
-        &self,
-        handle: &AgentHandle,
-        script: InputScript,
-    ) -> Result<()>;
+    async fn send_input_script(&self, handle: &AgentHandle, script: InputScript) -> Result<()>;
 
     /// Send a SIGINT (Ctrl-C) to interrupt a running command within the agent.
     async fn interrupt(&self, handle: &AgentHandle) -> Result<()>;
 
     /// Notify the agent's PTY of a terminal resize.
-    async fn resize(
-        &self,
-        handle: &AgentHandle,
-        size: TerminalSize,
-    ) -> Result<()>;
+    async fn resize(&self, handle: &AgentHandle, size: TerminalSize) -> Result<()>;
 
     /// Capture a point-in-time screenshot of the agent's terminal screen.
-    async fn snapshot_screen(
-        &self,
-        handle: &AgentHandle,
-    ) -> Result<ScreenSnapshot>;
+    async fn snapshot_screen(&self, handle: &AgentHandle) -> Result<ScreenSnapshot>;
 
     /// Analyse a screen snapshot and produce `StateSignal`s.
     ///

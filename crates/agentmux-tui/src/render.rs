@@ -1,4 +1,221 @@
-//! Pane and view rendering — stub.
-//!
-//! #TODO(agent): implement AgentPaneRenderer (mirrors ScreenGrid → ratatui buffer)
-//! #TODO(agent): implement InternalView renderers (MessageBus, ContextBoard, …)
+//! Pane and view rendering.
+
+use agentmux_terminal::{CellStyle, CellWidth, ScreenGrid, TerminalColor};
+use ratatui::{
+    buffer::Buffer,
+    layout::Rect,
+    style::{Color, Modifier, Style},
+    widgets::{Block, Borders, Widget},
+};
+
+/// Border/status metadata for an agent pane.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PaneChrome {
+    pub title: String,
+    pub focused: bool,
+}
+
+impl PaneChrome {
+    pub fn new(title: impl Into<String>) -> Self {
+        Self {
+            title: title.into(),
+            focused: false,
+        }
+    }
+
+    pub fn focused(mut self, focused: bool) -> Self {
+        self.focused = focused;
+        self
+    }
+}
+
+/// Renders a terminal `ScreenGrid` into a ratatui `Buffer`.
+#[derive(Clone, Debug, Default)]
+pub struct AgentPaneRenderer;
+
+impl AgentPaneRenderer {
+    pub fn render(&self, area: Rect, grid: &ScreenGrid, chrome: &PaneChrome, buffer: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let block_style = if chrome.focused {
+            Style::default().fg(Color::Cyan)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .title(chrome.title.as_str())
+            .border_style(block_style);
+        let inner = block.inner(area);
+        block.render(area, buffer);
+
+        self.render_grid(inner, grid, buffer);
+    }
+
+    pub fn render_grid(&self, area: Rect, grid: &ScreenGrid, buffer: &mut Buffer) {
+        if area.width == 0 || area.height == 0 {
+            return;
+        }
+
+        let rows = area.height.min(grid.rows());
+        let cols = area.width.min(grid.cols());
+
+        for row in 0..rows {
+            for col in 0..cols {
+                let Some(cell) = grid.cell(row, col) else {
+                    continue;
+                };
+
+                let x = area.x + col;
+                let y = area.y + row;
+                if let Some(target) = buffer.cell_mut((x, y)) {
+                    if cell.width == CellWidth::WideContinuation {
+                        target.set_symbol(" ");
+                    } else {
+                        target.set_char(cell.ch);
+                    }
+                    target.set_style(to_ratatui_style(&cell.style));
+                }
+            }
+        }
+
+        let cursor = grid.cursor();
+        if cursor.visible && cursor.row < rows && cursor.col < cols {
+            if let Some(cell) = buffer.cell_mut((area.x + cursor.col, area.y + cursor.row)) {
+                cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+            }
+        }
+    }
+}
+
+pub fn to_ratatui_style(style: &CellStyle) -> Style {
+    let mut out = Style::default();
+
+    if let Some(fg) = style.fg {
+        out = out.fg(to_ratatui_color(fg));
+    }
+    if let Some(bg) = style.bg {
+        out = out.bg(to_ratatui_color(bg));
+    }
+
+    let mut modifiers = Modifier::empty();
+    if style.bold {
+        modifiers |= Modifier::BOLD;
+    }
+    if style.italic {
+        modifiers |= Modifier::ITALIC;
+    }
+    if style.underline {
+        modifiers |= Modifier::UNDERLINED;
+    }
+    if style.reverse {
+        modifiers |= Modifier::REVERSED;
+    }
+    if style.dim {
+        modifiers |= Modifier::DIM;
+    }
+
+    out.add_modifier(modifiers)
+}
+
+pub fn to_ratatui_color(color: TerminalColor) -> Color {
+    match color {
+        TerminalColor::Indexed(index) => Color::Indexed(index),
+        TerminalColor::Rgb { r, g, b } => Color::Rgb(r, g, b),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agentmux_terminal::{CellStyle, TerminalColor};
+
+    #[test]
+    fn render_grid_copies_characters_and_styles() {
+        let mut grid = ScreenGrid::new(2, 4);
+        let style = CellStyle {
+            fg: Some(TerminalColor::Indexed(2)),
+            bg: Some(TerminalColor::Rgb { r: 1, g: 2, b: 3 }),
+            bold: true,
+            ..CellStyle::default()
+        };
+        grid.write_char('A', style);
+        grid.write_char('B', CellStyle::default());
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+        AgentPaneRenderer.render_grid(Rect::new(0, 0, 4, 2), &grid, &mut buffer);
+
+        let first = buffer.cell((0, 0)).expect("first cell");
+        assert_eq!(first.symbol(), "A");
+        assert_eq!(first.fg, Color::Indexed(2));
+        assert_eq!(first.bg, Color::Rgb(1, 2, 3));
+        assert!(first.modifier.contains(Modifier::BOLD));
+        assert_eq!(buffer.cell((1, 0)).expect("second cell").symbol(), "B");
+    }
+
+    #[test]
+    fn render_pane_draws_border_title_and_inner_grid() {
+        let mut grid = ScreenGrid::new(1, 3);
+        for ch in "abc".chars() {
+            grid.write_char(ch, CellStyle::default());
+        }
+
+        let area = Rect::new(0, 0, 8, 3);
+        let mut buffer = Buffer::empty(area);
+        let chrome = PaneChrome::new("impl-codex | AwaitingInput").focused(true);
+
+        AgentPaneRenderer.render(area, &grid, &chrome, &mut buffer);
+
+        assert_eq!(buffer.cell((0, 0)).expect("top-left border").symbol(), "┌");
+        assert_eq!(buffer.cell((1, 1)).expect("inner a").symbol(), "a");
+        assert_eq!(buffer.cell((2, 1)).expect("inner b").symbol(), "b");
+        assert_eq!(buffer.cell((3, 1)).expect("inner c").symbol(), "c");
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "i" && cell.fg == Color::Cyan)
+        );
+    }
+
+    #[test]
+    fn visible_cursor_is_rendered_as_reversed_cell() {
+        let mut grid = ScreenGrid::new(1, 3);
+        grid.write_char('x', CellStyle::default());
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 3, 1));
+        AgentPaneRenderer.render_grid(Rect::new(0, 0, 3, 1), &grid, &mut buffer);
+
+        assert!(
+            buffer
+                .cell((1, 0))
+                .expect("cursor cell")
+                .modifier
+                .contains(Modifier::REVERSED)
+        );
+    }
+
+    #[test]
+    fn terminal_style_conversion_maps_flags_and_colors() {
+        let style = CellStyle {
+            fg: Some(TerminalColor::Rgb { r: 9, g: 8, b: 7 }),
+            bg: Some(TerminalColor::Indexed(12)),
+            italic: true,
+            underline: true,
+            reverse: true,
+            dim: true,
+            ..CellStyle::default()
+        };
+
+        let converted = to_ratatui_style(&style);
+
+        assert_eq!(converted.fg, Some(Color::Rgb(9, 8, 7)));
+        assert_eq!(converted.bg, Some(Color::Indexed(12)));
+        assert!(converted.add_modifier.contains(Modifier::ITALIC));
+        assert!(converted.add_modifier.contains(Modifier::UNDERLINED));
+        assert!(converted.add_modifier.contains(Modifier::REVERSED));
+        assert!(converted.add_modifier.contains(Modifier::DIM));
+    }
+}

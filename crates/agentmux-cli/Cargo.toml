@@ -11,9 +11,17 @@ description = "agentmux CLI — user-facing command-line interface and TUI clien
 name = "agentmux"
 path = "src/main.rs"
 
+[[bin]]
+name = "agentmux-poc"
+path = "src/bin/agentmux-poc.rs"
+
 [dependencies]
 agentmux-core = { workspace = true }
 agentmux-ipc  = { workspace = true }
+agentmux-pty  = { workspace = true }
+agentmux-store = { workspace = true }
 agentmux-tui  = { workspace = true }
 clap          = { workspace = true }
+crossterm     = { workspace = true }
+serde_json    = { workspace = true }
 tokio         = { workspace = true }

@@ -9,14 +9,14 @@
 //! Inline vs mailbox split is governed by `max_inline_chars` from config
 //! (ADR-0005). Short items go inline in the prompt; long items go to a
 //! file whose path is embedded in the handoff prompt.
-//!
-//! #TODO(agent): implement ContextBroker struct with CRUD operations
-//! #TODO(agent): implement mailbox file writer
-//! #TODO(agent): implement basic redaction (regex-based secret scrubbing)
 
+pub mod broker;
 pub mod item;
 
+pub use broker::{
+    ContextBroker, ContextPack, ContextPackRequest, ContextUpdate, MailboxConfig, NewContextItem,
+};
 pub use item::ContextItem;
 // ContextKind lives in agentmux-core; re-export for callers that only
 // depend on agentmux-context.
-pub use agentmux_core::ContextKind;
+pub use agentmux_core::{ContextKind, ContextScope, ContextSource, Visibility};

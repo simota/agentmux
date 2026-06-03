@@ -66,6 +66,7 @@ async-trait = { version = "0.1" }
 # portable-pty provides cross-platform PTY creation.
 # #TODO(agent): verify portable-pty 0.8 is the latest stable on crates.io.
 portable-pty = { version = "0.8" }
+libc = { version = "0.2" }
 
 # ── Terminal parsing ─────────────────────────────────────────────────────────
 # vte is a widely-used VT/ANSI parser; alacritty uses it.

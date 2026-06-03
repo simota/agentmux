@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 
 use agentmux_core::{
-    ArtifactId, ContextItemId, ContextKind, ContextScope, ContextSource,
-    DateTimeUtc, ProjectId, TaskId, Visibility,
+    ArtifactId, ContextItemId, ContextKind, ContextScope, ContextSource, DateTimeUtc, ProjectId,
+    TaskId, Visibility,
 };
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// Context items are the primary mechanism for sharing information between
 /// agents without coupling them directly.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ContextItem {
     pub id: ContextItemId,
     pub project_id: ProjectId,

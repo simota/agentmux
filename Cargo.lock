@@ -7,10 +7,14 @@ name = "agentmux-agent"
 version = "0.1.0"
 dependencies = [
  "agentmux-core",
+ "agentmux-message",
  "agentmux-pty",
  "agentmux-terminal",
  "async-trait",
  "serde",
+ "serde_json",
+ "time",
+ "tokio",
 ]
 
 [[package]]
@@ -19,8 +23,12 @@ version = "0.1.0"
 dependencies = [
  "agentmux-core",
  "agentmux-ipc",
+ "agentmux-pty",
+ "agentmux-store",
  "agentmux-tui",
  "clap",
+ "crossterm",
+ "serde_json",
  "tokio",
 ]
 
@@ -56,7 +64,9 @@ dependencies = [
  "agentmux-store",
  "agentmux-terminal",
  "agentmux-worktree",
+ "serde_json",
  "tokio",
+ "ulid",
 ]
 
 [[package]]
@@ -90,6 +100,7 @@ name = "agentmux-pty"
 version = "0.1.0"
 dependencies = [
  "agentmux-core",
+ "libc",
  "portable-pty",
  "serde",
  "tokio",
@@ -103,6 +114,8 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "time",
+ "ulid",
 ]
 
 [[package]]
@@ -118,6 +131,7 @@ name = "agentmux-tui"
 version = "0.1.0"
 dependencies = [
  "agentmux-core",
+ "agentmux-terminal",
  "crossterm",
  "ratatui",
 ]

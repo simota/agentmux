@@ -13,11 +13,13 @@
 //!
 //! The policy engine MUST be synchronous and side-effect-free so it can
 //! be called in the hot path of every input injection.
-//!
-//! #TODO(agent): implement PolicyEngine struct with rule evaluation
-//! #TODO(agent): implement protected-path matcher
-//! #TODO(agent): implement command classifier (regex / allowlist / denylist)
 
+pub mod approval;
 pub mod policy;
 
-pub use policy::{PolicyDecision, PolicyEngine};
+pub use approval::{
+    ApprovalEvent, ApprovalGate, ApprovalQueue, ApprovalQueueError, ApprovalRequest,
+};
+pub use policy::{
+    ApprovalPolicy, CommandClassification, CommandSafety, InputSafety, PolicyDecision, PolicyEngine,
+};

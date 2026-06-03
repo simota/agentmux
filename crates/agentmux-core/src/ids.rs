@@ -9,6 +9,8 @@
 //! #TODO(agent): add Display / FromStr impls with prefix validation once
 //!               the string format is confirmed final.
 
+use std::str::FromStr;
+
 use serde::{Deserialize, Serialize};
 use ulid::Ulid;
 
@@ -40,25 +42,42 @@ macro_rules! define_id {
                 write!(f, "{}{}", $prefix, self.0)
             }
         }
+
+        impl FromStr for $name {
+            type Err = String;
+
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                let raw = value.strip_prefix($prefix).ok_or_else(|| {
+                    format!(
+                        "invalid {} prefix: expected '{}'",
+                        stringify!($name),
+                        $prefix
+                    )
+                })?;
+                Ulid::from_string(raw)
+                    .map(Self)
+                    .map_err(|error| format!("invalid {} ULID: {error}", stringify!($name)))
+            }
+        }
     };
 }
 
-define_id!(ProjectId,       "proj_");
-define_id!(TaskId,          "task_");
-define_id!(AgentSessionId,  "agent_");
-define_id!(PaneId,          "pane_");
-define_id!(MessageId,       "msg_");
-define_id!(ContextItemId,   "ctx_");
-define_id!(ArtifactId,      "art_");
-define_id!(ApprovalId,      "appr_");
-define_id!(WorktreeId,      "wt_");
-define_id!(PtyId,           "pty_");
-define_id!(TerminalBufferId,"tbuf_");
+define_id!(ProjectId, "proj_");
+define_id!(TaskId, "task_");
+define_id!(AgentSessionId, "agent_");
+define_id!(PaneId, "pane_");
+define_id!(MessageId, "msg_");
+define_id!(ContextItemId, "ctx_");
+define_id!(ArtifactId, "art_");
+define_id!(ApprovalId, "appr_");
+define_id!(WorktreeId, "wt_");
+define_id!(PtyId, "pty_");
+define_id!(TerminalBufferId, "tbuf_");
 define_id!(ClientSessionId, "csess_");
-define_id!(InboxId,         "inbox_");
-define_id!(ContextScopeId,  "cscope_");
-define_id!(InputScriptId,   "iscript_");
-define_id!(JobId,           "job_");
-define_id!(ClientId,        "client_");
+define_id!(InboxId, "inbox_");
+define_id!(ContextScopeId, "cscope_");
+define_id!(InputScriptId, "iscript_");
+define_id!(JobId, "job_");
+define_id!(ClientId, "client_");
 // Generic actor reference used in audit fields (human or orchestrator).
-define_id!(ActorId,         "actor_");
+define_id!(ActorId, "actor_");

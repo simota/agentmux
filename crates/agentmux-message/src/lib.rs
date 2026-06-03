@@ -4,10 +4,12 @@
 //! - `AgentMessage` domain struct and associated enums
 //! - inbox and delivery queue management
 //! - prompt renderer (inline vs mailbox-file delivery per ADR-0005)
-//!
-//! #TODO(agent): implement delivery queue with policy check integration
-//! #TODO(agent): implement prompt renderer (inline / mailbox-file split)
 
+pub mod bus;
 pub mod message;
 
-pub use message::{AgentMessage, MessageKind, MessageSource, MessageTarget};
+pub use bus::{
+    AgentDescriptor, DeliveryWait, DeliveryWaitReason, IdleDelivery, Inbox, MessageBus,
+    PreparedInjection, PromptContext, PromptContextItem, initial_delivery_status, render_prompt,
+};
+pub use message::{AgentMessage, MessageKind, MessageSource, MessageTarget, NewAgentMessage};

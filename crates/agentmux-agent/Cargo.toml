@@ -9,7 +9,11 @@ description = "AgentSession management, provider adapters, status detection, and
 
 [dependencies]
 agentmux-core     = { workspace = true }
+agentmux-message  = { workspace = true }
 agentmux-pty      = { workspace = true }
 agentmux-terminal = { workspace = true }
 async-trait       = { workspace = true }
 serde             = { workspace = true }
+serde_json        = { workspace = true }
+time              = { workspace = true }
+tokio             = { workspace = true }

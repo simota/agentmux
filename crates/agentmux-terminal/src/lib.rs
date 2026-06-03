@@ -7,14 +7,11 @@
 //! - track cursor position and style attributes (bold, fg/bg colour, …)
 //! - scrollback buffer
 //! - dirty-region tracking for efficient screen-diff delivery to clients
-//!
-//! #TODO(agent): implement ScreenGrid with Cell type (char + style)
-//! #TODO(agent): implement vte::Perform on TerminalParser
-//! #TODO(agent): implement scrollback ring buffer
-//! #TODO(agent): implement dirty-region bit mask for pane diff delivery
 
 pub mod grid;
 pub mod parser;
 
-pub use grid::ScreenGrid;
-pub use parser::TerminalParser;
+pub use grid::{
+    Cell, CellStyle, CellWidth, CursorState, DirtyRegion, Line, ScreenGrid, TerminalColor,
+};
+pub use parser::{ActiveScreen, TerminalParser};
