@@ -5,20 +5,33 @@
 //! control remains in the TUI.
 
 use std::collections::BTreeMap;
+use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::Duration;
 
 use agentmux_core::{AgentmuxConfig, AgentmuxError, error::Result};
 use agentmux_ipc::{
-    ClientHello, ClientRequest, DaemonResponse, IpcCommand, JsonlReader, JsonlWriter,
+    ClientHello, ClientRequest, DaemonResponse, DaemonStreamFrame, IpcCommand, JsonlReader,
+    JsonlWriter,
 };
 use agentmux_pty::{PtyHandle, PtySpawnSpec, TerminalSize};
 use agentmux_store::Store;
+use agentmux_tui::{
+    input::{InputForwardError, dispatch_to_daemon_request},
+    keymap::KeymapDispatcher,
+    render::TuiSessionRenderer,
+    state::{CommandEffect, TuiSessionState},
+    terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
+};
 use clap::{Parser, Subcommand};
+use crossterm::event::Event;
 use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
+use tokio::sync::mpsc;
+use tokio::task::JoinHandle;
 
 const DEFAULT_PROJECT_CONFIG: &str =
     include_str!("../../../docs/config/agentmux.config.example.toml");
@@ -301,10 +314,7 @@ async fn main() -> Result<()> {
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
 
     let Some(command) = cli.command else {
-        // Bare `agentmux`: make sure the daemon is up, then show its status.
-        ensure_daemon(&socket_path).await?;
-        let response = send_daemon_request(&socket_path, daemon_status_request()).await?;
-        print_response("agentmux", response)?;
+        run_bare_tui_session(&socket_path).await?;
         return Ok(());
     };
 
@@ -550,8 +560,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Attach(args) => {
-            let response = send_daemon_request(&socket_path, attach_request(args.target)).await?;
-            print_response("attach", response)?;
+            run_tui_session(&socket_path, args.target).await?;
         }
         Commands::Layout(args) => match args.action {
             LayoutAction::Save { name } => {
@@ -591,6 +600,10 @@ fn daemon_status_request() -> ClientRequest {
     ClientRequest::new("req_daemon_status", IpcCommand::DaemonStatus, json!({}))
 }
 
+fn tui_daemon_status_request() -> ClientRequest {
+    ClientRequest::new("req_tui_status", IpcCommand::DaemonStatus, json!({}))
+}
+
 fn task_run_request(description: String, team: Option<String>) -> Result<ClientRequest> {
     let project_path = std::env::current_dir()
         .map_err(|error| AgentmuxError::Internal(format!("failed to resolve cwd: {error}")))?;
@@ -614,8 +627,51 @@ fn attach_request(target: String) -> ClientRequest {
     )
 }
 
+fn snapshot_request(target: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_snapshot",
+        IpcCommand::AgentSnapshot,
+        json!({ "agent_id": target }),
+    )
+}
+
+fn detach_request() -> ClientRequest {
+    ClientRequest::new("req_detach", IpcCommand::ClientDetach, json!({}))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TuiSignal {
+    Sigint,
+}
+
+fn tui_signal_effect(signal: TuiSignal) -> CommandEffect {
+    match signal {
+        TuiSignal::Sigint => CommandEffect::Detach,
+    }
+}
+
+fn spawn_tui_signal_forwarder(signal_tx: mpsc::UnboundedSender<TuiSignal>) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if tokio::signal::ctrl_c().await.is_ok() {
+            let _ = signal_tx.send(TuiSignal::Sigint);
+        }
+    })
+}
+
 fn agent_ls_request() -> ClientRequest {
     ClientRequest::new("req_agent_ls", IpcCommand::DaemonStatus, json!({}))
+}
+
+fn bare_session_spawn_request() -> ClientRequest {
+    ClientRequest::new(
+        "req_bare_agent_spawn",
+        IpcCommand::AgentSpawn,
+        json!({
+            "provider": "shell",
+            "role": "shell",
+            "name": "shell",
+        }),
+    )
 }
 
 fn agent_spawn_request(provider: String, role: String) -> Result<ClientRequest> {
@@ -1189,6 +1245,258 @@ fn stop_daemon(socket_path: &Path) -> Result<()> {
     Ok(())
 }
 
+async fn run_bare_tui_session(socket_path: &Path) -> Result<()> {
+    let target = resolve_bare_tui_target(socket_path).await?;
+    run_tui_session(socket_path, target).await
+}
+
+async fn resolve_bare_tui_target(socket_path: &Path) -> Result<String> {
+    let status = send_daemon_request(socket_path, daemon_status_request()).await?;
+    if !status.ok {
+        return Err(response_error("agentmux", status));
+    }
+
+    if let Some(agent_id) =
+        existing_agent_id_from_status(&status.payload.clone().unwrap_or_else(|| json!({})))
+    {
+        return Ok(agent_id);
+    }
+
+    let response = send_daemon_request(socket_path, bare_session_spawn_request()).await?;
+    agent_id_from_spawn_response(response)
+}
+
+fn existing_agent_id_from_status(payload: &Value) -> Option<String> {
+    payload
+        .get("agents")
+        .and_then(Value::as_array)
+        .and_then(|agents| {
+            agents
+                .iter()
+                .find_map(|agent| agent.get("id").and_then(Value::as_str))
+        })
+        .map(ToString::to_string)
+}
+
+fn agent_id_from_spawn_response(response: DaemonResponse) -> Result<String> {
+    if !response.ok {
+        return Err(response_error("agent.spawn", response));
+    }
+
+    response
+        .payload
+        .and_then(|payload| {
+            payload
+                .get("agent_id")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+        })
+        .ok_or_else(|| AgentmuxError::IpcError("agent.spawn response missing agent_id".to_string()))
+}
+
+async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
+    ensure_daemon(socket_path).await?;
+    let stream = UnixStream::connect(socket_path).await.map_err(|error| {
+        AgentmuxError::IpcError(format!(
+            "failed to connect daemon socket '{}': {error}",
+            socket_path.display()
+        ))
+    })?;
+    let (reader, writer) = stream.into_split();
+    let mut reader = JsonlReader::new(BufReader::new(reader));
+    let mut writer = JsonlWriter::new(writer);
+
+    writer
+        .write(&ClientHello::new(env!("CARGO_PKG_VERSION")))
+        .await?;
+
+    let status_request = tui_daemon_status_request();
+    let status_request_id = status_request.id.clone();
+    let snapshot_request = snapshot_request(target.clone());
+    let snapshot_request_id = snapshot_request.id.clone();
+    let attach_request = attach_request(target);
+    let attach_request_id = attach_request.id.clone();
+    writer.write(&status_request).await?;
+    writer.write(&attach_request).await?;
+    writer.write(&snapshot_request).await?;
+
+    let mut state = TuiSessionState::default();
+    wait_for_tui_bootstrap(
+        &mut reader,
+        &mut state,
+        &status_request_id,
+        &attach_request_id,
+        &snapshot_request_id,
+    )
+    .await?;
+
+    let terminal_io = CrosstermTerminalIo::new(io::stdout()).map_err(|error| {
+        AgentmuxError::TerminalError(format!("failed to initialise terminal UI: {error}"))
+    })?;
+    let mut terminal = TerminalSession::enter(terminal_io).map_err(|error| {
+        AgentmuxError::TerminalError(format!("failed to enter terminal UI: {error}"))
+    })?;
+
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        loop {
+            match reader.read::<DaemonStreamFrame>().await {
+                Ok(Some(frame)) => {
+                    if frame_tx.send(Ok(frame)).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = frame_tx.send(Err(AgentmuxError::IpcError(
+                        "daemon closed the attached event stream".to_string(),
+                    )));
+                    break;
+                }
+                Err(error) => {
+                    let _ = frame_tx.send(Err(error));
+                    break;
+                }
+            }
+        }
+    });
+
+    let renderer = TuiSessionRenderer::default();
+    let mut keymap = KeymapDispatcher::default();
+    let mut input_sequence = 0_u64;
+    let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
+    let signal_task = spawn_tui_signal_forwarder(signal_tx);
+
+    draw_tui_frame(&mut terminal, &renderer, &state)?;
+
+    loop {
+        while let Ok(frame) = frame_rx.try_recv() {
+            apply_tui_stream_frame(&mut state, frame?)?;
+            draw_tui_frame(&mut terminal, &renderer, &state)?;
+        }
+
+        if let Ok(signal) = signal_rx.try_recv() {
+            match tui_signal_effect(signal) {
+                CommandEffect::Detach | CommandEffect::Quit => {
+                    writer.write(&detach_request()).await?;
+                    break;
+                }
+                CommandEffect::Continue | CommandEffect::Unhandled(_) => {}
+            }
+        }
+
+        if let Some(Event::Key(key)) = terminal
+            .io_mut()
+            .poll_event(Duration::from_millis(16))
+            .map_err(|error| AgentmuxError::TerminalError(format!("failed to read key: {error}")))?
+        {
+            let dispatch = keymap.dispatch(key);
+            if let Some(command) = match &dispatch {
+                agentmux_tui::keymap::KeyDispatch::Command(command) => Some(*command),
+                _ => None,
+            } {
+                match state.apply_command(command) {
+                    CommandEffect::Continue => {
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                    CommandEffect::Detach | CommandEffect::Quit => {
+                        writer.write(&detach_request()).await?;
+                        break;
+                    }
+                    CommandEffect::Unhandled(_) => {}
+                }
+                continue;
+            }
+
+            input_sequence = input_sequence.saturating_add(1);
+            let request_id = format!("req_input_{input_sequence}");
+            match dispatch_to_daemon_request(&state, request_id, dispatch) {
+                Ok(Some(request)) => writer.write(&request).await?,
+                Ok(None) | Err(InputForwardError::NoFocusedPane) => {}
+                Err(error) => {
+                    return Err(AgentmuxError::UserError(format!(
+                        "failed to forward input to focused agent: {error:?}"
+                    )));
+                }
+            }
+        }
+    }
+
+    signal_task.abort();
+
+    terminal.shutdown().map_err(|error| {
+        AgentmuxError::TerminalError(format!("failed to restore terminal UI: {error}"))
+    })
+}
+
+async fn wait_for_tui_bootstrap<R>(
+    reader: &mut JsonlReader<R>,
+    state: &mut TuiSessionState,
+    status_request_id: &str,
+    attach_request_id: &str,
+    snapshot_request_id: &str,
+) -> Result<()>
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    let mut status_received = false;
+    let mut attach_received = false;
+    let mut snapshot_received = false;
+
+    while !(status_received && attach_received && snapshot_received) {
+        let frame = reader.read::<DaemonStreamFrame>().await?.ok_or_else(|| {
+            AgentmuxError::IpcError("daemon closed before TUI attach completed".to_string())
+        })?;
+        if let Some(response_id) = apply_tui_stream_frame(state, frame)? {
+            if response_id == status_request_id {
+                status_received = true;
+            }
+            if response_id == attach_request_id {
+                attach_received = true;
+            }
+            if response_id == snapshot_request_id {
+                snapshot_received = true;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_tui_stream_frame(
+    state: &mut TuiSessionState,
+    frame: DaemonStreamFrame,
+) -> Result<Option<String>> {
+    match frame {
+        DaemonStreamFrame::Response(response) => {
+            if !response.ok {
+                return Err(response_error("tui", response));
+            }
+            if response.id == "req_tui_status" {
+                state.apply_daemon_status(&response.payload.clone().unwrap_or_else(|| json!({})));
+            }
+            if response.id == "req_snapshot" {
+                state.apply_snapshot(&response.payload.clone().unwrap_or_else(|| json!({})));
+            }
+            Ok(Some(response.id))
+        }
+        DaemonStreamFrame::Event(event) => {
+            state.apply_event(&event);
+            Ok(None)
+        }
+    }
+}
+
+fn draw_tui_frame<T: TerminalIo>(
+    terminal: &mut TerminalSession<T>,
+    renderer: &TuiSessionRenderer,
+    state: &TuiSessionState,
+) -> Result<()> {
+    terminal
+        .io_mut()
+        .draw(|frame| renderer.render(frame.area(), state, frame.buffer_mut()))
+        .map_err(|error| AgentmuxError::TerminalError(format!("failed to draw TUI: {error}")))
+}
+
 async fn send_daemon_request(socket_path: &Path, request: ClientRequest) -> Result<DaemonResponse> {
     ensure_daemon(socket_path).await?;
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
@@ -1220,20 +1528,27 @@ async fn send_daemon_request(socket_path: &Path, request: ClientRequest) -> Resu
     )))
 }
 
+fn response_error(label: &str, response: DaemonResponse) -> AgentmuxError {
+    let error = response.error.unwrap_or_else(|| {
+        agentmux_ipc::ErrorBody::new(
+            "missing_error_body",
+            "daemon returned an error without an error body",
+        )
+    });
+    AgentmuxError::UserError(format!(
+        "{label} request failed: {} ({}){}",
+        error.message,
+        error.code,
+        error
+            .hint
+            .map(|hint| format!("; hint: {hint}"))
+            .unwrap_or_default()
+    ))
+}
+
 fn print_response(label: &str, response: DaemonResponse) -> Result<()> {
     if !response.ok {
-        let error = response.error.ok_or_else(|| {
-            AgentmuxError::IpcError("daemon returned an error without an error body".to_string())
-        })?;
-        return Err(AgentmuxError::UserError(format!(
-            "{label} request failed: {} ({}){}",
-            error.message,
-            error.code,
-            error
-                .hint
-                .map(|hint| format!("; hint: {hint}"))
-                .unwrap_or_default()
-        )));
+        return Err(response_error(label, response));
     }
 
     let payload = response.payload.unwrap_or_else(|| json!({}));
@@ -1294,6 +1609,191 @@ mod tests {
 
         assert_eq!(request.command, IpcCommand::ClientAttach);
         assert_eq!(request.payload["agent_id"], "agent_01HX");
+    }
+
+    #[test]
+    fn tui_bootstrap_requests_status_attach_and_snapshot() {
+        let status = tui_daemon_status_request();
+        let attach = attach_request("agent_01HX".to_string());
+        let snapshot = snapshot_request("agent_01HX".to_string());
+
+        assert_eq!(status.id, "req_tui_status");
+        assert_eq!(status.command, IpcCommand::DaemonStatus);
+        assert_eq!(status.payload, json!({}));
+        assert_eq!(attach.id, "req_attach");
+        assert_eq!(attach.command, IpcCommand::ClientAttach);
+        assert_eq!(attach.payload["agent_id"], "agent_01HX");
+        assert_eq!(snapshot.id, "req_snapshot");
+        assert_eq!(snapshot.command, IpcCommand::AgentSnapshot);
+        assert_eq!(snapshot.payload["agent_id"], "agent_01HX");
+    }
+
+    #[test]
+    fn bare_tui_target_prefers_existing_agent_session() {
+        let payload = json!({
+            "agents": [
+                {"id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K", "name": "planner"},
+                {"id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2M", "name": "impl"},
+            ]
+        });
+
+        assert_eq!(
+            existing_agent_id_from_status(&payload),
+            Some("agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_tui_target_returns_none_when_status_has_no_agents() {
+        assert_eq!(
+            existing_agent_id_from_status(&json!({ "agents": [] })),
+            None
+        );
+        assert_eq!(existing_agent_id_from_status(&json!({})), None);
+    }
+
+    #[test]
+    fn bare_session_spawn_request_registers_minimal_shell_pane() {
+        let request = bare_session_spawn_request();
+
+        assert_eq!(request.id, "req_bare_agent_spawn");
+        assert_eq!(request.command, IpcCommand::AgentSpawn);
+        assert_eq!(request.payload["provider"], "shell");
+        assert_eq!(request.payload["role"], "shell");
+        assert_eq!(request.payload["name"], "shell");
+    }
+
+    #[test]
+    fn bare_spawn_response_yields_agent_id_for_tui_attach() {
+        let agent_id = agent_id_from_spawn_response(DaemonResponse::ok(
+            "req_bare_agent_spawn",
+            json!({ "agent_id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K" }),
+        ))
+        .unwrap();
+
+        assert_eq!(agent_id, "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K");
+    }
+
+    #[test]
+    fn bare_spawn_response_requires_agent_id() {
+        let error =
+            agent_id_from_spawn_response(DaemonResponse::ok("req_bare_agent_spawn", json!({})))
+                .unwrap_err();
+
+        assert!(error.to_string().contains("missing agent_id"));
+    }
+
+    #[test]
+    fn detach_request_uses_client_detach_ipc_command() {
+        let request = detach_request();
+
+        assert_eq!(request.id, "req_detach");
+        assert_eq!(request.command, IpcCommand::ClientDetach);
+        assert_eq!(request.payload, json!({}));
+    }
+
+    #[test]
+    fn sigint_requests_tui_detach_for_terminal_restoring_shutdown_path() {
+        assert_eq!(tui_signal_effect(TuiSignal::Sigint), CommandEffect::Detach);
+    }
+
+    #[test]
+    fn tui_stream_frame_seeds_status_and_applies_events() {
+        let mut state = TuiSessionState::default();
+        let status = DaemonResponse::ok(
+            "req_tui_status",
+            json!({
+                "agents": [
+                    {
+                        "id": "agent_01KBKX3F4SPGZ1A0JMQJEFAV7B",
+                        "name": "impl",
+                        "status": "ready"
+                    }
+                ]
+            }),
+        );
+
+        let response_id =
+            apply_tui_stream_frame(&mut state, DaemonStreamFrame::Response(status)).unwrap();
+
+        assert_eq!(response_id.as_deref(), Some("req_tui_status"));
+        assert_eq!(
+            state.layout().focused(),
+            Some("agent_01KBKX3F4SPGZ1A0JMQJEFAV7B")
+        );
+        assert_eq!(
+            state
+                .pane("agent_01KBKX3F4SPGZ1A0JMQJEFAV7B")
+                .and_then(|pane| pane.status()),
+            Some("ready")
+        );
+
+        apply_tui_stream_frame(
+            &mut state,
+            DaemonStreamFrame::Event(agentmux_ipc::DaemonEvent::new(
+                agentmux_ipc::IpcEventKind::PtyOutputChunk,
+                json!({
+                    "agent_id": "agent_01KBKX3F4SPGZ1A0JMQJEFAV7B",
+                    "text": "hi"
+                }),
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(
+            state
+                .pane("agent_01KBKX3F4SPGZ1A0JMQJEFAV7B")
+                .unwrap()
+                .grid()
+                .line_text(0)
+                .unwrap()
+                .trim_end(),
+            "hi"
+        );
+    }
+
+    #[test]
+    fn tui_stream_frame_restores_snapshot_response() {
+        let mut state = TuiSessionState::default();
+        let snapshot = DaemonResponse::ok(
+            "req_snapshot",
+            json!({
+                "agent_id": "agent_01KBKX3F4SPGZ1A0JMQJEFAV7B",
+                "name": "impl",
+                "rows": 2,
+                "cols": 4,
+                "lines": ["done", ">   "]
+            }),
+        );
+
+        let response_id =
+            apply_tui_stream_frame(&mut state, DaemonStreamFrame::Response(snapshot)).unwrap();
+
+        assert_eq!(response_id.as_deref(), Some("req_snapshot"));
+        assert_eq!(
+            state
+                .pane("agent_01KBKX3F4SPGZ1A0JMQJEFAV7B")
+                .unwrap()
+                .grid()
+                .line_text(0)
+                .unwrap(),
+            "done"
+        );
+    }
+
+    #[test]
+    fn tui_stream_frame_returns_daemon_response_errors() {
+        let mut state = TuiSessionState::default();
+        let response = DaemonResponse::error(
+            "req_attach",
+            agentmux_ipc::ErrorBody::new("not_found", "agent missing"),
+        );
+
+        let error =
+            apply_tui_stream_frame(&mut state, DaemonStreamFrame::Response(response)).unwrap_err();
+
+        assert!(error.to_string().contains("agent missing"));
+        assert!(error.to_string().contains("not_found"));
     }
 
     #[test]

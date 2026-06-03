@@ -121,6 +121,23 @@ impl PaneLayout {
         self.focused = Some(self.panes[next].clone());
     }
 
+    pub fn focus_previous(&mut self) {
+        if self.panes.is_empty() {
+            self.focused = None;
+            return;
+        }
+
+        let current = self
+            .focused
+            .as_ref()
+            .and_then(|focused| self.panes.iter().position(|pane| pane == focused))
+            .unwrap_or(0);
+        let previous = current
+            .checked_sub(1)
+            .unwrap_or_else(|| self.panes.len().saturating_sub(1));
+        self.focused = Some(self.panes[previous].clone());
+    }
+
     pub fn set_split_direction(&mut self, split_direction: SplitDirection) {
         self.split_direction = split_direction;
     }
@@ -257,5 +274,14 @@ mod tests {
     fn inner_size_accounts_for_border_without_underflow() {
         assert_eq!(PaneLayout::pane_inner_size(Rect::new(0, 0, 10, 5)), (3, 8));
         assert_eq!(PaneLayout::pane_inner_size(Rect::new(0, 0, 1, 1)), (0, 0));
+    }
+
+    #[test]
+    fn focus_previous_wraps_to_last_pane() {
+        let mut layout = PaneLayout::with_panes(SplitDirection::Vertical, ["a", "b", "c"]);
+
+        layout.focus_previous();
+
+        assert_eq!(layout.focused(), Some("c"));
     }
 }

@@ -16,6 +16,6 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 pub use framing::{JsonlReader, JsonlWriter, MAX_JSONL_FRAME_BYTES, read_jsonl, write_jsonl};
 pub use protocol::{
-    ClientHello, ClientRequest, DaemonEvent, DaemonResponse, ErrorBody, IpcCommand, IpcEventKind,
-    ProtocolCompatibility,
+    ClientHello, ClientRequest, DaemonEvent, DaemonResponse, DaemonStreamFrame, ErrorBody,
+    IpcCommand, IpcEventKind, ProtocolCompatibility,
 };

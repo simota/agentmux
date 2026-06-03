@@ -10,7 +10,10 @@
 //! This crate is a **library** consumed by `agentmux-cli`.
 //! It holds no daemon state — all data comes from IPC events.
 
+pub mod input;
 pub mod keymap;
 pub mod layout;
 pub mod panic_hook;
 pub mod render;
+pub mod state;
+pub mod terminal;
