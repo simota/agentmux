@@ -1370,7 +1370,11 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
 
     loop {
         while let Ok(frame) = frame_rx.try_recv() {
-            apply_tui_stream_frame(&mut state, frame?)?;
+            // Stream-level errors (daemon closed / read failure) stay fatal via `?`.
+            // A per-request response error during the session — e.g. a keystroke
+            // forwarded to an agent with no live PTY — must NOT tear down the
+            // cockpit; surface it as a notice and keep running.
+            let _notice = apply_runtime_stream_frame(&mut state, frame?);
             draw_tui_frame(&mut terminal, &renderer, &state)?;
         }
 
@@ -1483,6 +1487,19 @@ fn apply_tui_stream_frame(
             state.apply_event(&event);
             Ok(None)
         }
+    }
+}
+
+/// Apply a stream frame during the interactive loop. Unlike bootstrap, a failed
+/// per-request response (e.g. input to an agent with no live PTY) is non-fatal:
+/// the error text is returned as a notice so the session can keep running.
+fn apply_runtime_stream_frame(
+    state: &mut TuiSessionState,
+    frame: DaemonStreamFrame,
+) -> Option<String> {
+    match apply_tui_stream_frame(state, frame) {
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
     }
 }
 
@@ -1794,6 +1811,23 @@ mod tests {
 
         assert!(error.to_string().contains("agent missing"));
         assert!(error.to_string().contains("not_found"));
+    }
+
+    #[test]
+    fn runtime_input_failure_is_non_fatal() {
+        // A keystroke forwarded to an agent with no live PTY returns an error
+        // response; during the interactive loop this must be a soft notice, not
+        // a session-killing error.
+        let mut state = TuiSessionState::default();
+        let response = DaemonResponse::error(
+            "req_input_1",
+            agentmux_ipc::ErrorBody::new("INPUT_SCRIPT_FAILED", "agent has no live PTY"),
+        );
+
+        let notice = apply_runtime_stream_frame(&mut state, DaemonStreamFrame::Response(response));
+
+        let notice = notice.expect("runtime failure is surfaced as a notice");
+        assert!(notice.contains("no live PTY"));
     }
 
     #[test]
