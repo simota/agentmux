@@ -319,24 +319,44 @@ async fn main() -> Result<()> {
         },
         Commands::Project(args) => match args.action {
             ProjectAction::Init { path } => {
+                // `project init` is a purely local operation — it creates the
+                // `.agentmux/` directory and does not require a running daemon.
                 let project_dir = init_project(Path::new(&path))?;
-                let response = send_daemon_request(
-                    &socket_path,
-                    ClientRequest::new(
-                        "req_project_init",
-                        IpcCommand::DaemonStatus,
-                        json!({ "project_path": project_dir }),
-                    ),
-                )
-                .await?;
-                print_response("project", response)?;
+                println!("project initialised at {}", project_dir.display());
+                println!("  created: .agentmux/config.toml");
+                println!("  hint:    add '.agentmux/' to your .gitignore");
             }
             ProjectAction::Open { path } => {
                 println!("project open {path} — not yet implemented");
             }
             ProjectAction::Status => {
-                let response = send_daemon_request(&socket_path, daemon_status_request()).await?;
-                print_response("project", response)?;
+                // Local-first: report project state from `.agentmux/` without
+                // requiring a running daemon. Daemon connectivity is reported
+                // best-effort and never fails the command.
+                let cwd = std::env::current_dir().map_err(|error| {
+                    AgentmuxError::UserError(format!("cannot resolve current directory: {error}"))
+                })?;
+                let agentmux_dir = cwd.join(".agentmux");
+                if agentmux_dir.is_dir() {
+                    println!("project root: {}", cwd.display());
+                    let config_path = agentmux_dir.join("config.toml");
+                    match AgentmuxConfig::load_from_path(&config_path) {
+                        Ok(_) => println!("config:       {} (valid)", config_path.display()),
+                        Err(error) => {
+                            println!("config:       {} (invalid: {error})", config_path.display())
+                        }
+                    }
+                    match UnixStream::connect(&socket_path).await {
+                        Ok(_) => println!("daemon:       running ({})", socket_path.display()),
+                        Err(_) => println!("daemon:       not running ({})", socket_path.display()),
+                    }
+                } else {
+                    println!(
+                        "project: not initialised (no .agentmux/ in {})",
+                        cwd.display()
+                    );
+                    println!("  run: agentmux project init .");
+                }
             }
         },
         Commands::Task(args) => match args.action {
