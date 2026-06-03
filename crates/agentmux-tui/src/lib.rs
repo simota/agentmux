@@ -10,7 +10,6 @@
 //! This crate is a **library** consumed by `agentmux-cli`.
 //! It holds no daemon state — all data comes from IPC events.
 //!
-//! #TODO(agent): implement PaneLayout (split/resize) using ratatui Layout
 //! #TODO(agent): implement terminal restore panic hook
 //! #TODO(agent): implement keymap dispatcher (prefix key interception)
 

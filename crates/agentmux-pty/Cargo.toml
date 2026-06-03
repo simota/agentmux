@@ -10,5 +10,6 @@ description = "PTY creation, process spawn, I/O, resize, and termination for age
 [dependencies]
 agentmux-core = { workspace = true }
 portable-pty  = { workspace = true }
+libc          = { workspace = true }
 tokio         = { workspace = true }
 serde         = { workspace = true }

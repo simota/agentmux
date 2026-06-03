@@ -12,11 +12,9 @@
 //! task (`tokio::task::spawn_blocking`) and feed output over an async
 //! channel back to the daemon orchestrator.
 //!
-//! #TODO(agent): implement PtyHandle wrapper struct
-//! #TODO(agent): implement spawn() that returns PtyHandle + output Receiver
-//! #TODO(agent): implement resize() forwarding PtySize
-//! #TODO(agent): implement write_bytes() for raw input injection
-
 pub mod pty;
 
-pub use pty::TerminalSize;
+pub use pty::{
+    CTRL_C, PtyExitStatus, PtyHandle, PtyReadEvent, PtyReadLoop, PtySpawnSpec, TerminalSize,
+    bracketed_paste_bytes,
+};

@@ -9,5 +9,6 @@ description = "Ratatui layout, pane rendering, keymap, and overlays for the agen
 
 [dependencies]
 agentmux-core = { workspace = true }
+agentmux-terminal = { workspace = true }
 ratatui       = { workspace = true }
 crossterm     = { workspace = true }

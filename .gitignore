@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# nexus-autoloop runtime state (Orbit-generated; scripts are run from repo root)
+.nexus-loop/
+
 # agentmux runtime directory (per docs/spec)
 .agentmux/
 

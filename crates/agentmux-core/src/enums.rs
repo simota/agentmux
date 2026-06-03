@@ -144,12 +144,16 @@ pub enum RiskLevel {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AutomationLevel {
-    /// Never act automatically; all actions require explicit human approval.
-    Manual,
-    /// Ask before each potentially-dangerous action.
-    Ask,
-    /// Proceed automatically within safe bounds; escalate on risk.
-    Auto,
+    /// Agent processes may be observed, but agentmux sends no automated input.
+    ObserveOnly,
+    /// Prompt, message, and context handoff injection is allowed.
+    AutoPrompt,
+    /// Safe read-only and configured test commands may be approved.
+    AutoPromptAndApproveSafe,
+    /// Workspace-local writes and tests may be approved under policy.
+    AutoWorkspaceWrite,
+    /// Full access is explicit and discouraged for v0.1.
+    AutoFullAccess,
 }
 
 // ---------------------------------------------------------------------------
@@ -216,22 +220,23 @@ pub enum Priority {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryMode {
-    /// Inject at next available opportunity (agent is awaiting input).
-    Auto,
-    /// Require explicit human trigger.
-    Manual,
-    /// Inject immediately, bypassing delivery policy (requires approval).
-    Forced,
+    InboxOnly,
+    InjectWhenIdle,
+    InjectImmediately,
+    RequireHumanApproval,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DeliveryStatus {
     Queued,
-    Delivering,
+    Rendered,
+    WaitingForAgent,
+    WaitingForApproval,
+    Injecting,
     Delivered,
-    Read,
     Failed,
+    Cancelled,
 }
 
 // ---------------------------------------------------------------------------

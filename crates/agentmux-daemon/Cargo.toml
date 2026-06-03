@@ -22,4 +22,6 @@ agentmux-context  = { workspace = true }
 agentmux-worktree = { workspace = true }
 agentmux-store    = { workspace = true }
 agentmux-policy   = { workspace = true }
+serde_json        = { workspace = true }
 tokio             = { workspace = true }
+ulid              = { workspace = true }
