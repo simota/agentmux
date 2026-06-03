@@ -14,7 +14,23 @@ async fn main() -> Result<()> {
     println!("agentmux-daemon v{} starting", env!("CARGO_PKG_VERSION"));
     println!("Socket path: {}", socket_path.display());
 
-    serve(DaemonConfig::new(socket_path), DaemonRuntime::new(1024)).await
+    // Write a pidfile next to the socket so `agentmux daemon stop` can find us.
+    if let Some(parent) = socket_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let pid_path = socket_path
+        .parent()
+        .map(|parent| parent.join("agentmux.pid"));
+    if let Some(pid_path) = &pid_path {
+        let _ = std::fs::write(pid_path, std::process::id().to_string());
+    }
+
+    let result = serve(DaemonConfig::new(socket_path), DaemonRuntime::new(1024)).await;
+
+    if let Some(pid_path) = &pid_path {
+        let _ = std::fs::remove_file(pid_path);
+    }
+    result
 }
 
 fn default_socket_path() -> PathBuf {

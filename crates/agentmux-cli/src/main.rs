@@ -5,8 +5,9 @@
 //! control remains in the TUI.
 
 use std::collections::BTreeMap;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use agentmux_core::{AgentmuxConfig, AgentmuxError, error::Result};
 use agentmux_ipc::{
@@ -39,7 +40,7 @@ struct Cli {
     socket: Option<PathBuf>,
 
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand)]
@@ -299,7 +300,15 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let socket_path = cli.socket.unwrap_or_else(default_socket_path);
 
-    match cli.command {
+    let Some(command) = cli.command else {
+        // Bare `agentmux`: make sure the daemon is up, then show its status.
+        ensure_daemon(&socket_path).await?;
+        let response = send_daemon_request(&socket_path, daemon_status_request()).await?;
+        print_response("agentmux", response)?;
+        return Ok(());
+    };
+
+    match command {
         Commands::Doctor(_) => {
             let report = doctor_report(
                 &socket_path,
@@ -310,11 +319,20 @@ async fn main() -> Result<()> {
             print_doctor_report(&report);
         }
         Commands::Daemon(args) => match args.action {
-            DaemonAction::Start => println!("daemon start — not yet implemented"),
-            DaemonAction::Stop => println!("daemon stop — not yet implemented"),
+            DaemonAction::Start => {
+                ensure_daemon(&socket_path).await?;
+                println!("daemon running ({})", socket_path.display());
+            }
+            DaemonAction::Stop => stop_daemon(&socket_path)?,
             DaemonAction::Status => {
-                let response = send_daemon_request(&socket_path, daemon_status_request()).await?;
-                print_response("daemon", response)?;
+                // Passive: report not-running rather than auto-starting.
+                if daemon_running(&socket_path).await {
+                    let response =
+                        send_daemon_request(&socket_path, daemon_status_request()).await?;
+                    print_response("daemon", response)?;
+                } else {
+                    println!("daemon: not running ({})", socket_path.display());
+                }
             }
         },
         Commands::Project(args) => match args.action {
@@ -1079,7 +1097,100 @@ fn print_doctor_report(report: &[DoctorCheck]) {
     }
 }
 
+/// Pidfile written by the daemon next to its socket; used by `daemon stop`.
+fn daemon_pid_path(socket_path: &Path) -> Option<PathBuf> {
+    socket_path
+        .parent()
+        .map(|parent| parent.join("agentmux.pid"))
+}
+
+/// Resolve the `agentmux-daemon` binary: prefer a sibling of the running CLI
+/// (so dev `target/debug` and installed `bin/` both work), else fall back to PATH.
+fn resolve_daemon_binary() -> std::ffi::OsString {
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("agentmux-daemon");
+        if sibling.exists() {
+            return sibling.into_os_string();
+        }
+    }
+    std::ffi::OsString::from("agentmux-daemon")
+}
+
+/// Whether the daemon is currently accepting connections on `socket_path`.
+async fn daemon_running(socket_path: &Path) -> bool {
+    UnixStream::connect(socket_path).await.is_ok()
+}
+
+/// Ensure the daemon is reachable, auto-starting it in the background if not.
+async fn ensure_daemon(socket_path: &Path) -> Result<()> {
+    if daemon_running(socket_path).await {
+        return Ok(());
+    }
+
+    let binary = resolve_daemon_binary();
+    let mut command = Command::new(&binary);
+    command
+        .env("AGENTMUX_SOCKET", socket_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        // Detach into its own process group so it survives the CLI exiting and
+        // is not killed by a terminal Ctrl-C aimed at the foreground command.
+        .process_group(0);
+    command.spawn().map_err(|error| {
+        AgentmuxError::IpcError(format!(
+            "failed to start agentmux-daemon ('{}'): {error}",
+            binary.to_string_lossy()
+        ))
+    })?;
+
+    // Poll for the socket to come up (~5s).
+    for _ in 0..50 {
+        if daemon_running(socket_path).await {
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    Err(AgentmuxError::IpcError(format!(
+        "agentmux-daemon did not become ready at '{}' within 5s",
+        socket_path.display()
+    )))
+}
+
+/// Stop the running daemon via its pidfile (SIGTERM → graceful shutdown).
+fn stop_daemon(socket_path: &Path) -> Result<()> {
+    let Some(pid_path) = daemon_pid_path(socket_path) else {
+        println!(
+            "daemon: cannot resolve pidfile for {}",
+            socket_path.display()
+        );
+        return Ok(());
+    };
+    match std::fs::read_to_string(&pid_path) {
+        Ok(contents) => {
+            let pid = contents.trim();
+            let signalled = Command::new("kill")
+                .arg(pid)
+                .status()
+                .map(|status| status.success())
+                .unwrap_or(false);
+            if signalled {
+                let _ = std::fs::remove_file(&pid_path);
+                println!("daemon stopped (pid {pid})");
+            } else {
+                let _ = std::fs::remove_file(&pid_path);
+                println!("daemon stop: pid {pid} was not running (cleared stale pidfile)");
+            }
+        }
+        Err(_) => println!("daemon: not running (no pidfile at {})", pid_path.display()),
+    }
+    Ok(())
+}
+
 async fn send_daemon_request(socket_path: &Path, request: ClientRequest) -> Result<DaemonResponse> {
+    ensure_daemon(socket_path).await?;
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
         AgentmuxError::IpcError(format!(
             "failed to connect daemon socket '{}': {error}",
@@ -1139,6 +1250,21 @@ fn print_response(label: &str, response: DaemonResponse) -> Result<()> {
 mod tests {
     use super::*;
     use agentmux_ipc::PROTOCOL_VERSION;
+
+    #[test]
+    fn daemon_pid_path_sits_next_to_socket() {
+        let socket = PathBuf::from("/tmp/agentmux-test/agentmux.sock");
+        assert_eq!(
+            daemon_pid_path(&socket),
+            Some(PathBuf::from("/tmp/agentmux-test/agentmux.pid"))
+        );
+    }
+
+    #[test]
+    fn resolve_daemon_binary_falls_back_to_bare_name() {
+        // Always returns a non-empty program name (sibling path or PATH fallback).
+        assert!(!resolve_daemon_binary().is_empty());
+    }
 
     #[test]
     fn task_run_request_matches_spec_payload() {
