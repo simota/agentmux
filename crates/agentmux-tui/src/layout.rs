@@ -138,8 +138,35 @@ impl PaneLayout {
         self.focused = Some(self.panes[previous].clone());
     }
 
+    pub fn remove_pane(&mut self, pane_id: &str) -> bool {
+        let Some(index) = self.panes.iter().position(|existing| existing == pane_id) else {
+            return false;
+        };
+        self.panes.remove(index);
+
+        if self.focused.as_deref() == Some(pane_id) {
+            self.focused = if self.panes.is_empty() {
+                None
+            } else {
+                Some(self.panes[index.min(self.panes.len() - 1)].clone())
+            };
+        }
+
+        if self.panes.is_empty() {
+            self.zoomed = false;
+        }
+        true
+    }
+
     pub fn set_split_direction(&mut self, split_direction: SplitDirection) {
         self.split_direction = split_direction;
+    }
+
+    pub fn toggle_split_direction(&mut self) {
+        self.split_direction = match self.split_direction {
+            SplitDirection::Horizontal => SplitDirection::Vertical,
+            SplitDirection::Vertical => SplitDirection::Horizontal,
+        };
     }
 
     pub fn toggle_zoom(&mut self) {
@@ -283,5 +310,25 @@ mod tests {
         layout.focus_previous();
 
         assert_eq!(layout.focused(), Some("c"));
+    }
+
+    #[test]
+    fn remove_focused_pane_moves_focus_to_neighbor() {
+        let mut layout = PaneLayout::with_panes(SplitDirection::Vertical, ["a", "b", "c"]);
+        assert!(layout.focus("b"));
+
+        assert!(layout.remove_pane("b"));
+
+        assert_eq!(layout.panes(), &["a".to_owned(), "c".to_owned()]);
+        assert_eq!(layout.focused(), Some("c"));
+    }
+
+    #[test]
+    fn toggling_split_direction_switches_orientation() {
+        let mut layout = PaneLayout::with_panes(SplitDirection::Vertical, ["a", "b"]);
+
+        layout.toggle_split_direction();
+
+        assert_eq!(layout.split_direction(), SplitDirection::Horizontal);
     }
 }

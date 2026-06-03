@@ -95,10 +95,6 @@ impl KeymapDispatcher {
                 .unwrap_or(KeyDispatch::Consumed);
         }
 
-        if matches!(key.code, KeyCode::Char('q')) && key.modifiers.is_empty() {
-            return KeyDispatch::Command(TuiCommand::Quit);
-        }
-
         key_event_bytes(key)
             .map(KeyDispatch::ForwardToFocusedPane)
             .unwrap_or(KeyDispatch::Consumed)
@@ -241,12 +237,12 @@ mod tests {
     }
 
     #[test]
-    fn bare_q_maps_to_quit_command() {
+    fn bare_q_is_forwarded_to_focused_pane() {
         let mut dispatcher = KeymapDispatcher::default();
 
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
 
-        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Quit));
+        assert_eq!(dispatch, KeyDispatch::ForwardToFocusedPane(b"q".to_vec()));
     }
 
     #[test]

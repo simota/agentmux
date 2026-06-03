@@ -160,6 +160,22 @@ impl TuiSessionState {
                 self.toggle_zoom();
                 CommandEffect::Continue
             }
+            TuiCommand::SplitVertical => {
+                self.layout.set_split_direction(SplitDirection::Vertical);
+                CommandEffect::SpawnShellPane
+            }
+            TuiCommand::SplitHorizontal => {
+                self.layout.set_split_direction(SplitDirection::Horizontal);
+                CommandEffect::SpawnShellPane
+            }
+            TuiCommand::ClosePane => self
+                .focused_pane()
+                .map(|pane| CommandEffect::StopPane(pane.agent_id().to_string()))
+                .unwrap_or(CommandEffect::Continue),
+            TuiCommand::RotateLayout => {
+                self.layout.toggle_split_direction();
+                CommandEffect::Continue
+            }
             TuiCommand::Detach => CommandEffect::Detach,
             TuiCommand::Quit => CommandEffect::Quit,
             _ => CommandEffect::Unhandled(command),
@@ -317,6 +333,7 @@ impl TuiSessionState {
             self.default_terminal_size,
         );
         self.layout.add_pane(agent_id.clone());
+        self.layout.focus(&agent_id);
         self.panes.insert(agent_id.clone(), pane);
         StateChange::AddedPane(agent_id)
     }
@@ -375,13 +392,11 @@ impl TuiSessionState {
             return StateChange::Ignored;
         };
 
-        let Some(pane) = self.panes.get_mut(&agent_id) else {
+        if self.panes.remove(&agent_id).is_none() {
             return StateChange::Ignored;
-        };
-        pane.status = Some("exited".to_string());
-        pane.process_id = None;
-        pane.last_event = Some(IpcEventKind::AgentExited);
-        StateChange::UpdatedPane(agent_id)
+        }
+        self.layout.remove_pane(&agent_id);
+        StateChange::RemovedPane(agent_id)
     }
 }
 
@@ -390,14 +405,17 @@ pub enum StateChange {
     AddedPane(String),
     UpdatedPane(String),
     FocusedPane(String),
+    RemovedPane(String),
     Ignored,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CommandEffect {
     Continue,
     Detach,
     Quit,
+    SpawnShellPane,
+    StopPane(String),
     Unhandled(TuiCommand),
 }
 
@@ -603,11 +621,15 @@ mod tests {
     }
 
     #[test]
-    fn exited_event_marks_pane_without_removing_it() {
+    fn exited_event_removes_pane_and_moves_focus() {
         let mut state = TuiSessionState::default();
         state.apply_event(&event(
             IpcEventKind::AgentSpawned,
             json!({ "agent_id": "agent_001", "name": "impl", "process_id": 42 }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_002", "name": "shell", "process_id": 43 }),
         ));
 
         let change = state.apply_event(&event(
@@ -615,11 +637,10 @@ mod tests {
             json!({ "agent_id": "agent_001", "exit_status": 0 }),
         ));
 
-        assert_eq!(change, StateChange::UpdatedPane("agent_001".to_string()));
-        let pane = state.pane("agent_001").expect("pane");
-        assert_eq!(pane.status(), Some("exited"));
-        assert_eq!(pane.process_id(), None);
-        assert_eq!(state.layout().panes(), &["agent_001".to_string()]);
+        assert_eq!(change, StateChange::RemovedPane("agent_001".to_string()));
+        assert!(state.pane("agent_001").is_none());
+        assert_eq!(state.layout().panes(), &["agent_002".to_string()]);
+        assert_eq!(state.layout().focused(), Some("agent_002"));
     }
 
     #[test]
@@ -655,6 +676,7 @@ mod tests {
             IpcEventKind::AgentSpawned,
             json!({ "agent_id": "agent_b", "name": "b" }),
         ));
+        state.layout_mut().focus("agent_a");
 
         state.focus_next();
         state.focus_previous();
@@ -675,6 +697,7 @@ mod tests {
             IpcEventKind::AgentSpawned,
             json!({ "agent_id": "agent_b", "name": "b" }),
         ));
+        state.layout_mut().focus("agent_a");
 
         assert_eq!(
             state.apply_command(TuiCommand::Focus(FocusDirection::Right)),
@@ -693,6 +716,22 @@ mod tests {
             CommandEffect::Continue
         );
         assert!(state.layout().is_zoomed());
+        assert_eq!(
+            state.apply_command(TuiCommand::SplitVertical),
+            CommandEffect::SpawnShellPane
+        );
+        assert_eq!(
+            state.apply_command(TuiCommand::ClosePane),
+            CommandEffect::StopPane("agent_a".to_string())
+        );
+        assert_eq!(
+            state.apply_command(TuiCommand::RotateLayout),
+            CommandEffect::Continue
+        );
+        assert_eq!(
+            state.layout().split_direction(),
+            crate::layout::SplitDirection::Horizontal
+        );
         assert_eq!(
             state.apply_command(TuiCommand::Detach),
             CommandEffect::Detach

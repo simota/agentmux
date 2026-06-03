@@ -1271,9 +1271,15 @@ fn existing_agent_id_from_status(payload: &Value) -> Option<String> {
         .get("agents")
         .and_then(Value::as_array)
         .and_then(|agents| {
-            agents
-                .iter()
-                .find_map(|agent| agent.get("id").and_then(Value::as_str))
+            agents.iter().find_map(|agent| {
+                let has_live_process = agent
+                    .get("has_process")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                has_live_process
+                    .then(|| agent.get("id").and_then(Value::as_str))
+                    .flatten()
+            })
         })
         .map(ToString::to_string)
 }
@@ -1384,7 +1390,10 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
                     writer.write(&detach_request()).await?;
                     break;
                 }
-                CommandEffect::Continue | CommandEffect::Unhandled(_) => {}
+                CommandEffect::Continue
+                | CommandEffect::SpawnShellPane
+                | CommandEffect::StopPane(_)
+                | CommandEffect::Unhandled(_) => {}
             }
         }
 
@@ -1402,7 +1411,20 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
                     CommandEffect::Continue => {
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
                     }
-                    CommandEffect::Detach | CommandEffect::Quit => {
+                    CommandEffect::SpawnShellPane => {
+                        writer.write(&bare_session_spawn_request()).await?;
+                    }
+                    CommandEffect::StopPane(agent_id) => {
+                        writer.write(&agent_stop_request(agent_id)).await?;
+                    }
+                    CommandEffect::Detach => {
+                        writer.write(&detach_request()).await?;
+                        break;
+                    }
+                    CommandEffect::Quit => {
+                        for agent_id in state.layout().panes().iter().cloned() {
+                            writer.write(&agent_stop_request(agent_id)).await?;
+                        }
                         writer.write(&detach_request()).await?;
                         break;
                     }
@@ -1646,24 +1668,44 @@ mod tests {
     }
 
     #[test]
-    fn bare_tui_target_prefers_existing_agent_session() {
+    fn bare_tui_target_prefers_existing_live_agent_session() {
         let payload = json!({
             "agents": [
-                {"id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K", "name": "planner"},
-                {"id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2M", "name": "impl"},
+                {
+                    "id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K",
+                    "name": "planner",
+                    "has_process": false
+                },
+                {
+                    "id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2M",
+                    "name": "shell",
+                    "has_process": true
+                },
             ]
         });
 
         assert_eq!(
             existing_agent_id_from_status(&payload),
-            Some("agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K".to_string())
+            Some("agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2M".to_string())
         );
     }
 
     #[test]
-    fn bare_tui_target_returns_none_when_status_has_no_agents() {
+    fn bare_tui_target_returns_none_when_status_has_no_live_agents() {
         assert_eq!(
             existing_agent_id_from_status(&json!({ "agents": [] })),
+            None
+        );
+        assert_eq!(
+            existing_agent_id_from_status(&json!({
+                "agents": [
+                    {
+                        "id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K",
+                        "name": "metadata-only",
+                        "has_process": false
+                    }
+                ]
+            })),
             None
         );
         assert_eq!(existing_agent_id_from_status(&json!({})), None);
