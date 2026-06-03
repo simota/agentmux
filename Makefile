@@ -7,6 +7,14 @@ DESTDIR ?=
 BINDIR   = $(DESTDIR)$(PREFIX)/bin
 INSTALL ?= install
 
+# Resolve cargo subcommands (clippy, rustfmt) via the rustup toolchain bin.
+# The PATH `cargo` shim may not locate `cargo-clippy`, so prepend the toolchain
+# bin (which holds cargo-clippy / cargo-fmt) when rustup is available.
+RUSTUP_CARGO := $(shell rustup which cargo 2>/dev/null)
+ifneq ($(RUSTUP_CARGO),)
+export PATH := $(patsubst %/,%,$(dir $(RUSTUP_CARGO))):$(PATH)
+endif
+
 # Shipped binaries (see crates/*/Cargo.toml [[bin]] entries).
 BINS       = agentmux agentmux-daemon agentmux-poc
 RELEASE_DIR = target/release
@@ -70,8 +78,15 @@ doc: ## Build API docs for workspace crates
 
 # --- Install / uninstall ---------------------------------------------------
 .PHONY: install
-install: release ## Install release binaries into $(BINDIR) (PREFIX=/usr/local)
-	$(INSTALL) -d "$(BINDIR)"
+install: release ## Install release binaries into $(BINDIR) (PREFIX=/usr/local; needs sudo)
+	@mkdir -p "$(BINDIR)" 2>/dev/null || true; \
+	if [ ! -w "$(BINDIR)" ]; then \
+		echo "error: '$(BINDIR)' is not writable. Choose one:"; \
+		echo "  sudo make install                   # system-wide (/usr/local)"; \
+		echo "  make install PREFIX=\$$HOME/.local   # user-local (no sudo)"; \
+		echo "  make install-cargo                  # ~/.cargo/bin (recommended)"; \
+		exit 1; \
+	fi
 	@for bin in $(BINS); do \
 		echo "  install $$bin -> $(BINDIR)/$$bin"; \
 		$(INSTALL) -m 0755 "$(RELEASE_DIR)/$$bin" "$(BINDIR)/$$bin"; \
