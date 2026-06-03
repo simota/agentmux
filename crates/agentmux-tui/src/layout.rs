@@ -121,8 +121,52 @@ impl PaneLayout {
         self.focused = Some(self.panes[next].clone());
     }
 
+    pub fn focus_previous(&mut self) {
+        if self.panes.is_empty() {
+            self.focused = None;
+            return;
+        }
+
+        let current = self
+            .focused
+            .as_ref()
+            .and_then(|focused| self.panes.iter().position(|pane| pane == focused))
+            .unwrap_or(0);
+        let previous = current
+            .checked_sub(1)
+            .unwrap_or_else(|| self.panes.len().saturating_sub(1));
+        self.focused = Some(self.panes[previous].clone());
+    }
+
+    pub fn remove_pane(&mut self, pane_id: &str) -> bool {
+        let Some(index) = self.panes.iter().position(|existing| existing == pane_id) else {
+            return false;
+        };
+        self.panes.remove(index);
+
+        if self.focused.as_deref() == Some(pane_id) {
+            self.focused = if self.panes.is_empty() {
+                None
+            } else {
+                Some(self.panes[index.min(self.panes.len() - 1)].clone())
+            };
+        }
+
+        if self.panes.is_empty() {
+            self.zoomed = false;
+        }
+        true
+    }
+
     pub fn set_split_direction(&mut self, split_direction: SplitDirection) {
         self.split_direction = split_direction;
+    }
+
+    pub fn toggle_split_direction(&mut self) {
+        self.split_direction = match self.split_direction {
+            SplitDirection::Horizontal => SplitDirection::Vertical,
+            SplitDirection::Vertical => SplitDirection::Horizontal,
+        };
     }
 
     pub fn toggle_zoom(&mut self) {
@@ -257,5 +301,34 @@ mod tests {
     fn inner_size_accounts_for_border_without_underflow() {
         assert_eq!(PaneLayout::pane_inner_size(Rect::new(0, 0, 10, 5)), (3, 8));
         assert_eq!(PaneLayout::pane_inner_size(Rect::new(0, 0, 1, 1)), (0, 0));
+    }
+
+    #[test]
+    fn focus_previous_wraps_to_last_pane() {
+        let mut layout = PaneLayout::with_panes(SplitDirection::Vertical, ["a", "b", "c"]);
+
+        layout.focus_previous();
+
+        assert_eq!(layout.focused(), Some("c"));
+    }
+
+    #[test]
+    fn remove_focused_pane_moves_focus_to_neighbor() {
+        let mut layout = PaneLayout::with_panes(SplitDirection::Vertical, ["a", "b", "c"]);
+        assert!(layout.focus("b"));
+
+        assert!(layout.remove_pane("b"));
+
+        assert_eq!(layout.panes(), &["a".to_owned(), "c".to_owned()]);
+        assert_eq!(layout.focused(), Some("c"));
+    }
+
+    #[test]
+    fn toggling_split_direction_switches_orientation() {
+        let mut layout = PaneLayout::with_panes(SplitDirection::Vertical, ["a", "b"]);
+
+        layout.toggle_split_direction();
+
+        assert_eq!(layout.split_direction(), SplitDirection::Horizontal);
     }
 }

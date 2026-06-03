@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, Widget},
 };
 
+use crate::state::TuiSessionState;
+
 /// Border/status metadata for an agent pane.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaneChrome {
@@ -90,6 +92,26 @@ impl AgentPaneRenderer {
     }
 }
 
+/// Renders all daemon-backed panes from client-side TUI state.
+#[derive(Clone, Debug, Default)]
+pub struct TuiSessionRenderer {
+    pane_renderer: AgentPaneRenderer,
+}
+
+impl TuiSessionRenderer {
+    pub fn render(&self, area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+        for (pane_id, rect) in state.layout().pane_rects(area) {
+            let Some(pane) = state.pane(&pane_id) else {
+                continue;
+            };
+            let chrome = PaneChrome::new(pane.chrome_title())
+                .focused(state.layout().focused() == Some(pane.agent_id()));
+            self.pane_renderer
+                .render(rect, pane.grid(), &chrome, buffer);
+        }
+    }
+}
+
 pub fn to_ratatui_style(style: &CellStyle) -> Style {
     let mut out = Style::default();
 
@@ -131,6 +153,9 @@ pub fn to_ratatui_color(color: TerminalColor) -> Color {
 mod tests {
     use super::*;
     use agentmux_terminal::{CellStyle, TerminalColor};
+    use serde_json::json;
+
+    use crate::state::TuiSessionState;
 
     #[test]
     fn render_grid_copies_characters_and_styles() {
@@ -172,6 +197,41 @@ mod tests {
         assert_eq!(buffer.cell((1, 1)).expect("inner a").symbol(), "a");
         assert_eq!(buffer.cell((2, 1)).expect("inner b").symbol(), "b");
         assert_eq!(buffer.cell((3, 1)).expect("inner c").symbol(), "c");
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "i" && cell.fg == Color::Cyan)
+        );
+    }
+
+    #[test]
+    fn render_session_splits_daemon_agent_panes_and_marks_focus() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "left", "name": "planner", "status": "ready"},
+                {"id": "right", "name": "impl"}
+            ]
+        }));
+        assert!(state.layout_mut().focus("right"));
+
+        let area = Rect::new(0, 0, 20, 5);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        assert_eq!(buffer.cell((0, 0)).expect("left border").symbol(), "┌");
+        assert_eq!(
+            buffer.cell((10, 0)).expect("right border starts").symbol(),
+            "┌"
+        );
+        assert!(
+            buffer
+                .content()
+                .iter()
+                .any(|cell| cell.symbol() == "p" && cell.fg == Color::DarkGray)
+        );
         assert!(
             buffer
                 .content()

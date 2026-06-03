@@ -17,6 +17,7 @@ pub enum FocusDirection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiCommand {
     Detach,
+    Quit,
     Help,
     ToggleZoom,
     Focus(FocusDirection),
@@ -130,6 +131,7 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
 
     match key.code {
         KeyCode::Char('d') => Some(TuiCommand::Detach),
+        KeyCode::Char('q') => Some(TuiCommand::Quit),
         KeyCode::Char('?') => Some(TuiCommand::Help),
         KeyCode::Char('z') => Some(TuiCommand::ToggleZoom),
         KeyCode::Left => Some(TuiCommand::Focus(FocusDirection::Left)),
@@ -143,7 +145,7 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Char('A') => Some(TuiCommand::ShowApprovalQueue),
         KeyCode::Char('%') => Some(TuiCommand::SplitVertical),
         KeyCode::Char('"') => Some(TuiCommand::SplitHorizontal),
-        KeyCode::Char('x') => Some(TuiCommand::ClosePane),
+        KeyCode::Char('x') => Some(TuiCommand::Quit),
         KeyCode::Char('r') => Some(TuiCommand::ResizeMode),
         KeyCode::Char(' ') => Some(TuiCommand::RotateLayout),
         KeyCode::Char('p') => Some(TuiCommand::PasteQueuedMessage),
@@ -222,6 +224,35 @@ mod tests {
 
         assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ToggleZoom));
         assert!(!dispatcher.is_awaiting_prefix_command());
+    }
+
+    #[test]
+    fn prefixed_q_maps_to_quit_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Quit));
+    }
+
+    #[test]
+    fn bare_q_is_forwarded_to_focused_pane() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::ForwardToFocusedPane(b"q".to_vec()));
+    }
+
+    #[test]
+    fn prefixed_x_maps_to_quit_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Quit));
     }
 
     #[test]

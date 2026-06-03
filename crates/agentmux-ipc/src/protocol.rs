@@ -146,6 +146,30 @@ impl DaemonEvent {
     }
 }
 
+/// Frame sent from daemon to client on the JSONL stream.
+///
+/// A client receives request responses and unsolicited daemon events on the
+/// same socket. After `client.attach`, the daemon keeps this stream open and
+/// may continue to push events until `client.detach` or disconnect.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum DaemonStreamFrame {
+    Response(DaemonResponse),
+    Event(DaemonEvent),
+}
+
+impl From<DaemonResponse> for DaemonStreamFrame {
+    fn from(response: DaemonResponse) -> Self {
+        Self::Response(response)
+    }
+}
+
+impl From<DaemonEvent> for DaemonStreamFrame {
+    fn from(event: DaemonEvent) -> Self {
+        Self::Event(event)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorBody {
     pub code: String,
@@ -249,14 +273,28 @@ pub enum IpcEventKind {
     ClientAttached,
     #[serde(rename = "client.detached")]
     ClientDetached,
+    #[serde(rename = "task.created")]
+    TaskCreated,
+    #[serde(rename = "task.status_changed")]
+    TaskStatusChanged,
     #[serde(rename = "agent.spawned")]
     AgentSpawned,
+    #[serde(rename = "agent.status_signal")]
+    AgentStatusSignal,
     #[serde(rename = "agent.status_changed")]
     AgentStatusChanged,
     #[serde(rename = "agent.exited")]
     AgentExited,
+    #[serde(rename = "pty.output_chunk")]
+    PtyOutputChunk,
     #[serde(rename = "screen.diff")]
     ScreenDiff,
+    #[serde(rename = "terminal.snapshot_saved")]
+    TerminalSnapshotSaved,
+    #[serde(rename = "input_script.created")]
+    InputScriptCreated,
+    #[serde(rename = "input_script.injected")]
+    InputScriptInjected,
     #[serde(rename = "input.injected")]
     InputInjected,
     #[serde(rename = "message.created")]
@@ -347,6 +385,55 @@ mod tests {
         assert_eq!(encoded["version"], PROTOCOL_VERSION);
         assert_eq!(encoded["type"], "screen.diff");
         assert_eq!(encoded["payload"]["pane_id"], "pane_001");
+    }
+
+    #[test]
+    fn daemon_stream_frame_decodes_mixed_response_and_event_frames() {
+        let response = DaemonResponse::ok("req_attach", json!({ "client_id": "client_001" }));
+        let event = DaemonEvent::new(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_001" }),
+        );
+
+        let response_frame: DaemonStreamFrame =
+            serde_json::from_value(serde_json::to_value(response).unwrap()).unwrap();
+        let event_frame: DaemonStreamFrame =
+            serde_json::from_value(serde_json::to_value(event).unwrap()).unwrap();
+
+        assert!(matches!(response_frame, DaemonStreamFrame::Response(_)));
+        assert!(matches!(event_frame, DaemonStreamFrame::Event(_)));
+    }
+
+    #[test]
+    fn attach_command_uses_streaming_protocol_shape() {
+        let request = ClientRequest::new(
+            "req_attach",
+            IpcCommand::ClientAttach,
+            json!({ "agent_id": "agent_001" }),
+        );
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["type"], "client.attach");
+        assert_eq!(encoded["payload"]["agent_id"], "agent_001");
+    }
+
+    #[test]
+    fn event_kinds_include_required_continuous_stream_events() {
+        let cases = [
+            (IpcEventKind::AgentSpawned, "agent.spawned"),
+            (IpcEventKind::AgentExited, "agent.exited"),
+            (IpcEventKind::PtyOutputChunk, "pty.output_chunk"),
+            (IpcEventKind::AgentStatusChanged, "agent.status_changed"),
+            (IpcEventKind::MessageDelivered, "message.delivered"),
+            (IpcEventKind::ApprovalCreated, "approval.created"),
+            (IpcEventKind::InputScriptInjected, "input_script.injected"),
+        ];
+
+        for (kind, expected) in cases {
+            let event = DaemonEvent::new(kind, json!({}));
+            let encoded = serde_json::to_value(event).unwrap();
+            assert_eq!(encoded["type"], expected);
+        }
     }
 
     #[test]

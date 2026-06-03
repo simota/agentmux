@@ -131,10 +131,13 @@ dependencies = [
 name = "agentmux-tui"
 version = "0.1.0"
 dependencies = [
+ "agentmux-agent",
  "agentmux-core",
+ "agentmux-ipc",
  "agentmux-terminal",
  "crossterm",
  "ratatui",
+ "serde_json",
 ]
 
 [[package]]

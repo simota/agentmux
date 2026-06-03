@@ -8,7 +8,10 @@ repository.workspace = true
 description = "Ratatui layout, pane rendering, keymap, and overlays for the agentmux TUI client"
 
 [dependencies]
+agentmux-agent = { workspace = true }
 agentmux-core = { workspace = true }
+agentmux-ipc = { workspace = true }
 agentmux-terminal = { workspace = true }
 ratatui       = { workspace = true }
 crossterm     = { workspace = true }
+serde_json    = { workspace = true }

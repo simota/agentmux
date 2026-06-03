@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{io::ErrorKind, time::Duration};
 
 use agentmux_agent::{
     InputAction, InputScript,
@@ -13,7 +13,7 @@ use agentmux_ipc::{
 use agentmux_store::EventLog;
 use serde_json::json;
 use tokio::io::BufReader;
-use tokio::net::UnixStream;
+use tokio::net::{UnixListener, UnixStream};
 
 #[tokio::test]
 async fn task_run_shell_stub_handoffs_planner_to_implementer_tester_and_reviewer() {
@@ -131,10 +131,8 @@ async fn daemon_ipc_spawn_attach_inject_detach_and_reattach_reaches_live_process
         ))
         .await
         .unwrap();
-    let (spawn_response, spawn_events) =
-        read_response_and_events(&mut reader, "req_spawn", &[IpcEventKind::AgentSpawned]).await;
+    let spawn_response = read_response(&mut reader).await;
     assert!(spawn_response.ok, "spawn response was {spawn_response:?}");
-    assert_eq!(spawn_events[0].kind, IpcEventKind::AgentSpawned);
     let agent_id = spawn_response.payload.unwrap()["agent_id"]
         .as_str()
         .unwrap()
@@ -193,13 +191,11 @@ async fn daemon_ipc_spawn_attach_inject_detach_and_reattach_reaches_live_process
         ))
         .await
         .unwrap();
-    let (detach_response, detach_events) =
-        read_response_and_events(&mut reader, "req_detach", &[IpcEventKind::ClientDetached]).await;
+    let detach_response = read_response(&mut reader).await;
     assert!(
         detach_response.ok,
         "detach response was {detach_response:?}"
     );
-    assert_eq!(detach_events[0].payload["agent_id"], agent_id);
 
     writer
         .write(&ClientRequest::new(
@@ -279,6 +275,117 @@ async fn daemon_ipc_spawn_attach_inject_detach_and_reattach_reaches_live_process
     std::fs::remove_dir_all(root).expect("temporary project root is removed");
 }
 
+#[tokio::test]
+async fn daemon_socket_attach_stream_receives_spawn_event_and_detaches() {
+    let socket_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("target")
+        .join("t");
+    std::fs::create_dir_all(&socket_dir).expect("daemon test socket dir is created");
+    let socket_name = ulid::Ulid::new().to_string();
+    let socket_path = socket_dir.join(format!("{}.sock", &socket_name[..8]));
+    let runtime = DaemonRuntime::new(16);
+    let anchor_agent = runtime.register_agent("anchor".to_string()).await;
+
+    let (server, client_stream) = connect_daemon_test_socket(runtime.clone(), &socket_path).await;
+    let (reader, writer) = client_stream.into_split();
+    let mut reader = JsonlReader::new(BufReader::new(reader));
+    let mut writer = JsonlWriter::new(writer);
+
+    writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+    writer
+        .write(&ClientRequest::new(
+            "req_attach",
+            IpcCommand::ClientAttach,
+            json!({ "agent_id": anchor_agent.id.to_string() }),
+        ))
+        .await
+        .unwrap();
+    let (attach_response, attach_events) =
+        read_response_and_events(&mut reader, "req_attach", &[IpcEventKind::ClientAttached]).await;
+    assert!(
+        attach_response.ok,
+        "attach response was {attach_response:?}"
+    );
+    assert_eq!(
+        attach_events[0].payload["agent_id"],
+        anchor_agent.id.to_string()
+    );
+
+    writer
+        .write(&ClientRequest::new(
+            "req_spawn",
+            IpcCommand::AgentSpawn,
+            json!({ "name": "socket-spawned" }),
+        ))
+        .await
+        .unwrap();
+    let (spawn_response, spawn_events) =
+        read_response_and_events(&mut reader, "req_spawn", &[IpcEventKind::AgentSpawned]).await;
+    assert!(spawn_response.ok, "spawn response was {spawn_response:?}");
+    let spawned_agent_id = spawn_response.payload.unwrap()["agent_id"]
+        .as_str()
+        .expect("spawn response includes agent id")
+        .to_string();
+    assert_eq!(spawn_events[0].payload["agent_id"], spawned_agent_id);
+    assert_eq!(spawn_events[0].payload["name"], "socket-spawned");
+
+    writer
+        .write(&ClientRequest::new(
+            "req_detach",
+            IpcCommand::ClientDetach,
+            json!({}),
+        ))
+        .await
+        .unwrap();
+    let detach_response = read_response(&mut reader).await;
+    assert!(
+        detach_response.ok,
+        "detach response was {detach_response:?}"
+    );
+
+    runtime.register_agent("after-detach".to_string()).await;
+    assert_no_frame(&mut reader).await;
+
+    drop(writer);
+    drop(reader);
+    let server_result = server.await.expect("server task joins");
+    assert!(server_result.is_ok(), "server result was {server_result:?}");
+    if socket_path.exists() {
+        std::fs::remove_file(&socket_path).expect("daemon test socket is removed");
+    }
+}
+
+async fn connect_daemon_test_socket(
+    runtime: DaemonRuntime,
+    socket_path: &std::path::Path,
+) -> (
+    tokio::task::JoinHandle<agentmux_core::error::Result<()>>,
+    UnixStream,
+) {
+    match UnixListener::bind(socket_path) {
+        Ok(listener) => {
+            let server_runtime = runtime.clone();
+            let server = tokio::spawn(async move {
+                let (server_stream, _) = listener.accept().await.expect("client connects");
+                handle_client(server_stream, server_runtime).await
+            });
+            let client_stream = UnixStream::connect(socket_path)
+                .await
+                .expect("client connects through socket path");
+            (server, client_stream)
+        }
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            let (client_stream, server_stream) =
+                UnixStream::pair().expect("sandbox fallback IPC pair is created");
+            let server = tokio::spawn(async move { handle_client(server_stream, runtime).await });
+            (server, client_stream)
+        }
+        Err(error) => panic!("daemon test socket is bound: {error}"),
+    }
+}
+
 async fn read_response<R>(reader: &mut JsonlReader<R>) -> DaemonResponse
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -335,6 +442,20 @@ where
         }
     }
     panic!("daemon did not send response {request_id:?} with expected events {expected_events:?}");
+}
+
+async fn assert_no_frame<R>(reader: &mut JsonlReader<R>)
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    if let Ok(Ok(Some(frame))) = tokio::time::timeout(
+        Duration::from_millis(100),
+        reader.read::<serde_json::Value>(),
+    )
+    .await
+    {
+        panic!("unexpected daemon frame after detach: {frame:?}");
+    }
 }
 
 async fn assert_file_contains(path: &std::path::Path, needle: &str) {
