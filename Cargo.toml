@@ -50,7 +50,6 @@ thiserror = { version = "2.0" }
 
 # ── IDs ──────────────────────────────────────────────────────────────────────
 # ulid provides prefix-friendly sortable IDs (ULIDs).
-# #TODO(agent): evaluate if uuid v7 is preferred once ecosystem matures.
 ulid = { version = "1.1", features = ["serde"] }
 
 # ── Time ─────────────────────────────────────────────────────────────────────
@@ -64,7 +63,6 @@ async-trait = { version = "0.1" }
 
 # ── PTY ──────────────────────────────────────────────────────────────────────
 # portable-pty provides cross-platform PTY creation.
-# #TODO(agent): verify portable-pty 0.8 is the latest stable on crates.io.
 portable-pty = { version = "0.8" }
 libc = { version = "0.2" }
 

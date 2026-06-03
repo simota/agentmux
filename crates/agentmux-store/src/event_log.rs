@@ -321,11 +321,43 @@ pub struct MessageEventPayload {
 #[derive(Debug, Clone)]
 pub struct EventLog {
     path: PathBuf,
+    rotation: Option<EventLogRotation>,
+}
+
+/// Size-based JSONL rotation policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventLogRotation {
+    pub max_bytes: u64,
+    pub keep: usize,
+}
+
+impl EventLogRotation {
+    pub fn new(max_bytes: u64, keep: usize) -> Result<Self> {
+        if max_bytes == 0 {
+            return Err(AgentmuxError::StoreError(
+                "event log rotation max_bytes must be greater than zero".to_string(),
+            ));
+        }
+        if keep == 0 {
+            return Err(AgentmuxError::StoreError(
+                "event log rotation keep must be greater than zero".to_string(),
+            ));
+        }
+        Ok(Self { max_bytes, keep })
+    }
 }
 
 impl EventLog {
     pub fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            rotation: None,
+        }
+    }
+
+    pub fn with_rotation(mut self, rotation: EventLogRotation) -> Self {
+        self.rotation = Some(rotation);
+        self
     }
 
     pub fn path(&self) -> &Path {
@@ -333,6 +365,9 @@ impl EventLog {
     }
 
     pub fn append(&self, entry: &EventLogEntry) -> Result<()> {
+        let encoded = serde_json::to_vec(entry).map_err(json_error)?;
+        self.rotate_if_needed((encoded.len() + 1) as u64)?;
+
         if let Some(parent) = self.path.parent()
             && !parent.as_os_str().is_empty()
         {
@@ -354,8 +389,13 @@ impl EventLog {
                     self.path.display()
                 ))
             })?;
-        serde_json::to_writer(&mut file, entry).map_err(json_error)?;
         use std::io::Write;
+        file.write_all(&encoded).map_err(|error| {
+            AgentmuxError::StoreError(format!(
+                "failed to write event log '{}': {error}",
+                self.path.display()
+            ))
+        })?;
         file.write_all(b"\n").map_err(|error| {
             AgentmuxError::StoreError(format!(
                 "failed to write event log '{}': {error}",
@@ -374,10 +414,106 @@ impl EventLog {
         }
         Ok(())
     }
+
+    pub fn read_entries(&self) -> Result<Vec<EventLogEntry>> {
+        let mut entries = Vec::new();
+        for path in self.log_paths_oldest_first() {
+            let content = match std::fs::read_to_string(&path) {
+                Ok(content) => content,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(AgentmuxError::StoreError(format!(
+                        "failed to read event log '{}': {error}",
+                        path.display()
+                    )));
+                }
+            };
+            let last_line_number = content.lines().count();
+            for (index, line) in content.lines().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<EventLogEntry>(line) {
+                    Ok(entry) => entries.push(entry),
+                    Err(_) if index + 1 == last_line_number && !line.trim_end().ends_with('}') => {}
+                    Err(error) => {
+                        return Err(AgentmuxError::StoreError(format!(
+                            "invalid event log JSON in '{}': {error}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    fn rotate_if_needed(&self, pending_bytes: u64) -> Result<()> {
+        let Some(rotation) = self.rotation else {
+            return Ok(());
+        };
+        let current_bytes = match std::fs::metadata(&self.path) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                return Err(AgentmuxError::StoreError(format!(
+                    "failed to inspect event log '{}': {error}",
+                    self.path.display()
+                )));
+            }
+        };
+        if current_bytes == 0 || current_bytes + pending_bytes <= rotation.max_bytes {
+            return Ok(());
+        }
+
+        let oldest = rotated_path(&self.path, rotation.keep);
+        if oldest.exists() {
+            std::fs::remove_file(&oldest).map_err(|error| {
+                AgentmuxError::StoreError(format!(
+                    "failed to remove rotated event log '{}': {error}",
+                    oldest.display()
+                ))
+            })?;
+        }
+        for index in (1..rotation.keep).rev() {
+            let from = rotated_path(&self.path, index);
+            if from.exists() {
+                let to = rotated_path(&self.path, index + 1);
+                std::fs::rename(&from, &to).map_err(|error| {
+                    AgentmuxError::StoreError(format!(
+                        "failed to rotate event log '{}' to '{}': {error}",
+                        from.display(),
+                        to.display()
+                    ))
+                })?;
+            }
+        }
+        std::fs::rename(&self.path, rotated_path(&self.path, 1)).map_err(|error| {
+            AgentmuxError::StoreError(format!(
+                "failed to rotate event log '{}': {error}",
+                self.path.display()
+            ))
+        })
+    }
+
+    fn log_paths_oldest_first(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        if let Some(rotation) = self.rotation {
+            for index in (1..=rotation.keep).rev() {
+                paths.push(rotated_path(&self.path, index));
+            }
+        }
+        paths.push(self.path.clone());
+        paths
+    }
 }
 
 fn json_error(error: serde_json::Error) -> AgentmuxError {
     AgentmuxError::StoreError(format!("invalid event log JSON: {error}"))
+}
+
+fn rotated_path(path: &Path, index: usize) -> PathBuf {
+    PathBuf::from(format!("{}.{index}", path.display()))
 }
 
 #[cfg(test)]
@@ -523,6 +659,78 @@ mod tests {
                 .contains(&key.as_str())
             }));
         }
+
+        std::fs::remove_dir_all(root).expect("temporary event log directory is removed");
+    }
+
+    #[test]
+    fn rejects_invalid_rotation_policy() {
+        assert!(EventLogRotation::new(0, 1).is_err());
+        assert!(EventLogRotation::new(1, 0).is_err());
+    }
+
+    #[test]
+    fn rotates_event_log_when_next_entry_would_exceed_limit() {
+        let root = std::env::temp_dir().join(format!("agentmux-event-log-{}", ulid::Ulid::new()));
+        let path = root.join(".agentmux").join("events.jsonl");
+        let rotation = EventLogRotation::new(220, 2).expect("rotation policy is valid");
+        let log = EventLog::new(&path).with_rotation(rotation);
+        let first = EventLogEntry::new(
+            "first",
+            DateTimeUtc::UNIX_EPOCH,
+            json!({"body": "a".repeat(80)}),
+        )
+        .expect("first event");
+        let second = EventLogEntry::new(
+            "second",
+            DateTimeUtc::UNIX_EPOCH,
+            json!({"body": "b".repeat(80)}),
+        )
+        .expect("second event");
+
+        log.append(&first).expect("first entry is appended");
+        log.append(&second).expect("second entry triggers rotation");
+
+        let current = std::fs::read_to_string(&path).expect("current log exists");
+        let rotated = std::fs::read_to_string(rotated_path(&path, 1)).expect("rotated log exists");
+        assert!(current.contains("\"type\":\"second\""));
+        assert!(rotated.contains("\"type\":\"first\""));
+
+        std::fs::remove_dir_all(root).expect("temporary event log directory is removed");
+    }
+
+    #[test]
+    fn reads_rotated_event_logs_oldest_first_and_ignores_truncated_tail() {
+        let root = std::env::temp_dir().join(format!("agentmux-event-log-{}", ulid::Ulid::new()));
+        let path = root.join(".agentmux").join("events.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).expect("event log directory is created");
+        let rotation = EventLogRotation::new(1024, 2).expect("rotation policy is valid");
+        let log = EventLog::new(&path).with_rotation(rotation);
+        let older =
+            EventLogEntry::new("older", DateTimeUtc::UNIX_EPOCH, json!({})).expect("older event");
+        let newer =
+            EventLogEntry::new("newer", DateTimeUtc::UNIX_EPOCH, json!({})).expect("newer event");
+
+        std::fs::write(
+            rotated_path(&path, 1),
+            serde_json::to_string(&older).unwrap() + "\n",
+        )
+        .expect("rotated log is written");
+        std::fs::write(
+            &path,
+            serde_json::to_string(&newer).unwrap() + "\n{\"id\":\"evt_truncated\"",
+        )
+        .expect("current log is written");
+
+        let entries = log.read_entries().expect("entries are read");
+
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry.kind.as_str())
+                .collect::<Vec<_>>(),
+            ["older", "newer"]
+        );
 
         std::fs::remove_dir_all(root).expect("temporary event log directory is removed");
     }

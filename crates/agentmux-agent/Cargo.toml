@@ -9,6 +9,7 @@ description = "AgentSession management, provider adapters, status detection, and
 
 [dependencies]
 agentmux-core     = { workspace = true }
+agentmux-context  = { workspace = true }
 agentmux-message  = { workspace = true }
 agentmux-pty      = { workspace = true }
 agentmux-terminal = { workspace = true }

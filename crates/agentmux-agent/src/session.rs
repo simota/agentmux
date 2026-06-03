@@ -1,8 +1,6 @@
 //! `AgentSession` domain struct.
 //!
 //! See `docs/spec/03_domain_model.md §5`.
-//!
-//! #TODO(agent): implement full AgentSession with in-memory state management
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -10,14 +8,16 @@ use std::time::Duration;
 
 use agentmux_core::{
     AgentMode, AgentProvider, AgentRole, AgentSessionId, AgentStatus, ContextScopeId, DateTimeUtc,
-    InboxId, PaneId, ProjectId, PtyId, TaskId, TerminalBufferId, WorktreeId, ids::ClientId,
+    InboxId, PaneId, ProjectId, PtyId, TaskId, TerminalBufferId, WorktreeId, error::Result,
+    ids::ClientId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::AgentCapabilities;
+use crate::signal::StateSignal;
 
 /// Represents a live (or recently-exited) agent process managed by agentmux.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentSession {
     pub id: AgentSessionId,
     pub project_id: ProjectId,
@@ -35,11 +35,135 @@ pub struct AgentSession {
     pub env: BTreeMap<String, String>,
     pub status: AgentStatus,
     pub capabilities: AgentCapabilities,
+    pub input_lock: InputLock,
     pub inbox_id: InboxId,
     pub context_scope_id: ContextScopeId,
     pub created_at: DateTimeUtc,
     pub last_activity_at: DateTimeUtc,
     pub exited_at: Option<DateTimeUtc>,
+}
+
+impl AgentSession {
+    pub fn new(init: AgentSessionInit, now: DateTimeUtc) -> Self {
+        Self {
+            id: init.id.unwrap_or_default(),
+            project_id: init.project_id,
+            task_id: init.task_id,
+            name: init.name,
+            provider: init.provider,
+            role: init.role,
+            mode: init.mode,
+            pty_id: init.pty_id,
+            process_id: init.process_id,
+            pane_id: init.pane_id,
+            terminal_buffer_id: init.terminal_buffer_id.unwrap_or_default(),
+            worktree_id: init.worktree_id,
+            cwd: init.cwd,
+            env: init.env,
+            status: AgentStatus::Starting,
+            capabilities: init.capabilities,
+            input_lock: InputLock::default(),
+            inbox_id: init.inbox_id.unwrap_or_default(),
+            context_scope_id: init.context_scope_id.unwrap_or_default(),
+            created_at: now,
+            last_activity_at: now,
+            exited_at: None,
+        }
+    }
+
+    pub fn transition_status(&mut self, next: AgentStatus, now: DateTimeUtc) -> Result<()> {
+        if !is_allowed_transition(&self.status, &next) {
+            return Err(agentmux_core::AgentmuxError::UserError(format!(
+                "invalid agent status transition: {:?} -> {:?}",
+                self.status, next
+            )));
+        }
+
+        self.status = next;
+        self.last_activity_at = now;
+        if matches!(self.status, AgentStatus::Exited | AgentStatus::Failed) {
+            self.exited_at = Some(now);
+            self.input_lock = InputLock::unlocked();
+        }
+        Ok(())
+    }
+
+    pub fn apply_state_signal(&mut self, signal: &StateSignal) -> Result<()> {
+        if signal.agent_id != self.id {
+            return Err(agentmux_core::AgentmuxError::UserError(format!(
+                "state signal for '{}' cannot be applied to '{}'",
+                signal.agent_id, self.id
+            )));
+        }
+
+        self.transition_status(signal.value.clone(), signal.observed_at)
+    }
+
+    pub fn record_human_input(&mut self, at: DateTimeUtc) {
+        self.last_activity_at = at;
+    }
+
+    pub fn record_pty_output(&mut self, at: DateTimeUtc) {
+        self.last_activity_at = at;
+    }
+
+    pub fn set_process_id(&mut self, process_id: u32, at: DateTimeUtc) {
+        self.process_id = Some(process_id);
+        self.last_activity_at = at;
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AgentSessionInit {
+    pub id: Option<AgentSessionId>,
+    pub project_id: ProjectId,
+    pub task_id: Option<TaskId>,
+    pub name: String,
+    pub provider: AgentProvider,
+    pub role: AgentRole,
+    pub mode: AgentMode,
+    pub pty_id: PtyId,
+    pub process_id: Option<u32>,
+    pub pane_id: Option<PaneId>,
+    pub terminal_buffer_id: Option<TerminalBufferId>,
+    pub worktree_id: Option<WorktreeId>,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub capabilities: AgentCapabilities,
+    pub inbox_id: Option<InboxId>,
+    pub context_scope_id: Option<ContextScopeId>,
+}
+
+fn is_allowed_transition(current: &AgentStatus, next: &AgentStatus) -> bool {
+    if current == next {
+        return true;
+    }
+
+    if matches!(current, AgentStatus::Exited | AgentStatus::Failed) {
+        return false;
+    }
+
+    if matches!(
+        next,
+        AgentStatus::NeedsHuman | AgentStatus::Stalled | AgentStatus::Exited | AgentStatus::Failed
+    ) {
+        return true;
+    }
+
+    matches!(
+        (current, next),
+        (AgentStatus::Starting, AgentStatus::InteractiveReady)
+            | (AgentStatus::InteractiveReady, AgentStatus::AwaitingInput)
+            | (AgentStatus::AwaitingInput, AgentStatus::RunningTurn)
+            | (AgentStatus::RunningTurn, AgentStatus::RunningCommand)
+            | (AgentStatus::RunningCommand, AgentStatus::AwaitingApproval)
+            | (AgentStatus::AwaitingApproval, AgentStatus::RunningCommand)
+            | (AgentStatus::RunningCommand, AgentStatus::CompletedTurn)
+            | (AgentStatus::RunningTurn, AgentStatus::CompletedTurn)
+            | (AgentStatus::CompletedTurn, AgentStatus::AwaitingInput)
+            | (AgentStatus::Stalled, AgentStatus::AwaitingInput)
+            | (AgentStatus::NeedsHuman, AgentStatus::AwaitingInput)
+    )
 }
 
 /// Current owner of a pane's input stream.
@@ -178,9 +302,148 @@ fn elapsed_since(earlier: DateTimeUtc, later: DateTimeUtc) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use agentmux_core::StateSignalSource;
 
     fn now() -> DateTimeUtc {
         DateTimeUtc::UNIX_EPOCH + time::Duration::seconds(100)
+    }
+
+    fn session_init() -> AgentSessionInit {
+        AgentSessionInit {
+            id: Some(AgentSessionId::new()),
+            project_id: ProjectId::new(),
+            task_id: Some(TaskId::new()),
+            name: "impl-codex".to_string(),
+            provider: AgentProvider::Codex,
+            role: AgentRole::Implementer,
+            mode: AgentMode::InteractiveTui,
+            pty_id: PtyId::new(),
+            process_id: None,
+            pane_id: Some(PaneId::new()),
+            terminal_buffer_id: Some(TerminalBufferId::new()),
+            worktree_id: Some(WorktreeId::new()),
+            cwd: PathBuf::from("/tmp/project"),
+            env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+            capabilities: AgentCapabilities::codex(),
+            inbox_id: Some(InboxId::new()),
+            context_scope_id: Some(ContextScopeId::new()),
+        }
+    }
+
+    #[test]
+    fn agent_session_initializes_in_memory_state() {
+        let created_at = now();
+        let init = session_init();
+        let expected_id = init.id.clone().expect("test id");
+
+        let session = AgentSession::new(init, created_at);
+
+        assert_eq!(session.id, expected_id);
+        assert_eq!(session.status, AgentStatus::Starting);
+        assert_eq!(session.input_lock, InputLock::unlocked());
+        assert_eq!(session.created_at, created_at);
+        assert_eq!(session.last_activity_at, created_at);
+        assert_eq!(session.exited_at, None);
+    }
+
+    #[test]
+    fn agent_session_applies_spec_status_transitions() {
+        let mut session = AgentSession::new(session_init(), now());
+        let ready_at = now() + time::Duration::seconds(1);
+
+        session
+            .transition_status(AgentStatus::InteractiveReady, ready_at)
+            .expect("starting -> ready");
+        session
+            .transition_status(
+                AgentStatus::AwaitingInput,
+                ready_at + time::Duration::seconds(1),
+            )
+            .expect("ready -> awaiting input");
+        session
+            .transition_status(
+                AgentStatus::RunningTurn,
+                ready_at + time::Duration::seconds(2),
+            )
+            .expect("awaiting input -> running turn");
+        session
+            .transition_status(
+                AgentStatus::CompletedTurn,
+                ready_at + time::Duration::seconds(3),
+            )
+            .expect("running turn -> completed turn");
+
+        assert_eq!(session.status, AgentStatus::CompletedTurn);
+        assert_eq!(
+            session.last_activity_at,
+            ready_at + time::Duration::seconds(3)
+        );
+    }
+
+    #[test]
+    fn agent_session_rejects_invalid_forward_jump() {
+        let mut session = AgentSession::new(session_init(), now());
+
+        let error = session
+            .transition_status(AgentStatus::RunningCommand, now())
+            .expect_err("starting cannot skip to running command");
+
+        assert!(
+            error
+                .to_string()
+                .contains("invalid agent status transition")
+        );
+        assert_eq!(session.status, AgentStatus::Starting);
+    }
+
+    #[test]
+    fn agent_session_terminal_status_releases_input_lock_and_is_final() {
+        let mut session = AgentSession::new(session_init(), now());
+        session
+            .input_lock
+            .acquire(InputOwner::Orchestrator, now(), Duration::from_secs(30))
+            .expect("lock acquired");
+
+        session
+            .transition_status(AgentStatus::Exited, now() + time::Duration::seconds(1))
+            .expect("any non-terminal can exit");
+
+        assert_eq!(session.input_lock, InputLock::unlocked());
+        assert_eq!(session.exited_at, Some(now() + time::Duration::seconds(1)));
+        assert!(
+            session
+                .transition_status(
+                    AgentStatus::AwaitingInput,
+                    now() + time::Duration::seconds(2)
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_session_applies_matching_state_signal_only() {
+        let mut session = AgentSession::new(session_init(), now());
+        let signal = StateSignal {
+            agent_id: session.id.clone(),
+            source: StateSignalSource::Process,
+            confidence: 1.0,
+            value: AgentStatus::Failed,
+            evidence: "process exited non-zero".to_string(),
+            observed_at: now() + time::Duration::seconds(5),
+        };
+
+        session
+            .apply_state_signal(&signal)
+            .expect("matching signal applies");
+
+        assert_eq!(session.status, AgentStatus::Failed);
+        assert_eq!(session.exited_at, Some(signal.observed_at));
+
+        let mut other = AgentSession::new(session_init(), now());
+        let error = other
+            .apply_state_signal(&signal)
+            .expect_err("signal belongs to a different session");
+        assert!(error.to_string().contains("cannot be applied"));
     }
 
     #[test]

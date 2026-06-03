@@ -38,4 +38,4 @@ pub use result::{
     OutgoingMessage, OutgoingMessageKind, OutgoingPriority, ParsedAgentResult, RESULT_MARKER,
     ResultRecommendation, ResultRisk, StatusProbeRequest, parse_agent_result_marker,
 };
-pub use session::{InputActivity, InputLock, InputOwner};
+pub use session::{AgentSession, AgentSessionInit, InputActivity, InputLock, InputOwner};

@@ -105,6 +105,11 @@ impl PtyReadLoop {
         self.receiver.recv().await
     }
 
+    /// Try to receive one PTY output event without waiting.
+    pub fn try_recv(&mut self) -> Option<PtyReadEvent> {
+        self.receiver.try_recv().ok()
+    }
+
     /// Whether the underlying blocking read task has finished.
     pub fn is_finished(&self) -> bool {
         self.task.is_finished()
@@ -323,23 +328,43 @@ mod tests {
         assert!(output.contains("agentmux-pty"), "output was {output:?}");
     }
 
-    #[test]
-    fn writes_input_to_interactive_process() {
+    #[tokio::test]
+    async fn writes_input_to_interactive_process() {
         let mut handle = PtyHandle::spawn(shell_spec("cat")).expect("spawn cat");
-        let mut reader = handle.try_clone_reader().expect("clone pty reader");
+        let mut read_loop = handle.spawn_read_loop(4).expect("spawn read loop");
 
         handle
             .write_bytes(b"round trip through pty\n")
             .expect("write input");
-        handle.terminate().expect("terminate cat");
 
-        let mut output = String::new();
-        reader.read_to_string(&mut output).expect("read output");
+        let mut output = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(event) = read_loop.recv().await {
+                match event {
+                    PtyReadEvent::Output(bytes) => {
+                        output.extend(bytes);
+                        if output
+                            .windows(b"round trip through pty".len())
+                            .any(|window| window == b"round trip through pty")
+                        {
+                            break;
+                        }
+                    }
+                    PtyReadEvent::Eof => break,
+                    PtyReadEvent::Error(error) => panic!("read loop error: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("read echoed PTY input before timeout");
+
+        handle.terminate().expect("terminate cat");
         let _ = handle.wait();
 
         assert!(
-            output.contains("round trip through pty"),
-            "output was {output:?}"
+            String::from_utf8_lossy(&output).contains("round trip through pty"),
+            "output was {:?}",
+            String::from_utf8_lossy(&output)
         );
     }
 
