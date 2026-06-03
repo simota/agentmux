@@ -6,9 +6,6 @@
 //!
 //! Each newtype wraps a `ulid::Ulid` and serialises as `"<prefix><ulid>"`.
 //!
-//! #TODO(agent): add Display / FromStr impls with prefix validation once
-//!               the string format is confirmed final.
-
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
@@ -81,3 +78,39 @@ define_id!(JobId, "job_");
 define_id!(ClientId, "client_");
 // Generic actor reference used in audit fields (human or orchestrator).
 define_id!(ActorId, "actor_");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_and_from_str_round_trip_prefixed_id() {
+        let id = TaskId::new();
+        let encoded = id.to_string();
+
+        assert!(encoded.starts_with(TaskId::prefix()));
+        assert_eq!(encoded.parse::<TaskId>().expect("valid task id"), id);
+    }
+
+    #[test]
+    fn from_str_rejects_wrong_prefix() {
+        let id = TaskId::new();
+        let encoded = id
+            .to_string()
+            .replace(TaskId::prefix(), ProjectId::prefix());
+
+        let error = encoded.parse::<TaskId>().expect_err("wrong prefix");
+
+        assert!(error.contains("invalid TaskId prefix"));
+        assert!(error.contains(TaskId::prefix()));
+    }
+
+    #[test]
+    fn from_str_rejects_invalid_ulid() {
+        let error = "task_not-a-ulid"
+            .parse::<TaskId>()
+            .expect_err("invalid ulid");
+
+        assert!(error.contains("invalid TaskId ULID"));
+    }
+}

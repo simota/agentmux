@@ -221,6 +221,16 @@ pub enum IpcCommand {
     ContextInject,
     #[serde(rename = "context.export")]
     ContextExport,
+    #[serde(rename = "worktree.list")]
+    WorktreeList,
+    #[serde(rename = "worktree.diff")]
+    WorktreeDiff,
+    #[serde(rename = "worktree.test")]
+    WorktreeTest,
+    #[serde(rename = "worktree.promote")]
+    WorktreePromote,
+    #[serde(rename = "worktree.archive")]
+    WorktreeArchive,
     #[serde(rename = "approval.list")]
     ApprovalList,
     #[serde(rename = "approval.approve")]

@@ -5,17 +5,34 @@
 //! spawning are layered on later Phase 2 tasks.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-use agentmux_agent::{EncodedInputStep, InputScript, encode_input_action};
-use agentmux_core::{AgentSessionId, AgentmuxError, ClientSessionId, DateTimeUtc, error::Result};
+use agentmux_agent::{
+    AgentResult, AgentResultParse, AgentRouteIdentity, EncodedInputStep, InputScript,
+    StandardWorkflowState, WorkflowHandoffContext, advance_standard_workflow,
+    default_claude_codex_team, encode_input_action, parse_agent_result_marker, plan_task_run,
+};
+use agentmux_context::{ContextBroker, ContextItem, NewContextItem};
+use agentmux_core::{
+    AgentRole, AgentSessionId, AgentmuxError, ApprovalId, ClientId, ClientSessionId, ContextItemId,
+    ContextKind, ContextScope, ContextSource, DateTimeUtc, DeliveryMode, MessageId, Priority,
+    ProjectId, TaskId, Visibility, WorktreeId, WorktreeStatus, error::Result,
+};
 use agentmux_ipc::{
     ClientHello, ClientRequest, DaemonEvent, DaemonResponse, ErrorBody, IpcCommand, IpcEventKind,
     JsonlReader, JsonlWriter, ProtocolCompatibility,
 };
-use agentmux_pty::{PtyHandle, PtySpawnSpec};
+use agentmux_message::{
+    AgentDescriptor, AgentMessage, MessageBus, MessageKind, MessageSource, MessageTarget,
+    NewAgentMessage,
+};
+use agentmux_policy::{ApprovalEvent, ApprovalQueue, ApprovalQueueError, ApprovalRequest};
+use agentmux_pty::{CTRL_C, PtyHandle, PtySpawnSpec};
 use agentmux_store::{EventLog, EventLogEntry};
+use agentmux_worktree::{CaptureDiff, TestCommand, TestRunStatus, Worktree};
 use serde_json::json;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
@@ -52,6 +69,15 @@ impl RegisteredAgentSession {
             attached_clients: BTreeSet::new(),
         }
     }
+
+    fn restored(id: AgentSessionId, name: String) -> Self {
+        Self {
+            id,
+            name,
+            process_id: None,
+            attached_clients: BTreeSet::new(),
+        }
+    }
 }
 
 struct LiveAgentSession {
@@ -59,10 +85,30 @@ struct LiveAgentSession {
     pty: Option<Mutex<PtyHandle>>,
 }
 
-#[derive(Default)]
 struct DaemonState {
     clients: BTreeMap<ClientSessionId, Option<AgentSessionId>>,
     agents: BTreeMap<AgentSessionId, LiveAgentSession>,
+    worktrees: BTreeMap<WorktreeId, Worktree>,
+    messages: MessageBus,
+    contexts: ContextBroker,
+    approvals: ApprovalQueue,
+    layout_presets: BTreeMap<String, serde_json::Value>,
+    default_project_id: ProjectId,
+}
+
+impl Default for DaemonState {
+    fn default() -> Self {
+        Self {
+            clients: BTreeMap::new(),
+            agents: BTreeMap::new(),
+            worktrees: BTreeMap::new(),
+            messages: MessageBus::new(),
+            contexts: ContextBroker::new(),
+            approvals: ApprovalQueue::new(),
+            layout_presets: BTreeMap::new(),
+            default_project_id: ProjectId::new(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -87,17 +133,92 @@ impl DaemonRuntime {
         self
     }
 
+    pub async fn recover_state_from_event_log(&self) -> Result<usize> {
+        let Some(event_log) = &self.event_log else {
+            return Ok(0);
+        };
+        let entries = event_log.read_entries()?;
+        let Some(stopped) = entries
+            .iter()
+            .rev()
+            .find(|entry| entry.kind == "daemon.stopped")
+        else {
+            return Ok(0);
+        };
+        let agents = stopped
+            .payload
+            .get("state")
+            .and_then(|state| state.get("agents"))
+            .and_then(|agents| agents.as_array())
+            .ok_or_else(|| {
+                AgentmuxError::StoreError(
+                    "daemon.stopped recovery event is missing payload.state.agents".to_string(),
+                )
+            })?;
+
+        let mut recovered = BTreeMap::new();
+        let mut recovered_message_agents = Vec::new();
+        for agent in agents {
+            let id = agent
+                .get("id")
+                .and_then(|id| id.as_str())
+                .ok_or_else(|| {
+                    AgentmuxError::StoreError(
+                        "daemon.stopped recovery agent is missing id".to_string(),
+                    )
+                })?
+                .parse::<AgentSessionId>()
+                .map_err(|error| {
+                    AgentmuxError::StoreError(format!(
+                        "daemon.stopped recovery agent has invalid id: {error}"
+                    ))
+                })?;
+            let name = agent
+                .get("name")
+                .and_then(|name| name.as_str())
+                .ok_or_else(|| {
+                    AgentmuxError::StoreError(
+                        "daemon.stopped recovery agent is missing name".to_string(),
+                    )
+                })?
+                .to_string();
+            recovered_message_agents.push(AgentDescriptor::new(
+                id.clone(),
+                AgentRole::Custom(name.clone()),
+            ));
+            recovered.insert(
+                id.clone(),
+                LiveAgentSession::metadata(RegisteredAgentSession::restored(id, name)),
+            );
+        }
+
+        let recovered_count = recovered.len();
+        if recovered_count == 0 {
+            return Ok(0);
+        }
+        let mut state = self.state.write().await;
+        for agent in recovered_message_agents {
+            state.messages.register_agent(agent);
+        }
+        state.agents.extend(recovered);
+        Ok(recovered_count)
+    }
+
     pub fn subscribe(&self) -> broadcast::Receiver<DaemonEvent> {
         self.events.subscribe()
     }
 
     pub async fn register_agent(&self, name: String) -> RegisteredAgentSession {
-        let agent = RegisteredAgentSession::new(name, None);
-        self.state
-            .write()
-            .await
+        let agent = RegisteredAgentSession::new(name.clone(), None);
+        let mut state = self.state.write().await;
+        state
             .agents
             .insert(agent.id.clone(), LiveAgentSession::metadata(agent.clone()));
+        state.messages.register_agent(AgentDescriptor::new(
+            agent.id.clone(),
+            AgentRole::Custom(name.clone()),
+        ));
+        drop(state);
         self.publish(DaemonEvent::new(
             IpcEventKind::AgentSpawned,
             json!({
@@ -115,14 +236,20 @@ impl DaemonRuntime {
         spec: PtySpawnSpec,
     ) -> Result<RegisteredAgentSession> {
         let pty = PtyHandle::spawn(spec)?;
-        let agent = RegisteredAgentSession::new(name, pty.process_id());
-        self.state.write().await.agents.insert(
+        let agent = RegisteredAgentSession::new(name.clone(), pty.process_id());
+        let mut state = self.state.write().await;
+        state.agents.insert(
             agent.id.clone(),
             LiveAgentSession {
                 metadata: agent.clone(),
                 pty: Some(Mutex::new(pty)),
             },
         );
+        state.messages.register_agent(AgentDescriptor::new(
+            agent.id.clone(),
+            AgentRole::Custom(name.clone()),
+        ));
+        drop(state);
         self.publish(DaemonEvent::new(
             IpcEventKind::AgentSpawned,
             json!({
@@ -156,6 +283,424 @@ impl DaemonRuntime {
             json!({ "client_id": client_id.to_string(), "agent_id": agent_id.to_string() }),
         ));
         Ok(())
+    }
+
+    pub async fn stop_agent(&self, agent_id: &AgentSessionId) -> Result<RegisteredAgentSession> {
+        let mut state = self.state.write().await;
+        let Some(agent) = state.agents.remove(agent_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        };
+        drop(state);
+
+        if let Some(pty) = &agent.pty {
+            let mut pty = pty.lock().map_err(|_| {
+                AgentmuxError::Internal(format!("PTY lock for agent '{agent_id}' is poisoned"))
+            })?;
+            pty.terminate()?;
+        }
+
+        self.publish(DaemonEvent::new(
+            IpcEventKind::AgentExited,
+            json!({
+                "agent_id": agent.metadata.id.to_string(),
+                "name": agent.metadata.name,
+            }),
+        ));
+        Ok(agent.metadata)
+    }
+
+    pub async fn interrupt_agent(&self, agent_id: &AgentSessionId) -> Result<()> {
+        let state = self.state.read().await;
+        let Some(agent) = state.agents.get(agent_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        };
+        let Some(pty) = &agent.pty else {
+            return Err(AgentmuxError::UserError(format!(
+                "agent session '{agent_id}' has no live PTY"
+            )));
+        };
+        let mut pty = pty.lock().map_err(|_| {
+            AgentmuxError::Internal(format!("PTY lock for agent '{agent_id}' is poisoned"))
+        })?;
+        pty.write_bytes(CTRL_C)
+    }
+
+    pub async fn save_layout(&self, name: String, layout: serde_json::Value) -> Result<()> {
+        if name.trim().is_empty() {
+            return Err(AgentmuxError::UserError(
+                "layout.set requires non-empty name".to_string(),
+            ));
+        }
+        let mut state = self.state.write().await;
+        state.layout_presets.insert(name, layout);
+        Ok(())
+    }
+
+    pub async fn get_layout(&self, name: &str) -> Option<serde_json::Value> {
+        let state = self.state.read().await;
+        state.layout_presets.get(name).cloned()
+    }
+
+    pub async fn list_layouts(&self) -> Vec<String> {
+        let state = self.state.read().await;
+        state.layout_presets.keys().cloned().collect()
+    }
+
+    pub async fn create_message(&self, input: NewAgentMessage) -> Result<AgentMessage> {
+        let mut state = self.state.write().await;
+        let message = state.messages.create_message(input)?;
+        drop(state);
+
+        self.append_message_event(agentmux_store::EVENT_MESSAGE_CREATED, &message)?;
+        self.publish(DaemonEvent::new(
+            IpcEventKind::MessageCreated,
+            message_payload(&message),
+        ));
+        Ok(message)
+    }
+
+    pub async fn list_messages(&self) -> Vec<AgentMessage> {
+        let state = self.state.read().await;
+        state
+            .messages
+            .list_messages()
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn get_message(&self, id: &MessageId) -> Option<AgentMessage> {
+        let state = self.state.read().await;
+        state.messages.get_message(id).cloned()
+    }
+
+    pub async fn inject_message(&self, id: &MessageId) -> Result<AgentMessage> {
+        let now = DateTimeUtc::now_utc();
+        let mut state = self.state.write().await;
+        state.messages.mark_message_injected(id, now)?;
+        let message = state
+            .messages
+            .get_message(id)
+            .cloned()
+            .ok_or_else(|| AgentmuxError::UserError(format!("unknown message '{id}'")))?;
+        drop(state);
+
+        self.append_message_event(agentmux_store::EVENT_MESSAGE_INJECTED, &message)?;
+        self.publish(DaemonEvent::new(
+            IpcEventKind::MessageDelivered,
+            message_payload(&message),
+        ));
+        Ok(message)
+    }
+
+    pub async fn create_context(&self, input: NewContextItem) -> Result<ContextItem> {
+        let mut state = self.state.write().await;
+        let item = state.contexts.create_item(input)?;
+        drop(state);
+
+        self.append_context_created_event(&item)?;
+        self.publish(DaemonEvent::new(
+            IpcEventKind::ContextCreated,
+            context_payload(&item),
+        ));
+        Ok(item)
+    }
+
+    pub async fn list_contexts(&self) -> Vec<ContextItem> {
+        let state = self.state.read().await;
+        state
+            .contexts
+            .list_items(&state.default_project_id)
+            .into_iter()
+            .cloned()
+            .collect()
+    }
+
+    pub async fn get_context(&self, id: &ContextItemId) -> Option<ContextItem> {
+        let state = self.state.read().await;
+        state.contexts.get_item(id).cloned()
+    }
+
+    pub async fn search_contexts(&self, query: &str) -> Vec<ContextItem> {
+        let query = query.to_ascii_lowercase();
+        self.list_contexts()
+            .await
+            .into_iter()
+            .filter(|item| {
+                item.title.to_ascii_lowercase().contains(&query)
+                    || item.body.to_ascii_lowercase().contains(&query)
+                    || item
+                        .tags
+                        .iter()
+                        .any(|tag| tag.to_ascii_lowercase().contains(&query))
+            })
+            .collect()
+    }
+
+    pub async fn attach_context_to_message(
+        &self,
+        context_id: &ContextItemId,
+        message_id: &MessageId,
+    ) -> Result<AgentMessage> {
+        let mut state = self.state.write().await;
+        if state.contexts.get_item(context_id).is_none() {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown context item '{context_id}'"
+            )));
+        }
+        state
+            .messages
+            .attach_context_ref(message_id, context_id.clone())
+    }
+
+    pub async fn inject_context(
+        &self,
+        context_id: &ContextItemId,
+        agent_id: &AgentSessionId,
+    ) -> Result<ContextItem> {
+        let state = self.state.read().await;
+        if !state.agents.contains_key(agent_id) {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        }
+        let item = state
+            .contexts
+            .get_item(context_id)
+            .cloned()
+            .ok_or_else(|| {
+                AgentmuxError::UserError(format!("unknown context item '{context_id}'"))
+            })?;
+        drop(state);
+
+        self.publish(DaemonEvent::new(
+            IpcEventKind::ContextInjected,
+            json!({
+                "context_id": context_id.to_string(),
+                "agent_id": agent_id.to_string(),
+            }),
+        ));
+        Ok(item)
+    }
+
+    pub async fn export_contexts(&self, output: &Path) -> Result<usize> {
+        let contexts = self.list_contexts().await;
+        let payload = json!({
+            "contexts": contexts.iter().map(context_payload).collect::<Vec<_>>(),
+        });
+        let bytes = serde_json::to_vec_pretty(&payload).map_err(json_error)?;
+        std::fs::write(output, bytes).map_err(|error| {
+            AgentmuxError::StoreError(format!(
+                "failed to export contexts to '{}': {error}",
+                output.display()
+            ))
+        })?;
+        Ok(contexts.len())
+    }
+
+    pub async fn register_worktree(&self, worktree: Worktree) {
+        let mut state = self.state.write().await;
+        state.worktrees.insert(worktree.id.clone(), worktree);
+    }
+
+    pub async fn list_worktrees(&self) -> Vec<Worktree> {
+        let state = self.state.read().await;
+        state.worktrees.values().cloned().collect()
+    }
+
+    pub async fn capture_worktree_diff(
+        &self,
+        worktree_id: &WorktreeId,
+    ) -> Result<serde_json::Value> {
+        let worktree = self.worktree_by_id(worktree_id).await?;
+        let captured = agentmux_worktree::WorktreeManager::new(
+            worktree.project_id.clone(),
+            worktree.path.clone(),
+            worktree.path.join(".agentmux/worktrees"),
+        )?
+        .capture_diff_artifact(
+            CaptureDiff {
+                task_id: worktree.task_id.clone(),
+                agent_name: worktree.branch_name.clone(),
+                worktree_path: worktree.path.clone(),
+                base_branch: worktree.base_branch.clone(),
+            },
+            worktree.path.join(".agentmux/artifacts"),
+        )?;
+
+        self.publish(DaemonEvent::new(
+            IpcEventKind::WorktreeDiffCaptured,
+            json!({
+                "worktree_id": worktree.id.to_string(),
+                "artifact_id": captured.patch.id.to_string(),
+                "stat": captured.stat,
+            }),
+        ));
+
+        Ok(json!({
+            "worktree": worktree_payload(&worktree),
+            "artifact": artifact_payload(
+                captured.patch.id.to_string(),
+                captured.patch.path.display().to_string(),
+                captured.patch.title,
+            ),
+            "stat": captured.stat,
+        }))
+    }
+
+    pub async fn run_worktree_test(
+        &self,
+        worktree_id: &WorktreeId,
+        command: TestCommand,
+    ) -> Result<serde_json::Value> {
+        let mut worktree = self.worktree_by_id(worktree_id).await?;
+        self.set_worktree_status(worktree_id, WorktreeStatus::Testing)
+            .await?;
+        let result = agentmux_worktree::WorktreeManager::new(
+            worktree.project_id.clone(),
+            worktree.path.clone(),
+            worktree.path.join(".agentmux/worktrees"),
+        )?
+        .run_test_command_artifact(
+            worktree.task_id.clone(),
+            &worktree.branch_name,
+            &worktree.path,
+            command,
+            worktree.path.join(".agentmux/artifacts"),
+        );
+
+        match result {
+            Ok(test_run) => {
+                worktree.status = if test_run.status == TestRunStatus::Passed {
+                    WorktreeStatus::ReviewReady
+                } else {
+                    WorktreeStatus::Failed
+                };
+                self.set_worktree_status(worktree_id, worktree.status.clone())
+                    .await?;
+                self.publish(DaemonEvent::new(
+                    IpcEventKind::ArtifactCreated,
+                    json!({
+                        "worktree_id": worktree.id.to_string(),
+                        "artifact_id": test_run.artifact.id.to_string(),
+                    }),
+                ));
+                Ok(json!({
+                    "worktree": worktree_payload(&worktree),
+                    "test": {
+                        "status": test_run.status,
+                        "command": test_run.command,
+                        "exit_code": test_run.exit_code,
+                        "artifact": artifact_payload(
+                            test_run.artifact.id.to_string(),
+                            test_run.artifact.path.display().to_string(),
+                            test_run.artifact.title,
+                        ),
+                    },
+                }))
+            }
+            Err(error) => {
+                let _ = self
+                    .set_worktree_status(worktree_id, WorktreeStatus::Failed)
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn promote_worktree(&self, worktree_id: &WorktreeId) -> Result<Worktree> {
+        self.set_worktree_status(worktree_id, WorktreeStatus::Promoted)
+            .await
+    }
+
+    pub async fn archive_worktree(&self, worktree_id: &WorktreeId) -> Result<Worktree> {
+        self.set_worktree_status(worktree_id, WorktreeStatus::Archived)
+            .await
+    }
+
+    pub async fn submit_approval_request(&self, request: ApprovalRequest) -> ApprovalRequest {
+        let mut state = self.state.write().await;
+        let gate = state
+            .approvals
+            .submit(agentmux_policy::PolicyDecision::Ask, request);
+        let agentmux_policy::ApprovalGate::Queued(request, event) = gate else {
+            unreachable!("PolicyDecision::Ask always queues an approval request");
+        };
+        drop(state);
+
+        let _ = self.append_approval_event(&event);
+        self.publish(approval_daemon_event(&event));
+        request
+    }
+
+    pub async fn list_approvals(&self) -> Vec<ApprovalRequest> {
+        let state = self.state.read().await;
+        state.approvals.pending().into_iter().cloned().collect()
+    }
+
+    pub async fn approve_approval(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> std::result::Result<ApprovalRequest, ApprovalQueueError> {
+        self.decide_approval(approval_id, true).await
+    }
+
+    pub async fn reject_approval(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> std::result::Result<ApprovalRequest, ApprovalQueueError> {
+        self.decide_approval(approval_id, false).await
+    }
+
+    async fn decide_approval(
+        &self,
+        approval_id: &ApprovalId,
+        approved: bool,
+    ) -> std::result::Result<ApprovalRequest, ApprovalQueueError> {
+        let mut state = self.state.write().await;
+        let event = if approved {
+            state.approvals.approve(approval_id)?
+        } else {
+            state.approvals.reject(approval_id)?
+        };
+        let request = state
+            .approvals
+            .get(approval_id)
+            .expect("decided approval remains in queue")
+            .clone();
+        drop(state);
+
+        let _ = self.append_approval_event(&event);
+        self.publish(approval_daemon_event(&event));
+        Ok(request)
+    }
+
+    async fn worktree_by_id(&self, worktree_id: &WorktreeId) -> Result<Worktree> {
+        let state = self.state.read().await;
+        state
+            .worktrees
+            .get(worktree_id)
+            .cloned()
+            .ok_or_else(|| AgentmuxError::UserError(format!("unknown worktree '{worktree_id}'")))
+    }
+
+    async fn set_worktree_status(
+        &self,
+        worktree_id: &WorktreeId,
+        status: WorktreeStatus,
+    ) -> Result<Worktree> {
+        let mut state = self.state.write().await;
+        let Some(worktree) = state.worktrees.get_mut(worktree_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown worktree '{worktree_id}'"
+            )));
+        };
+        worktree.status = status;
+        Ok(worktree.clone())
     }
 
     pub async fn detach_client(&self, client_id: &ClientSessionId) -> Option<AgentSessionId> {
@@ -205,6 +750,97 @@ impl DaemonRuntime {
             "agent_count": state.agents.len(),
             "agents": agents,
         })
+    }
+
+    pub async fn run_task_with_shell_stubs(
+        &self,
+        body: String,
+        team_name: String,
+        project_path: PathBuf,
+    ) -> Result<serde_json::Value> {
+        if body.trim().is_empty() {
+            return Err(AgentmuxError::UserError(
+                "task.run requires non-empty body".to_string(),
+            ));
+        }
+
+        let task_id = TaskId::new();
+        let team = default_claude_codex_team();
+        let plan = plan_task_run(task_id.clone(), &body, team.clone())?;
+        let context = WorkflowHandoffContext {
+            task_title: body.trim().to_string(),
+            worktree_path: project_path.display().to_string(),
+            test_command: "cargo test --workspace".to_string(),
+            diff_path: Some(
+                project_path
+                    .join(".agentmux/artifacts/diff.patch")
+                    .display()
+                    .to_string(),
+            ),
+            test_log_path: Some(
+                project_path
+                    .join(".agentmux/artifacts/test.log")
+                    .display()
+                    .to_string(),
+            ),
+            task_brief_path: Some(
+                project_path
+                    .join(".agentmux/inbox/planner/task-brief.md")
+                    .display()
+                    .to_string(),
+            ),
+            candidate_worktrees: vec![project_path.display().to_string()],
+        };
+        let mut state = StandardWorkflowState::new(task_id.clone());
+        let mut handoffs = vec![orchestrator_message_payload(&plan.bootstrap)];
+        let mut shell_processes = Vec::new();
+
+        for (name, role) in [
+            ("planner", AgentRole::Planner),
+            ("impl-codex", AgentRole::Implementer),
+            ("tester", AgentRole::Tester),
+            ("reviewer", AgentRole::Reviewer),
+        ] {
+            let output = run_shell_stub_agent(name)?;
+            let result = parse_shell_stub_result(name, &output.stdout)?;
+            shell_processes.push(json!({
+                "agent": name,
+                "exit_code": output.exit_code,
+                "stdout": output.stdout,
+            }));
+            let advanced = advance_standard_workflow(
+                state,
+                &AgentRouteIdentity {
+                    name: name.to_string(),
+                    role,
+                },
+                &team,
+                result,
+                &context,
+            )?;
+            state = advanced.state;
+            handoffs.extend(advanced.outgoing.iter().map(orchestrator_message_payload));
+            if let Some(summary) = advanced.final_summary {
+                let payload = json!({
+                    "task_id": task_id.to_string(),
+                    "team": team_name,
+                    "runner": "shell-stub",
+                    "project_path": project_path.display().to_string(),
+                    "status": "completed",
+                    "stage": format!("{:?}", state.stage),
+                    "handoffs": handoffs,
+                    "shell_processes": shell_processes,
+                    "final_summary": summary.render_markdown(),
+                    "recommended_next_action": summary.recommended_next_action,
+                });
+                self.append_daemon_lifecycle_event("task.completed", payload.clone())?;
+                return Ok(payload);
+            }
+        }
+
+        Err(AgentmuxError::OrchestratorError(
+            "shell stub task workflow ended without final summary".to_string(),
+        ))
     }
 
     pub async fn send_input_script(&self, script: &InputScript) -> Result<()> {
@@ -281,6 +917,83 @@ impl DaemonRuntime {
         };
         event_log.append(&entry)
     }
+
+    fn append_daemon_lifecycle_event(&self, kind: &str, payload: serde_json::Value) -> Result<()> {
+        let Some(event_log) = &self.event_log else {
+            return Ok(());
+        };
+        event_log.append(&EventLogEntry::new(kind, DateTimeUtc::now_utc(), payload)?)
+    }
+
+    fn append_message_event(&self, kind: &str, message: &AgentMessage) -> Result<()> {
+        let Some(event_log) = &self.event_log else {
+            return Ok(());
+        };
+        let entry = match kind {
+            agentmux_store::EVENT_MESSAGE_CREATED => EventLogEntry::message_created(
+                DateTimeUtc::now_utc(),
+                message.id.clone(),
+                message.task_id.clone(),
+                agentmux_store::MessageEventPayload {
+                    from: serde_json::to_string(&message.from).map_err(json_error)?,
+                    to: serde_json::to_string(&message.to).map_err(json_error)?,
+                    kind: serde_json::to_string(&message.kind).map_err(json_error)?,
+                    delivery_mode: serde_json::to_string(&message.delivery_mode)
+                        .map_err(json_error)?,
+                    delivery_status: message.delivery_status.clone(),
+                    context_refs: message.context_refs.clone(),
+                    artifact_refs: message.artifact_refs.clone(),
+                },
+            )?,
+            agentmux_store::EVENT_MESSAGE_INJECTED => match &message.to {
+                MessageTarget::Agent(agent_id) => EventLogEntry::message_injected(
+                    DateTimeUtc::now_utc(),
+                    message.id.clone(),
+                    message.task_id.clone(),
+                    agent_id.clone(),
+                    message.delivery_status.clone(),
+                )?,
+                _ => EventLogEntry::new(
+                    agentmux_store::EVENT_MESSAGE_INJECTED,
+                    DateTimeUtc::now_utc(),
+                    json!({
+                        "message_id": message.id.to_string(),
+                        "delivery_status": message.delivery_status,
+                    }),
+                )?,
+            },
+            _ => EventLogEntry::new(kind, DateTimeUtc::now_utc(), json!({}))?,
+        };
+        event_log.append(&entry)
+    }
+
+    fn append_context_created_event(&self, item: &ContextItem) -> Result<()> {
+        let Some(event_log) = &self.event_log else {
+            return Ok(());
+        };
+        let entry = EventLogEntry::context_created(
+            DateTimeUtc::now_utc(),
+            item.project_id.clone(),
+            item.task_id.clone(),
+            item.id.clone(),
+            serde_json::to_string(&item.kind).map_err(json_error)?,
+            serde_json::to_string(&item.source).map_err(json_error)?,
+        )?;
+        event_log.append(&entry)
+    }
+
+    fn append_approval_event(&self, event: &ApprovalEvent) -> Result<()> {
+        let Some(event_log) = &self.event_log else {
+            return Ok(());
+        };
+        let kind = match event {
+            ApprovalEvent::ApprovalCreated { .. } => "approval.created",
+            ApprovalEvent::ApprovalDecided { .. } => "approval.decided",
+            ApprovalEvent::PolicyDenied { .. } => "policy.denied",
+        };
+        let payload = serde_json::to_value(event).map_err(json_error)?;
+        event_log.append(&EventLogEntry::new(kind, DateTimeUtc::now_utc(), payload)?)
+    }
 }
 
 impl LiveAgentSession {
@@ -298,23 +1011,88 @@ enum ServerFrame {
 }
 
 pub async fn serve(config: DaemonConfig, runtime: DaemonRuntime) -> Result<()> {
+    serve_until_shutdown(config, runtime, shutdown_signal()).await
+}
+
+pub async fn serve_until_shutdown(
+    config: DaemonConfig,
+    runtime: DaemonRuntime,
+    shutdown: impl Future<Output = ()>,
+) -> Result<()> {
     let listener = bind_unix_listener(&config.socket_path)?;
+    let socket_path = config.socket_path.clone();
+    let restored_agent_count = runtime.recover_state_from_event_log().await?;
+    let started_payload =
+        json!({ "socket_path": socket_path, "restored_agent_count": restored_agent_count });
+    runtime.append_daemon_lifecycle_event("daemon.started", started_payload.clone())?;
     runtime.publish(DaemonEvent::new(
         IpcEventKind::DaemonStarted,
-        json!({ "socket_path": config.socket_path }),
+        started_payload,
     ));
 
     let mut clients = JoinSet::new();
+    tokio::pin!(shutdown);
     loop {
-        let (stream, _addr) = listener.accept().await.map_err(|error| {
-            AgentmuxError::IpcError(format!("failed to accept daemon client: {error}"))
-        })?;
-        let runtime = runtime.clone();
-        clients.spawn(async move {
-            if let Err(error) = handle_client(stream, runtime).await {
-                eprintln!("agentmux-daemon client error: {error}");
+        tokio::select! {
+            biased;
+            () = &mut shutdown => break,
+            accepted = listener.accept() => {
+                let (stream, _addr) = accepted.map_err(|error| {
+                    AgentmuxError::IpcError(format!("failed to accept daemon client: {error}"))
+                })?;
+                let runtime = runtime.clone();
+                clients.spawn(async move {
+                    if let Err(error) = handle_client(stream, runtime).await {
+                        eprintln!("agentmux-daemon client error: {error}");
+                    }
+                });
             }
-        });
+        }
+    }
+
+    drop(listener);
+    clients.abort_all();
+    while let Some(joined) = clients.join_next().await {
+        if let Err(error) = joined
+            && !error.is_cancelled()
+        {
+            return Err(AgentmuxError::IpcError(format!(
+                "daemon client task failed during shutdown: {error}"
+            )));
+        }
+    }
+
+    finish_shutdown(&runtime, &socket_path).await?;
+    Ok(())
+}
+
+async fn finish_shutdown(runtime: &DaemonRuntime, socket_path: &Path) -> Result<()> {
+    let status = runtime.status_payload().await;
+    let stopped_payload = json!({ "socket_path": socket_path, "state": status });
+    runtime.append_daemon_lifecycle_event("daemon.stopped", stopped_payload.clone())?;
+    runtime.publish(DaemonEvent::new(
+        IpcEventKind::DaemonStopped,
+        stopped_payload,
+    ));
+    remove_socket_file(socket_path)
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        let mut interrupt = signal(SignalKind::interrupt()).expect("SIGINT handler installs");
+        let mut terminate = signal(SignalKind::terminate()).expect("SIGTERM handler installs");
+        tokio::select! {
+            _ = interrupt.recv() => {}
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
 
@@ -359,7 +1137,19 @@ fn bind_unix_listener(socket_path: &Path) -> Result<UnixListener> {
     Ok(listener)
 }
 
-async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result<()> {
+fn remove_socket_file(socket_path: &Path) -> Result<()> {
+    if !socket_path.exists() {
+        return Ok(());
+    }
+    std::fs::remove_file(socket_path).map_err(|error| {
+        AgentmuxError::IpcError(format!(
+            "failed to remove daemon socket '{}': {error}",
+            socket_path.display()
+        ))
+    })
+}
+
+pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result<()> {
     let client_id = ClientSessionId::new();
     let (reader, writer) = stream.into_split();
     let mut reader = JsonlReader::new(BufReader::new(reader));
@@ -453,6 +1243,38 @@ async fn handle_request(
 
     match request.command {
         IpcCommand::DaemonStatus => DaemonResponse::ok(request.id, runtime.status_payload().await),
+        IpcCommand::TaskRun => {
+            let (body, team, project_path, runner) = match task_run_payload(&request.payload) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_TASK_RUN", error.to_string()),
+                    );
+                }
+            };
+            if runner != "shell-stub" {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new(
+                        "TASK_RUNNER_UNAVAILABLE",
+                        format!("unsupported task.run runner '{runner}'"),
+                    )
+                    .with_hint("use runner=shell-stub for deterministic test execution"),
+                );
+            }
+
+            match runtime
+                .run_task_with_shell_stubs(body, team, project_path)
+                .await
+            {
+                Ok(payload) => DaemonResponse::ok(request.id, payload),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("TASK_RUN_FAILED", error.to_string()),
+                ),
+            }
+        }
         IpcCommand::AgentSpawn => {
             let name = request
                 .payload
@@ -521,6 +1343,80 @@ async fn handle_request(
                 }),
             )
         }
+        IpcCommand::AgentStop => {
+            let agent_id = match agent_id_payload(&request.payload, "agent.stop") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.stop_agent(&agent_id).await {
+                Ok(agent) => DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "agent_id": agent.id.to_string(),
+                        "name": agent.name,
+                        "stopped": true,
+                    }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("AGENT_STOP_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::AgentFocus => {
+            let agent_id = match agent_id_payload(&request.payload, "agent.focus") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime
+                .attach_client(client_id.clone(), agent_id.clone())
+                .await
+            {
+                Ok(()) => DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "client_id": client_id.to_string(),
+                        "agent_id": agent_id.to_string(),
+                        "focused": true,
+                    }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("AGENT_FOCUS_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::AgentInterrupt => {
+            let agent_id = match agent_id_payload(&request.payload, "agent.interrupt") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.interrupt_agent(&agent_id).await {
+                Ok(()) => DaemonResponse::ok(
+                    request.id,
+                    json!({ "agent_id": agent_id.to_string(), "interrupted": true }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("AGENT_INTERRUPT_FAILED", error.to_string()),
+                ),
+            }
+        }
         IpcCommand::AgentSendInputScript => {
             let script = match serde_json::from_value::<InputScript>(request.payload) {
                 Ok(script) => script,
@@ -548,6 +1444,363 @@ async fn handle_request(
                 ),
             }
         }
+        IpcCommand::MessageCreate => {
+            let input = match message_create_payload(&request.payload) {
+                Ok(input) => input,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_MESSAGE_CREATE", error.to_string()),
+                    );
+                }
+            };
+            match runtime.create_message(input).await {
+                Ok(message) => DaemonResponse::ok(request.id, message_payload(&message)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("MESSAGE_CREATE_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::MessageList => {
+            let messages = runtime.list_messages().await;
+            DaemonResponse::ok(
+                request.id,
+                json!({
+                    "messages": messages.iter().map(message_payload).collect::<Vec<_>>(),
+                }),
+            )
+        }
+        IpcCommand::MessageShow => {
+            let Some(message_id) = request
+                .payload
+                .get("message_id")
+                .and_then(|value| value.as_str())
+                .and_then(parse_message_id)
+            else {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("INVALID_MESSAGE_ID", "message.show requires message_id"),
+                );
+            };
+            match runtime.get_message(&message_id).await {
+                Some(message) => DaemonResponse::ok(request.id, message_payload(&message)),
+                None => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new(
+                        "MESSAGE_NOT_FOUND",
+                        format!("unknown message '{message_id}'"),
+                    ),
+                ),
+            }
+        }
+        IpcCommand::MessageInject => {
+            let Some(message_id) = request
+                .payload
+                .get("message_id")
+                .and_then(|value| value.as_str())
+                .and_then(parse_message_id)
+            else {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("INVALID_MESSAGE_ID", "message.inject requires message_id"),
+                );
+            };
+            match runtime.inject_message(&message_id).await {
+                Ok(message) => DaemonResponse::ok(request.id, message_payload(&message)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("MESSAGE_INJECT_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::ContextCreate => {
+            let input = match context_create_payload(&request.payload, runtime).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_CONTEXT_CREATE", error.to_string()),
+                    );
+                }
+            };
+            match runtime.create_context(input).await {
+                Ok(item) => DaemonResponse::ok(request.id, context_payload(&item)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("CONTEXT_CREATE_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::ContextSearch => match context_search_payload(&request.payload) {
+            Ok(ContextLookup::List) => {
+                let contexts = runtime.list_contexts().await;
+                DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "contexts": contexts.iter().map(context_payload).collect::<Vec<_>>(),
+                    }),
+                )
+            }
+            Ok(ContextLookup::Show(context_id)) => match runtime.get_context(&context_id).await {
+                Some(item) => DaemonResponse::ok(request.id, context_payload(&item)),
+                None => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new(
+                        "CONTEXT_NOT_FOUND",
+                        format!("unknown context item '{context_id}'"),
+                    ),
+                ),
+            },
+            Ok(ContextLookup::Search(query)) => {
+                let contexts = runtime.search_contexts(&query).await;
+                DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "contexts": contexts.iter().map(context_payload).collect::<Vec<_>>(),
+                    }),
+                )
+            }
+            Err(error) => DaemonResponse::error(
+                request.id,
+                ErrorBody::new("INVALID_CONTEXT_SEARCH", error.to_string()),
+            ),
+        },
+        IpcCommand::ContextAttach => {
+            let (context_id, message_id) = match context_attach_payload(&request.payload) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_CONTEXT_ATTACH", error.to_string()),
+                    );
+                }
+            };
+            match runtime
+                .attach_context_to_message(&context_id, &message_id)
+                .await
+            {
+                Ok(message) => DaemonResponse::ok(request.id, message_payload(&message)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("CONTEXT_ATTACH_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::ContextInject => {
+            let (context_id, agent_id) = match context_inject_payload(&request.payload) {
+                Ok(ids) => ids,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_CONTEXT_INJECT", error.to_string()),
+                    );
+                }
+            };
+            match runtime.inject_context(&context_id, &agent_id).await {
+                Ok(item) => DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "context": context_payload(&item),
+                        "agent_id": agent_id.to_string(),
+                    }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("CONTEXT_INJECT_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::ContextExport => {
+            let Some(output) = request
+                .payload
+                .get("output")
+                .and_then(|value| value.as_str())
+            else {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("INVALID_CONTEXT_EXPORT", "context.export requires output"),
+                );
+            };
+            match runtime.export_contexts(Path::new(output)).await {
+                Ok(count) => DaemonResponse::ok(
+                    request.id,
+                    json!({ "output": output, "context_count": count }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("CONTEXT_EXPORT_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::WorktreeList => {
+            let worktrees = runtime.list_worktrees().await;
+            DaemonResponse::ok(
+                request.id,
+                json!({
+                    "worktrees": worktrees.iter().map(worktree_payload).collect::<Vec<_>>(),
+                }),
+            )
+        }
+        IpcCommand::WorktreeDiff => {
+            let worktree_id = match worktree_id_payload(&request.payload, "worktree.diff") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_WORKTREE_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.capture_worktree_diff(&worktree_id).await {
+                Ok(payload) => DaemonResponse::ok(request.id, payload),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("WORKTREE_DIFF_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::WorktreeTest => {
+            let worktree_id = match worktree_id_payload(&request.payload, "worktree.test") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_WORKTREE_ID", error.to_string()),
+                    );
+                }
+            };
+            let command = worktree_test_command_payload(&request.payload);
+            match runtime.run_worktree_test(&worktree_id, command).await {
+                Ok(payload) => DaemonResponse::ok(request.id, payload),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("WORKTREE_TEST_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::WorktreePromote => {
+            let worktree_id = match worktree_id_payload(&request.payload, "worktree.promote") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_WORKTREE_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.promote_worktree(&worktree_id).await {
+                Ok(worktree) => DaemonResponse::ok(request.id, worktree_payload(&worktree)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("WORKTREE_PROMOTE_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::WorktreeArchive => {
+            let worktree_id = match worktree_id_payload(&request.payload, "worktree.archive") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_WORKTREE_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.archive_worktree(&worktree_id).await {
+                Ok(worktree) => DaemonResponse::ok(request.id, worktree_payload(&worktree)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("WORKTREE_ARCHIVE_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::ApprovalList => {
+            let approvals = runtime.list_approvals().await;
+            DaemonResponse::ok(
+                request.id,
+                json!({
+                    "approvals": approvals.iter().map(approval_payload).collect::<Vec<_>>(),
+                }),
+            )
+        }
+        IpcCommand::ApprovalApprove => {
+            let approval_id = match approval_id_payload(&request.payload, "approval.approve") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_APPROVAL_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.approve_approval(&approval_id).await {
+                Ok(approval) => DaemonResponse::ok(request.id, approval_payload(&approval)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("APPROVAL_DECISION_FAILED", approval_queue_error(error)),
+                ),
+            }
+        }
+        IpcCommand::ApprovalReject => {
+            let approval_id = match approval_id_payload(&request.payload, "approval.reject") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_APPROVAL_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.reject_approval(&approval_id).await {
+                Ok(approval) => DaemonResponse::ok(request.id, approval_payload(&approval)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("APPROVAL_DECISION_FAILED", approval_queue_error(error)),
+                ),
+            }
+        }
+        IpcCommand::LayoutSet => {
+            let name = match required_string(&request.payload, "name", "layout.set") {
+                Ok(name) => name.to_string(),
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_LAYOUT_SET", error.to_string()),
+                    );
+                }
+            };
+            let layout = request
+                .payload
+                .get("layout")
+                .cloned()
+                .unwrap_or_else(|| json!({ "name": name }));
+            match runtime.save_layout(name.clone(), layout.clone()).await {
+                Ok(()) => DaemonResponse::ok(
+                    request.id,
+                    json!({ "name": name, "layout": layout, "saved": true }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("LAYOUT_SET_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::LayoutGet => {
+            let Some(name) = request.payload.get("name").and_then(|value| value.as_str()) else {
+                let layouts = runtime.list_layouts().await;
+                return DaemonResponse::ok(request.id, json!({ "layouts": layouts }));
+            };
+            match runtime.get_layout(name).await {
+                Some(layout) => {
+                    DaemonResponse::ok(request.id, json!({ "name": name, "layout": layout }))
+                }
+                None => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("LAYOUT_NOT_FOUND", format!("unknown layout '{name}'")),
+                ),
+            }
+        }
         _ => DaemonResponse::error(
             request.id,
             ErrorBody::new(
@@ -556,6 +1809,144 @@ async fn handle_request(
             ),
         ),
     }
+}
+
+fn task_run_payload(payload: &serde_json::Value) -> Result<(String, String, PathBuf, String)> {
+    let body = required_string(payload, "body", "task.run")?.to_string();
+    let team = payload
+        .get("team")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("claude-codex")
+        .to_string();
+    let project_path = payload
+        .get("project_path")
+        .and_then(|value| value.as_str())
+        .map(PathBuf::from)
+        .unwrap_or(std::env::current_dir().map_err(|error| {
+            AgentmuxError::Internal(format!("failed to resolve current directory: {error}"))
+        })?);
+    let runner = payload
+        .get("runner")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("AGENTMUX_TASK_RUNNER").ok())
+        .unwrap_or_else(|| "shell-stub".to_string());
+    Ok((body, team, project_path, runner))
+}
+
+#[derive(Debug)]
+struct ShellStubOutput {
+    stdout: String,
+    exit_code: Option<i32>,
+}
+
+fn run_shell_stub_agent(agent_name: &str) -> Result<ShellStubOutput> {
+    let result = match agent_name {
+        "planner" => json!({
+            "status": "completed",
+            "summary": "Assign the deterministic shell-stub implementation.",
+            "changed_files": [],
+            "messages": [],
+            "context_updates": [],
+            "needs": [],
+            "next": "impl-codex",
+            "recommendation": "continue",
+            "risk": "low",
+        }),
+        "impl-codex" => json!({
+            "status": "completed",
+            "summary": "Shell stub implemented the requested change.",
+            "changed_files": ["src/lib.rs"],
+            "messages": [],
+            "context_updates": [],
+            "needs": [],
+            "next": "tester",
+            "recommendation": "continue",
+            "risk": "low",
+        }),
+        "tester" => json!({
+            "status": "completed",
+            "summary": "cargo test --workspace passed in shell stub.",
+            "changed_files": [],
+            "messages": [],
+            "context_updates": [],
+            "needs": [],
+            "next": "reviewer",
+            "recommendation": "continue",
+            "risk": "low",
+        }),
+        "reviewer" => json!({
+            "status": "completed",
+            "summary": "Shell stub reviewer approved the candidate.",
+            "changed_files": [],
+            "messages": [],
+            "context_updates": [],
+            "needs": [],
+            "next": "none",
+            "recommendation": "approve",
+            "risk": "low",
+        }),
+        other => {
+            return Err(AgentmuxError::OrchestratorError(format!(
+                "unknown shell stub agent '{other}'"
+            )));
+        }
+    };
+    let marker = format!("AGENTMUX_RESULT: {result}");
+    let script = format!("cat <<'AGENTMUX_EOF'\n{marker}\nAGENTMUX_EOF\n");
+    let output = Command::new("/bin/sh")
+        .arg("-c")
+        .arg(script)
+        .output()
+        .map_err(|error| {
+            AgentmuxError::OrchestratorError(format!(
+                "failed to run shell stub agent '{agent_name}': {error}"
+            ))
+        })?;
+    if !output.status.success() {
+        return Err(AgentmuxError::OrchestratorError(format!(
+            "shell stub agent '{agent_name}' exited with status {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
+    Ok(ShellStubOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        exit_code: output.status.code(),
+    })
+}
+
+fn parse_shell_stub_result(agent_name: &str, stdout: &str) -> Result<AgentResult> {
+    match parse_agent_result_marker(stdout) {
+        AgentResultParse::Found(parsed) => Ok(parsed.result),
+        AgentResultParse::NotFound => Err(AgentmuxError::OrchestratorError(format!(
+            "shell stub agent '{agent_name}' did not emit AGENTMUX_RESULT"
+        ))),
+        AgentResultParse::NeedsStatusProbe(probe) => {
+            Err(AgentmuxError::OrchestratorError(format!(
+                "shell stub agent '{agent_name}' emitted invalid AGENTMUX_RESULT: {}",
+                probe.reason
+            )))
+        }
+    }
+}
+
+fn orchestrator_message_payload(
+    message: &agentmux_agent::OrchestratorMessage,
+) -> serde_json::Value {
+    json!({
+        "task_id": message.task_id.as_ref().map(ToString::to_string),
+        "from": message.from,
+        "to": message.to,
+        "kind": message.kind,
+        "priority": message.priority,
+        "body": message.body,
+        "delivery_mode": message.delivery_mode,
+        "requires_response": message.requires_response,
+        "context_refs": message.context_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "artifact_refs": message.artifact_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+    })
 }
 
 fn protocol_error(compatibility: ProtocolCompatibility) -> Option<ErrorBody> {
@@ -572,8 +1963,384 @@ fn protocol_error(compatibility: ProtocolCompatibility) -> Option<ErrorBody> {
 }
 
 fn parse_agent_session_id(value: &str) -> Option<AgentSessionId> {
-    let raw = value.strip_prefix(AgentSessionId::prefix())?;
-    raw.parse::<ulid::Ulid>().ok().map(AgentSessionId)
+    value.parse::<AgentSessionId>().ok()
+}
+
+fn agent_id_payload(payload: &serde_json::Value, command: &str) -> Result<AgentSessionId> {
+    required_string(payload, "agent_id", command)?
+        .parse::<AgentSessionId>()
+        .map_err(|error| AgentmuxError::UserError(format!("invalid agent_id: {error}")))
+}
+
+fn parse_message_id(value: &str) -> Option<MessageId> {
+    value.parse::<MessageId>().ok()
+}
+
+fn parse_context_item_id(value: &str) -> Option<ContextItemId> {
+    value.parse::<ContextItemId>().ok()
+}
+
+fn message_create_payload(payload: &serde_json::Value) -> Result<NewAgentMessage> {
+    let to = payload
+        .get("to")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AgentmuxError::UserError("message.create requires to".to_string()))
+        .and_then(parse_message_target)?;
+    let body = payload
+        .get("body")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| AgentmuxError::UserError("message.create requires body".to_string()))?
+        .to_string();
+    let kind = payload
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .map(parse_message_kind)
+        .transpose()?
+        .unwrap_or(MessageKind::Handoff);
+    let priority = payload
+        .get("priority")
+        .and_then(|value| value.as_str())
+        .map(parse_priority)
+        .transpose()?
+        .unwrap_or(Priority::Normal);
+    let delivery_mode = payload
+        .get("delivery_mode")
+        .and_then(|value| value.as_str())
+        .map(parse_delivery_mode)
+        .transpose()?
+        .unwrap_or(DeliveryMode::InjectWhenIdle);
+
+    Ok(NewAgentMessage {
+        task_id: None,
+        from: MessageSource::User(ClientId::new()),
+        to,
+        kind,
+        priority,
+        body,
+        context_refs: Vec::new(),
+        artifact_refs: Vec::new(),
+        delivery_mode,
+        requires_response: false,
+    })
+}
+
+fn parse_message_target(raw: &str) -> Result<MessageTarget> {
+    if raw == "broadcast" {
+        return Ok(MessageTarget::Broadcast);
+    }
+    if let Some(role) = raw.strip_prefix("role:") {
+        return Ok(MessageTarget::Role(parse_agent_role(role)?));
+    }
+    if let Ok(agent_id) = raw.parse::<AgentSessionId>() {
+        return Ok(MessageTarget::Agent(agent_id));
+    }
+    Err(AgentmuxError::UserError(format!(
+        "unsupported message target '{raw}'"
+    )))
+}
+
+fn parse_agent_role(raw: &str) -> Result<AgentRole> {
+    serde_json::from_value(json!(raw)).map_err(|error| {
+        AgentmuxError::UserError(format!("invalid message role target '{raw}': {error}"))
+    })
+}
+
+fn parse_message_kind(raw: &str) -> Result<MessageKind> {
+    serde_json::from_value(json!(raw))
+        .map_err(|error| AgentmuxError::UserError(format!("invalid message kind '{raw}': {error}")))
+}
+
+fn parse_priority(raw: &str) -> Result<Priority> {
+    serde_json::from_value(json!(raw))
+        .map_err(|error| AgentmuxError::UserError(format!("invalid priority '{raw}': {error}")))
+}
+
+fn parse_delivery_mode(raw: &str) -> Result<DeliveryMode> {
+    serde_json::from_value(json!(raw)).map_err(|error| {
+        AgentmuxError::UserError(format!("invalid delivery_mode '{raw}': {error}"))
+    })
+}
+
+fn message_payload(message: &AgentMessage) -> serde_json::Value {
+    json!({
+        "message_id": message.id.to_string(),
+        "task_id": message.task_id.as_ref().map(ToString::to_string),
+        "from": message.from,
+        "to": message.to,
+        "kind": message.kind,
+        "priority": message.priority,
+        "body": message.body,
+        "context_refs": message.context_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "artifact_refs": message.artifact_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "delivery_mode": message.delivery_mode,
+        "delivery_status": message.delivery_status,
+        "requires_response": message.requires_response,
+        "created_at": message.created_at.to_string(),
+        "delivered_at": message.delivered_at.map(|ts| ts.to_string()),
+        "read_at": message.read_at.map(|ts| ts.to_string()),
+    })
+}
+
+enum ContextLookup {
+    List,
+    Show(ContextItemId),
+    Search(String),
+}
+
+async fn context_create_payload(
+    payload: &serde_json::Value,
+    runtime: &DaemonRuntime,
+) -> Result<NewContextItem> {
+    let project_id = {
+        let state = runtime.state.read().await;
+        state.default_project_id.clone()
+    };
+    let title = required_string(payload, "title", "context.create")?.to_string();
+    let body = payload
+        .get("body")
+        .and_then(|value| value.as_str())
+        .unwrap_or(&title)
+        .to_string();
+    let kind = payload
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .map(parse_context_kind)
+        .transpose()?
+        .unwrap_or(ContextKind::HandoffSummary);
+    let visibility = payload
+        .get("visibility")
+        .and_then(|value| value.as_str())
+        .map(parse_visibility)
+        .transpose()?
+        .unwrap_or(Visibility::Internal);
+    let tags = payload
+        .get("tags")
+        .map(|value| serde_json::from_value(value.clone()))
+        .transpose()
+        .map_err(|error| AgentmuxError::UserError(format!("context.create tags invalid: {error}")))?
+        .unwrap_or_default();
+
+    Ok(NewContextItem {
+        project_id,
+        task_id: None,
+        scope: ContextScope::Project,
+        kind,
+        title,
+        body,
+        source: ContextSource::Human,
+        visibility,
+        confidence: 1.0,
+        tags,
+        related_files: Vec::new(),
+        artifact_refs: Vec::new(),
+    })
+}
+
+fn context_search_payload(payload: &serde_json::Value) -> Result<ContextLookup> {
+    if let Some(raw_context_id) = payload.get("context_id").and_then(|value| value.as_str()) {
+        let context_id = parse_context_item_id(raw_context_id).ok_or_else(|| {
+            AgentmuxError::UserError(format!("invalid context_id '{raw_context_id}'"))
+        })?;
+        return Ok(ContextLookup::Show(context_id));
+    }
+    let query = payload
+        .get("query")
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if query.is_empty() {
+        Ok(ContextLookup::List)
+    } else {
+        Ok(ContextLookup::Search(query))
+    }
+}
+
+fn context_attach_payload(payload: &serde_json::Value) -> Result<(ContextItemId, MessageId)> {
+    let context_id = required_string(payload, "context_id", "context.attach")?
+        .parse::<ContextItemId>()
+        .map_err(|error| AgentmuxError::UserError(format!("invalid context_id: {error}")))?;
+    let message_id = required_string(payload, "message_id", "context.attach")?
+        .parse::<MessageId>()
+        .map_err(|error| AgentmuxError::UserError(format!("invalid message_id: {error}")))?;
+    Ok((context_id, message_id))
+}
+
+fn context_inject_payload(payload: &serde_json::Value) -> Result<(ContextItemId, AgentSessionId)> {
+    let context_id = required_string(payload, "context_id", "context.inject")?
+        .parse::<ContextItemId>()
+        .map_err(|error| AgentmuxError::UserError(format!("invalid context_id: {error}")))?;
+    let agent_id = required_string(payload, "agent_id", "context.inject")?
+        .parse::<AgentSessionId>()
+        .map_err(|error| AgentmuxError::UserError(format!("invalid agent_id: {error}")))?;
+    Ok((context_id, agent_id))
+}
+
+fn required_string<'a>(
+    payload: &'a serde_json::Value,
+    field: &str,
+    command: &str,
+) -> Result<&'a str> {
+    payload
+        .get(field)
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AgentmuxError::UserError(format!("{command} requires {field}")))
+}
+
+fn parse_context_kind(raw: &str) -> Result<ContextKind> {
+    serde_json::from_value(json!(raw))
+        .map_err(|error| AgentmuxError::UserError(format!("invalid context kind '{raw}': {error}")))
+}
+
+fn parse_visibility(raw: &str) -> Result<Visibility> {
+    serde_json::from_value(json!(raw))
+        .map_err(|error| AgentmuxError::UserError(format!("invalid visibility '{raw}': {error}")))
+}
+
+fn context_payload(item: &ContextItem) -> serde_json::Value {
+    json!({
+        "context_id": item.id.to_string(),
+        "project_id": item.project_id.to_string(),
+        "task_id": item.task_id.as_ref().map(ToString::to_string),
+        "scope": item.scope,
+        "kind": item.kind,
+        "title": item.title,
+        "body": item.body,
+        "source": item.source,
+        "visibility": item.visibility,
+        "confidence": item.confidence,
+        "tags": item.tags,
+        "related_files": item
+            .related_files
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>(),
+        "artifact_refs": item.artifact_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "created_at": item.created_at.to_string(),
+        "updated_at": item.updated_at.to_string(),
+    })
+}
+
+fn worktree_id_payload(payload: &serde_json::Value, command: &str) -> Result<WorktreeId> {
+    required_string(payload, "worktree_id", command)?
+        .parse::<WorktreeId>()
+        .map_err(|error| AgentmuxError::UserError(format!("invalid worktree_id: {error}")))
+}
+
+fn approval_id_payload(payload: &serde_json::Value, command: &str) -> Result<ApprovalId> {
+    required_string(payload, "approval_id", command)?
+        .parse::<ApprovalId>()
+        .map_err(|error| AgentmuxError::UserError(format!("invalid approval_id: {error}")))
+}
+
+fn worktree_test_command_payload(payload: &serde_json::Value) -> TestCommand {
+    TestCommand {
+        name: payload
+            .get("name")
+            .and_then(|value| value.as_str())
+            .unwrap_or("default")
+            .to_string(),
+        command: payload
+            .get("command")
+            .and_then(|value| value.as_str())
+            .unwrap_or("cargo test")
+            .to_string(),
+    }
+}
+
+fn worktree_payload(worktree: &Worktree) -> serde_json::Value {
+    json!({
+        "worktree_id": worktree.id.to_string(),
+        "project_id": worktree.project_id.to_string(),
+        "task_id": worktree.task_id.to_string(),
+        "owner_agent_id": worktree.owner_agent_id.as_ref().map(ToString::to_string),
+        "path": worktree.path.display().to_string(),
+        "branch_name": worktree.branch_name,
+        "base_branch": worktree.base_branch,
+        "status": worktree.status,
+        "created_at": worktree.created_at.to_string(),
+    })
+}
+
+fn approval_payload(approval: &ApprovalRequest) -> serde_json::Value {
+    json!({
+        "approval_id": approval.id.to_string(),
+        "kind": approval.kind,
+        "risk": approval.risk,
+        "title": approval.title,
+        "description": approval.description,
+        "proposed_input": approval.proposed_input,
+        "command": approval.command,
+        "context_refs": approval.context_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
+        "status": approval.status,
+    })
+}
+
+fn approval_queue_error(error: ApprovalQueueError) -> String {
+    match error {
+        ApprovalQueueError::UnknownApproval(id) => format!("unknown approval '{id}'"),
+        ApprovalQueueError::AlreadyDecided { id, status } => {
+            format!("approval '{id}' is already {status:?}")
+        }
+    }
+}
+
+fn approval_daemon_event(event: &ApprovalEvent) -> DaemonEvent {
+    match event {
+        ApprovalEvent::ApprovalCreated {
+            approval_id,
+            kind,
+            risk,
+            title,
+        } => DaemonEvent::new(
+            IpcEventKind::ApprovalCreated,
+            json!({
+                "approval_id": approval_id.to_string(),
+                "kind": kind,
+                "risk": risk,
+                "title": title,
+            }),
+        ),
+        ApprovalEvent::ApprovalDecided {
+            approval_id,
+            status,
+        } => DaemonEvent::new(
+            IpcEventKind::ApprovalDecided,
+            json!({
+                "approval_id": approval_id.to_string(),
+                "status": status,
+            }),
+        ),
+        ApprovalEvent::PolicyDenied {
+            kind,
+            risk,
+            title,
+            description,
+            command,
+        } => DaemonEvent::new(
+            IpcEventKind::PolicyDenied,
+            json!({
+                "kind": kind,
+                "risk": risk,
+                "title": title,
+                "description": description,
+                "command": command,
+            }),
+        ),
+    }
+}
+
+fn artifact_payload(artifact_id: String, path: String, title: String) -> serde_json::Value {
+    json!({
+        "artifact_id": artifact_id,
+        "path": path,
+        "title": title,
+    })
+}
+
+fn json_error(error: serde_json::Error) -> AgentmuxError {
+    AgentmuxError::StoreError(format!("failed to encode event payload: {error}"))
 }
 
 fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<PtySpawnSpec>> {
@@ -663,6 +2430,37 @@ mod tests {
                 .len(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn task_run_shell_stub_completes_standard_workflow() {
+        let root = std::env::temp_dir().join(format!("agentmux-daemon-task-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let runtime = DaemonRuntime::new(8);
+
+        let payload = runtime
+            .run_task_with_shell_stubs(
+                "small deterministic task".to_string(),
+                "shell-stub".to_string(),
+                root.clone(),
+            )
+            .await
+            .expect("shell-stub task run completes");
+
+        assert_eq!(payload["status"], "completed");
+        assert_eq!(payload["stage"], "Completed");
+        assert_eq!(payload["shell_processes"].as_array().unwrap().len(), 4);
+        let handoffs = payload["handoffs"].as_array().unwrap();
+        assert_eq!(handoffs.len(), 4);
+        assert!(handoffs[1]["body"].as_str().unwrap().contains("impl"));
+        assert!(
+            payload["final_summary"]
+                .as_str()
+                .unwrap()
+                .contains("promote approved candidate worktree")
+        );
+
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
     }
 
     #[tokio::test]
@@ -810,6 +2608,812 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ipc_message_commands_create_list_show_and_inject() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_spawn",
+                IpcCommand::AgentSpawn,
+                json!({ "name": "implementer" }),
+            ))
+            .await
+            .unwrap();
+        let (spawn_response, _) = read_response_and_event(&mut reader).await;
+        let agent_id = spawn_response.payload.unwrap()["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        writer
+            .write(&ClientRequest::new(
+                "req_message_create",
+                IpcCommand::MessageCreate,
+                json!({
+                    "to": agent_id,
+                    "body": "please review the diff",
+                    "kind": "handoff",
+                    "priority": "normal",
+                    "delivery_mode": "inject_when_idle",
+                }),
+            ))
+            .await
+            .unwrap();
+        let (create_response, created_event) = read_response_and_event(&mut reader).await;
+        assert!(create_response.ok);
+        assert_eq!(created_event.kind, IpcEventKind::MessageCreated);
+        let create_payload = create_response.payload.unwrap();
+        let message_id = create_payload["message_id"].as_str().unwrap().to_string();
+        assert_eq!(create_payload["delivery_status"], "queued");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_message_list",
+                IpcCommand::MessageList,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let list_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(list_response.ok);
+        let list_payload = list_response.payload.unwrap();
+        assert_eq!(list_payload["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(list_payload["messages"][0]["message_id"], message_id);
+
+        writer
+            .write(&ClientRequest::new(
+                "req_message_show",
+                IpcCommand::MessageShow,
+                json!({ "message_id": message_id }),
+            ))
+            .await
+            .unwrap();
+        let show_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(show_response.ok);
+        let show_payload = show_response.payload.unwrap();
+        assert_eq!(show_payload["body"], "please review the diff");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_message_inject",
+                IpcCommand::MessageInject,
+                json!({ "message_id": show_payload["message_id"] }),
+            ))
+            .await
+            .unwrap();
+        let (inject_response, delivered_event) = read_response_and_event(&mut reader).await;
+        assert!(inject_response.ok);
+        assert_eq!(delivered_event.kind, IpcEventKind::MessageDelivered);
+        assert_eq!(
+            inject_response.payload.unwrap()["delivery_status"],
+            "delivered"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_message_show_reports_unknown_message() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        let missing = MessageId::new();
+        writer
+            .write(&ClientRequest::new(
+                "req_message_show",
+                IpcCommand::MessageShow,
+                json!({ "message_id": missing.to_string() }),
+            ))
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "MESSAGE_NOT_FOUND");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_context_commands_create_search_attach_inject_and_export() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_spawn",
+                IpcCommand::AgentSpawn,
+                json!({ "name": "implementer" }),
+            ))
+            .await
+            .unwrap();
+        let (spawn_response, _) = read_response_and_event(&mut reader).await;
+        let agent_id = spawn_response.payload.unwrap()["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        writer
+            .write(&ClientRequest::new(
+                "req_context_create",
+                IpcCommand::ContextCreate,
+                json!({
+                    "title": "review decision",
+                    "body": "Use daemon IPC for shared context.",
+                    "kind": "decision",
+                    "visibility": "internal",
+                    "tags": ["ipc"],
+                }),
+            ))
+            .await
+            .unwrap();
+        let (create_response, created_event) = read_response_and_event(&mut reader).await;
+        assert!(create_response.ok);
+        assert_eq!(created_event.kind, IpcEventKind::ContextCreated);
+        let create_payload = create_response.payload.unwrap();
+        let context_id = create_payload["context_id"].as_str().unwrap().to_string();
+        assert_eq!(create_payload["title"], "review decision");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_context_list",
+                IpcCommand::ContextSearch,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let list_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(list_response.ok);
+        let list_payload = list_response.payload.unwrap();
+        assert_eq!(list_payload["contexts"].as_array().unwrap().len(), 1);
+
+        writer
+            .write(&ClientRequest::new(
+                "req_context_show",
+                IpcCommand::ContextSearch,
+                json!({ "context_id": context_id }),
+            ))
+            .await
+            .unwrap();
+        let show_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(show_response.ok);
+        let show_payload = show_response.payload.unwrap();
+        assert_eq!(show_payload["body"], "Use daemon IPC for shared context.");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_context_search",
+                IpcCommand::ContextSearch,
+                json!({ "query": "daemon ipc" }),
+            ))
+            .await
+            .unwrap();
+        let search_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(search_response.ok);
+        assert_eq!(
+            search_response.payload.unwrap()["contexts"]
+                .as_array()
+                .unwrap()
+                .len(),
+            1
+        );
+
+        writer
+            .write(&ClientRequest::new(
+                "req_message_create",
+                IpcCommand::MessageCreate,
+                json!({
+                    "to": agent_id,
+                    "body": "please use the attached context",
+                }),
+            ))
+            .await
+            .unwrap();
+        let (message_response, _) = read_response_and_event(&mut reader).await;
+        let message_id = message_response.payload.unwrap()["message_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        writer
+            .write(&ClientRequest::new(
+                "req_context_attach",
+                IpcCommand::ContextAttach,
+                json!({ "context_id": show_payload["context_id"], "message_id": message_id }),
+            ))
+            .await
+            .unwrap();
+        let attach_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(attach_response.ok);
+        assert_eq!(
+            attach_response.payload.unwrap()["context_refs"][0],
+            show_payload["context_id"]
+        );
+
+        writer
+            .write(&ClientRequest::new(
+                "req_context_inject",
+                IpcCommand::ContextInject,
+                json!({ "context_id": show_payload["context_id"], "agent_id": agent_id }),
+            ))
+            .await
+            .unwrap();
+        let (inject_response, injected_event) = read_response_and_event(&mut reader).await;
+        assert!(inject_response.ok);
+        assert_eq!(injected_event.kind, IpcEventKind::ContextInjected);
+
+        let output = std::env::temp_dir().join(format!(
+            "agentmux-context-export-{}.json",
+            ulid::Ulid::new()
+        ));
+        writer
+            .write(&ClientRequest::new(
+                "req_context_export",
+                IpcCommand::ContextExport,
+                json!({ "output": output }),
+            ))
+            .await
+            .unwrap();
+        let export_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(export_response.ok);
+        assert_eq!(export_response.payload.unwrap()["context_count"], 1);
+        let exported = std::fs::read_to_string(&output).unwrap();
+        assert!(exported.contains("review decision"));
+        std::fs::remove_file(output).unwrap();
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_context_show_reports_unknown_context() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_context_show",
+                IpcCommand::ContextSearch,
+                json!({ "context_id": ContextItemId::new().to_string() }),
+            ))
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "CONTEXT_NOT_FOUND");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_context_show_rejects_invalid_context_id() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_context_show",
+                IpcCommand::ContextSearch,
+                json!({ "context_id": "not-a-context-id" }),
+            ))
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "INVALID_CONTEXT_SEARCH");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_worktree_commands_list_test_promote_and_archive() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-worktree-ipc-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary worktree root is created");
+        let runtime = DaemonRuntime::new(16);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: agentmux_core::TaskId::new(),
+            owner_agent_id: None,
+            path: root.clone(),
+            branch_name: "agentmux/task-impl".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::Ready,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.to_string();
+        runtime.register_worktree(worktree).await;
+
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_list",
+                IpcCommand::WorktreeList,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let list_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(list_response.ok);
+        let list_payload = list_response.payload.unwrap();
+        assert_eq!(list_payload["worktrees"].as_array().unwrap().len(), 1);
+        assert_eq!(list_payload["worktrees"][0]["worktree_id"], worktree_id);
+
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_test",
+                IpcCommand::WorktreeTest,
+                json!({
+                    "worktree_id": worktree_id,
+                    "name": "smoke",
+                    "command": "printf test-ok",
+                }),
+            ))
+            .await
+            .unwrap();
+        let (test_response, artifact_event) = read_response_and_event(&mut reader).await;
+        assert!(test_response.ok);
+        assert_eq!(artifact_event.kind, IpcEventKind::ArtifactCreated);
+        let test_payload = test_response.payload.unwrap();
+        assert_eq!(test_payload["worktree"]["status"], "review_ready");
+        assert_eq!(test_payload["test"]["status"], "passed");
+        assert!(
+            std::fs::read_to_string(test_payload["test"]["artifact"]["path"].as_str().unwrap())
+                .unwrap()
+                .contains("test-ok")
+        );
+
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_promote",
+                IpcCommand::WorktreePromote,
+                json!({ "worktree_id": test_payload["worktree"]["worktree_id"] }),
+            ))
+            .await
+            .unwrap();
+        let promote_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(promote_response.ok);
+        assert_eq!(promote_response.payload.unwrap()["status"], "promoted");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_archive",
+                IpcCommand::WorktreeArchive,
+                json!({ "worktree_id": test_payload["worktree"]["worktree_id"] }),
+            ))
+            .await
+            .unwrap();
+        let archive_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(archive_response.ok);
+        assert_eq!(archive_response.payload.unwrap()["status"], "archived");
+
+        server.abort();
+        std::fs::remove_dir_all(root).expect("temporary worktree root is removed");
+    }
+
+    #[tokio::test]
+    async fn ipc_worktree_diff_reports_unknown_worktree() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_diff",
+                IpcCommand::WorktreeDiff,
+                json!({ "worktree_id": WorktreeId::new().to_string() }),
+            ))
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "WORKTREE_DIFF_FAILED");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_worktree_commands_reject_invalid_worktree_id() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_test",
+                IpcCommand::WorktreeTest,
+                json!({ "worktree_id": "not-a-worktree-id" }),
+            ))
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!response.ok);
+        assert_eq!(response.error.unwrap().code, "INVALID_WORKTREE_ID");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_approval_commands_list_approve_and_reject() {
+        let runtime = DaemonRuntime::new(16);
+        let approve_request = runtime
+            .submit_approval_request(ApprovalRequest::command(
+                agentmux_core::ApprovalKind::ShellCommand,
+                "cargo test",
+                "test command requires approval",
+            ))
+            .await;
+        let reject_request = runtime
+            .submit_approval_request(ApprovalRequest::command(
+                agentmux_core::ApprovalKind::GitCommit,
+                "git commit -m fix",
+                "git commit requires approval",
+            ))
+            .await;
+
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_approval_list",
+                IpcCommand::ApprovalList,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let list_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(list_response.ok);
+        let list_payload = list_response.payload.unwrap();
+        assert_eq!(list_payload["approvals"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            list_payload["approvals"][0]["status"],
+            serde_json::json!("pending")
+        );
+
+        writer
+            .write(&ClientRequest::new(
+                "req_approval_approve",
+                IpcCommand::ApprovalApprove,
+                json!({ "approval_id": approve_request.id.to_string() }),
+            ))
+            .await
+            .unwrap();
+        let (approve_response, approve_event) = read_response_and_event(&mut reader).await;
+        assert!(approve_response.ok);
+        assert_eq!(approve_event.kind, IpcEventKind::ApprovalDecided);
+        assert_eq!(approve_response.payload.unwrap()["status"], "approved");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_approval_reject",
+                IpcCommand::ApprovalReject,
+                json!({ "approval_id": reject_request.id.to_string() }),
+            ))
+            .await
+            .unwrap();
+        let (reject_response, reject_event) = read_response_and_event(&mut reader).await;
+        assert!(reject_response.ok);
+        assert_eq!(reject_event.kind, IpcEventKind::ApprovalDecided);
+        assert_eq!(reject_response.payload.unwrap()["status"], "rejected");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_approval_list_after_decisions",
+                IpcCommand::ApprovalList,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let list_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(list_response.ok);
+        assert!(
+            list_response.payload.unwrap()["approvals"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_approval_commands_report_invalid_and_unknown_ids() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_approval_invalid",
+                IpcCommand::ApprovalApprove,
+                json!({ "approval_id": "not-an-approval-id" }),
+            ))
+            .await
+            .unwrap();
+        let invalid_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!invalid_response.ok);
+        assert_eq!(invalid_response.error.unwrap().code, "INVALID_APPROVAL_ID");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_approval_unknown",
+                IpcCommand::ApprovalReject,
+                json!({ "approval_id": ApprovalId::new().to_string() }),
+            ))
+            .await
+            .unwrap();
+        let unknown_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!unknown_response.ok);
+        let error = unknown_response.error.unwrap();
+        assert_eq!(error.code, "APPROVAL_DECISION_FAILED");
+        assert!(error.message.contains("unknown approval"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_agent_commands_focus_stop_and_report_errors() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_spawn",
+                IpcCommand::AgentSpawn,
+                json!({ "name": "reviewer", "provider": "codex", "role": "reviewer" }),
+            ))
+            .await
+            .unwrap();
+        let (spawn_response, spawned_event) = read_response_and_event(&mut reader).await;
+        assert!(spawn_response.ok);
+        assert_eq!(spawned_event.kind, IpcEventKind::AgentSpawned);
+        let agent_id = spawn_response.payload.unwrap()["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        writer
+            .write(&ClientRequest::new(
+                "req_focus",
+                IpcCommand::AgentFocus,
+                json!({ "agent_id": agent_id }),
+            ))
+            .await
+            .unwrap();
+        let (focus_response, focus_event) = read_response_and_event(&mut reader).await;
+        assert!(focus_response.ok);
+        assert_eq!(focus_response.payload.unwrap()["focused"], true);
+        assert_eq!(focus_event.kind, IpcEventKind::ClientAttached);
+
+        writer
+            .write(&ClientRequest::new(
+                "req_interrupt",
+                IpcCommand::AgentInterrupt,
+                json!({ "agent_id": agent_id }),
+            ))
+            .await
+            .unwrap();
+        let interrupt_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!interrupt_response.ok);
+        assert_eq!(
+            interrupt_response.error.unwrap().code,
+            "AGENT_INTERRUPT_FAILED"
+        );
+
+        writer
+            .write(&ClientRequest::new(
+                "req_stop",
+                IpcCommand::AgentStop,
+                json!({ "agent_id": agent_id }),
+            ))
+            .await
+            .unwrap();
+        let (stop_response, exited_event) = read_response_and_event(&mut reader).await;
+        assert!(stop_response.ok);
+        assert_eq!(stop_response.payload.unwrap()["stopped"], true);
+        assert_eq!(exited_event.kind, IpcEventKind::AgentExited);
+
+        writer
+            .write(&ClientRequest::new(
+                "req_stop_unknown",
+                IpcCommand::AgentStop,
+                json!({ "agent_id": AgentSessionId::new().to_string() }),
+            ))
+            .await
+            .unwrap();
+        let unknown_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!unknown_response.ok);
+        assert_eq!(unknown_response.error.unwrap().code, "AGENT_STOP_FAILED");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_focus_invalid",
+                IpcCommand::AgentFocus,
+                json!({ "agent_id": "not-an-agent-id" }),
+            ))
+            .await
+            .unwrap();
+        let invalid_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!invalid_response.ok);
+        assert_eq!(invalid_response.error.unwrap().code, "INVALID_AGENT_ID");
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_layout_commands_save_list_load_and_report_unknown_layout() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_layout_save",
+                IpcCommand::LayoutSet,
+                json!({
+                    "name": "default",
+                    "layout": { "panes": ["planner", "implementer"] },
+                }),
+            ))
+            .await
+            .unwrap();
+        let save_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(save_response.ok);
+        assert_eq!(save_response.payload.unwrap()["saved"], true);
+
+        writer
+            .write(&ClientRequest::new(
+                "req_layout_list",
+                IpcCommand::LayoutGet,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        let list_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(list_response.ok);
+        assert_eq!(list_response.payload.unwrap()["layouts"][0], "default");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_layout_load",
+                IpcCommand::LayoutGet,
+                json!({ "name": "default" }),
+            ))
+            .await
+            .unwrap();
+        let load_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(load_response.ok);
+        assert_eq!(
+            load_response.payload.unwrap()["layout"]["panes"][1],
+            "implementer"
+        );
+
+        writer
+            .write(&ClientRequest::new(
+                "req_layout_unknown",
+                IpcCommand::LayoutGet,
+                json!({ "name": "missing" }),
+            ))
+            .await
+            .unwrap();
+        let unknown_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!unknown_response.ok);
+        assert_eq!(unknown_response.error.unwrap().code, "LAYOUT_NOT_FOUND");
+
+        writer
+            .write(&ClientRequest::new(
+                "req_layout_invalid",
+                IpcCommand::LayoutSet,
+                json!({ "name": " " }),
+            ))
+            .await
+            .unwrap();
+        let invalid_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!invalid_response.ok);
+        assert_eq!(invalid_response.error.unwrap().code, "INVALID_LAYOUT_SET");
+
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn send_input_script_appends_audit_events_to_event_log() {
         let root = std::env::temp_dir().join(format!("agentmux-daemon-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("temporary root is created");
@@ -865,6 +3469,81 @@ mod tests {
             assert_eq!(event["payload"]["action_count"], 1);
             assert_eq!(event["payload"]["target_agent_id"], agent.id.to_string());
             assert_eq!(event["payload"]["actions"][0]["type_text"], "audit works\n");
+        }
+
+        std::fs::remove_dir_all(root).expect("temporary daemon directory is removed");
+    }
+
+    #[tokio::test]
+    async fn finish_shutdown_removes_socket_and_flushes_state_event() {
+        let root = std::env::temp_dir().join(format!("agentmux-daemon-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let socket_path = root.join("agentmux.sock");
+        std::fs::write(&socket_path, b"stale socket placeholder")
+            .expect("socket placeholder is written");
+        let event_log_path = root.join(".agentmux").join("events.jsonl");
+        let runtime = DaemonRuntime::new(16).with_event_log(EventLog::new(&event_log_path));
+        let agent = runtime.register_agent("planner".to_string()).await;
+        let mut events = runtime.subscribe();
+
+        finish_shutdown(&runtime, &socket_path).await.unwrap();
+
+        assert!(!socket_path.exists(), "daemon socket should be removed");
+        let event = events.recv().await.expect("shutdown event is published");
+        assert_eq!(event.kind, IpcEventKind::DaemonStopped);
+        let content = std::fs::read_to_string(&event_log_path).expect("event log is written");
+        let events: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSONL event"))
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["type"], "daemon.stopped");
+        assert_eq!(events[0]["payload"]["state"]["agent_count"], 1);
+        assert_eq!(
+            events[0]["payload"]["state"]["agents"][0]["id"],
+            agent.id.to_string()
+        );
+
+        std::fs::remove_dir_all(root).expect("temporary daemon directory is removed");
+    }
+
+    #[tokio::test]
+    async fn runtime_recovers_agent_metadata_from_latest_shutdown_event() {
+        let root = std::env::temp_dir().join(format!("agentmux-daemon-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let socket_path = root.join("agentmux.sock");
+        let event_log_path = root.join(".agentmux").join("events.jsonl");
+        let first_runtime = DaemonRuntime::new(16).with_event_log(EventLog::new(&event_log_path));
+        let planner = first_runtime.register_agent("planner".to_string()).await;
+        let implementer = first_runtime
+            .register_agent("implementer".to_string())
+            .await;
+
+        finish_shutdown(&first_runtime, &socket_path).await.unwrap();
+
+        let recovered_runtime =
+            DaemonRuntime::new(16).with_event_log(EventLog::new(&event_log_path));
+        let recovered_count = recovered_runtime
+            .recover_state_from_event_log()
+            .await
+            .expect("state is recovered");
+        let status = recovered_runtime.status_payload().await;
+
+        assert_eq!(recovered_count, 2);
+        assert_eq!(status["agent_count"], 2);
+        let agents = status["agents"].as_array().expect("agents are listed");
+        let planner_id = planner.id.to_string();
+        let implementer_id = implementer.id.to_string();
+        let recovered_ids = agents
+            .iter()
+            .map(|agent| agent["id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert!(recovered_ids.contains(planner_id.as_str()));
+        assert!(recovered_ids.contains(implementer_id.as_str()));
+        for agent in agents {
+            assert_eq!(agent["has_process"], false);
+            assert_eq!(agent["process_id"], serde_json::Value::Null);
+            assert!(agent["attached_clients"].as_array().unwrap().is_empty());
         }
 
         std::fs::remove_dir_all(root).expect("temporary daemon directory is removed");

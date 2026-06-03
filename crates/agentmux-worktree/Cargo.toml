@@ -12,4 +12,3 @@ agentmux-core = { workspace = true }
 serde         = { workspace = true }
 # No libgit2 / git2 dependency for v0.1 — git operations are shelled out
 # via std::process::Command. Re-evaluate in v0.2.
-# #TODO(agent): consider git2 or gitoxide once shell-out proves too fragile

@@ -7,8 +7,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use agentmux_core::{
-    AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, DateTimeUtc,
-    DeliveryMode, DeliveryStatus, MessageId, Priority, TaskId, error::Result,
+    AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ContextItemId,
+    DateTimeUtc, DeliveryMode, DeliveryStatus, MessageId, Priority, TaskId, error::Result,
 };
 
 use crate::message::{AgentMessage, MessageKind, MessageSource, MessageTarget, NewAgentMessage};
@@ -142,6 +142,22 @@ impl MessageBus {
 
     pub fn get_message(&self, id: &MessageId) -> Option<&AgentMessage> {
         self.messages.get(id)
+    }
+
+    pub fn list_messages(&self) -> Vec<&AgentMessage> {
+        self.messages.values().collect()
+    }
+
+    pub fn attach_context_ref(
+        &mut self,
+        id: &MessageId,
+        context_id: ContextItemId,
+    ) -> Result<AgentMessage> {
+        let message = self.message_mut(id)?;
+        if !message.context_refs.contains(&context_id) {
+            message.context_refs.push(context_id);
+        }
+        Ok(message.clone())
     }
 
     pub fn update_delivery_status(

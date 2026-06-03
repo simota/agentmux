@@ -8,7 +8,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use agentmux_core::{AgentmuxError, error::Result};
+use agentmux_core::{AgentmuxConfig, AgentmuxError, error::Result};
 use agentmux_ipc::{
     ClientHello, ClientRequest, DaemonResponse, IpcCommand, JsonlReader, JsonlWriter,
 };
@@ -18,6 +18,9 @@ use clap::{Parser, Subcommand};
 use serde_json::{Value, json};
 use tokio::io::BufReader;
 use tokio::net::UnixStream;
+
+const DEFAULT_PROJECT_CONFIG: &str =
+    include_str!("../../../docs/config/agentmux.config.example.toml");
 
 // ---------------------------------------------------------------------------
 // Top-level CLI
@@ -357,88 +360,155 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Agent(args) => match args.action {
-            AgentAction::Ls => println!("agent ls — not yet implemented"),
+            AgentAction::Ls => {
+                let response = send_daemon_request(&socket_path, agent_ls_request()).await?;
+                print_response("agent", response)?;
+            }
             AgentAction::Spawn { provider, role } => {
-                println!("agent spawn provider={provider} role={role} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, agent_spawn_request(provider, role)?).await?;
+                print_response("agent", response)?;
             }
             AgentAction::Stop { agent_id } => {
-                println!("agent stop {agent_id} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, agent_stop_request(agent_id)).await?;
+                print_response("agent", response)?;
             }
             AgentAction::Send { agent_id, body } => {
-                println!("agent send {agent_id} {body:?} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, agent_send_request(agent_id, body)?).await?;
+                print_response("agent", response)?;
             }
             AgentAction::Inject {
                 message_id,
                 agent_id,
             } => {
-                println!("agent inject {message_id} → {agent_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, agent_inject_request(message_id, agent_id))
+                        .await?;
+                print_response("agent", response)?;
             }
             AgentAction::Focus { agent_id } => {
-                println!("agent focus {agent_id} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, agent_focus_request(agent_id)).await?;
+                print_response("agent", response)?;
             }
             AgentAction::Interrupt { agent_id } => {
-                println!("agent interrupt {agent_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, agent_interrupt_request(agent_id)).await?;
+                print_response("agent", response)?;
             }
         },
         Commands::Message(args) => match args.action {
-            MessageAction::List => println!("message list — not yet implemented"),
+            MessageAction::List => {
+                let response = send_daemon_request(&socket_path, message_list_request()).await?;
+                print_response("message", response)?;
+            }
             MessageAction::Show { message_id } => {
-                println!("message show {message_id} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, message_show_request(message_id)).await?;
+                print_response("message", response)?;
             }
             MessageAction::Send { to, body } => {
-                println!("message send --to {to} {body:?} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, message_send_request(to, body)?).await?;
+                print_response("message", response)?;
             }
             MessageAction::Inject { message_id } => {
-                println!("message inject {message_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, message_inject_request(message_id)).await?;
+                print_response("message", response)?;
             }
         },
         Commands::Context(args) => match args.action {
-            ContextAction::Add { title } => println!("context add {title:?} — not yet implemented"),
-            ContextAction::List => println!("context list — not yet implemented"),
+            ContextAction::Add { title } => {
+                let response =
+                    send_daemon_request(&socket_path, context_add_request(title)?).await?;
+                print_response("context", response)?;
+            }
+            ContextAction::List => {
+                let response = send_daemon_request(&socket_path, context_list_request()).await?;
+                print_response("context", response)?;
+            }
             ContextAction::Show { context_id } => {
-                println!("context show {context_id} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, context_show_request(context_id)).await?;
+                print_response("context", response)?;
             }
             ContextAction::Search { query } => {
-                println!("context search {query:?} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, context_search_request(query)?).await?;
+                print_response("context", response)?;
             }
             ContextAction::Attach {
                 context_id,
                 message_id,
             } => {
-                println!("context attach {context_id} → {message_id} — not yet implemented");
+                let response = send_daemon_request(
+                    &socket_path,
+                    context_attach_request(context_id, message_id),
+                )
+                .await?;
+                print_response("context", response)?;
             }
             ContextAction::Inject {
                 context_id,
                 agent_id,
             } => {
-                println!("context inject {context_id} → {agent_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, context_inject_request(context_id, agent_id))
+                        .await?;
+                print_response("context", response)?;
             }
             ContextAction::Export { output } => {
-                println!("context export {output} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, context_export_request(output)).await?;
+                print_response("context", response)?;
             }
         },
         Commands::Worktree(args) => match args.action {
-            WorktreeAction::List => println!("worktree list — not yet implemented"),
+            WorktreeAction::List => {
+                let response = send_daemon_request(&socket_path, worktree_list_request()).await?;
+                print_response("worktree", response)?;
+            }
             WorktreeAction::Diff { worktree_id } => {
-                println!("worktree diff {worktree_id} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, worktree_diff_request(worktree_id)).await?;
+                print_response("worktree", response)?;
             }
             WorktreeAction::Test { worktree_id } => {
-                println!("worktree test {worktree_id} — not yet implemented")
+                let response =
+                    send_daemon_request(&socket_path, worktree_test_request(worktree_id)).await?;
+                print_response("worktree", response)?;
             }
             WorktreeAction::Promote { worktree_id } => {
-                println!("worktree promote {worktree_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, worktree_promote_request(worktree_id))
+                        .await?;
+                print_response("worktree", response)?;
             }
             WorktreeAction::Archive { worktree_id } => {
-                println!("worktree archive {worktree_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, worktree_archive_request(worktree_id))
+                        .await?;
+                print_response("worktree", response)?;
             }
         },
         Commands::Approval(args) => match args.action {
-            ApprovalAction::List => println!("approval list — not yet implemented"),
+            ApprovalAction::List => {
+                let response = send_daemon_request(&socket_path, approval_list_request()).await?;
+                print_response("approval", response)?;
+            }
             ApprovalAction::Approve { approval_id } => {
-                println!("approval approve {approval_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, approval_approve_request(approval_id))
+                        .await?;
+                print_response("approval", response)?;
             }
             ApprovalAction::Reject { approval_id } => {
-                println!("approval reject {approval_id} — not yet implemented");
+                let response =
+                    send_daemon_request(&socket_path, approval_reject_request(approval_id)).await?;
+                print_response("approval", response)?;
             }
         },
         Commands::Attach(args) => {
@@ -446,9 +516,19 @@ async fn main() -> Result<()> {
             print_response("attach", response)?;
         }
         Commands::Layout(args) => match args.action {
-            LayoutAction::Save { name } => println!("layout save {name} — not yet implemented"),
-            LayoutAction::Load { name } => println!("layout load {name} — not yet implemented"),
-            LayoutAction::List => println!("layout list — not yet implemented"),
+            LayoutAction::Save { name } => {
+                let response =
+                    send_daemon_request(&socket_path, layout_save_request(name)?).await?;
+                print_response("layout", response)?;
+            }
+            LayoutAction::Load { name } => {
+                let response = send_daemon_request(&socket_path, layout_load_request(name)).await?;
+                print_response("layout", response)?;
+            }
+            LayoutAction::List => {
+                let response = send_daemon_request(&socket_path, layout_list_request()).await?;
+                print_response("layout", response)?;
+            }
         },
     };
 
@@ -496,6 +576,274 @@ fn attach_request(target: String) -> ClientRequest {
     )
 }
 
+fn agent_ls_request() -> ClientRequest {
+    ClientRequest::new("req_agent_ls", IpcCommand::DaemonStatus, json!({}))
+}
+
+fn agent_spawn_request(provider: String, role: String) -> Result<ClientRequest> {
+    if provider.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "agent provider must not be empty".to_string(),
+        ));
+    }
+    if role.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "agent role must not be empty".to_string(),
+        ));
+    }
+
+    Ok(ClientRequest::new(
+        "req_agent_spawn",
+        IpcCommand::AgentSpawn,
+        json!({
+            "provider": provider,
+            "role": role,
+            "name": role,
+        }),
+    ))
+}
+
+fn agent_stop_request(agent_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_agent_stop",
+        IpcCommand::AgentStop,
+        json!({ "agent_id": agent_id }),
+    )
+}
+
+fn agent_send_request(agent_id: String, body: String) -> Result<ClientRequest> {
+    if body.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "agent message body must not be empty".to_string(),
+        ));
+    }
+    Ok(ClientRequest::new(
+        "req_agent_send",
+        IpcCommand::MessageCreate,
+        json!({
+            "to": agent_id,
+            "body": body,
+            "kind": "handoff",
+            "priority": "normal",
+            "delivery_mode": "inject_when_idle",
+        }),
+    ))
+}
+
+fn agent_inject_request(message_id: String, agent_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_agent_inject",
+        IpcCommand::MessageInject,
+        json!({ "message_id": message_id, "agent_id": agent_id }),
+    )
+}
+
+fn agent_focus_request(agent_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_agent_focus",
+        IpcCommand::AgentFocus,
+        json!({ "agent_id": agent_id }),
+    )
+}
+
+fn agent_interrupt_request(agent_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_agent_interrupt",
+        IpcCommand::AgentInterrupt,
+        json!({ "agent_id": agent_id }),
+    )
+}
+
+fn message_list_request() -> ClientRequest {
+    ClientRequest::new("req_message_list", IpcCommand::MessageList, json!({}))
+}
+
+fn message_show_request(message_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_message_show",
+        IpcCommand::MessageShow,
+        json!({ "message_id": message_id }),
+    )
+}
+
+fn message_send_request(to: String, body: String) -> Result<ClientRequest> {
+    if body.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "message body must not be empty".to_string(),
+        ));
+    }
+
+    Ok(ClientRequest::new(
+        "req_message_send",
+        IpcCommand::MessageCreate,
+        json!({
+            "to": to,
+            "body": body,
+            "kind": "handoff",
+            "priority": "normal",
+            "delivery_mode": "inject_when_idle",
+        }),
+    ))
+}
+
+fn message_inject_request(message_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_message_inject",
+        IpcCommand::MessageInject,
+        json!({ "message_id": message_id }),
+    )
+}
+
+fn context_add_request(title: String) -> Result<ClientRequest> {
+    if title.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "context title must not be empty".to_string(),
+        ));
+    }
+
+    Ok(ClientRequest::new(
+        "req_context_add",
+        IpcCommand::ContextCreate,
+        json!({
+            "title": title,
+            "kind": "handoff_summary",
+            "visibility": "internal",
+        }),
+    ))
+}
+
+fn context_list_request() -> ClientRequest {
+    ClientRequest::new("req_context_list", IpcCommand::ContextSearch, json!({}))
+}
+
+fn context_show_request(context_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_context_show",
+        IpcCommand::ContextSearch,
+        json!({ "context_id": context_id }),
+    )
+}
+
+fn context_search_request(query: String) -> Result<ClientRequest> {
+    if query.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "context search query must not be empty".to_string(),
+        ));
+    }
+
+    Ok(ClientRequest::new(
+        "req_context_search",
+        IpcCommand::ContextSearch,
+        json!({ "query": query }),
+    ))
+}
+
+fn context_attach_request(context_id: String, message_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_context_attach",
+        IpcCommand::ContextAttach,
+        json!({ "context_id": context_id, "message_id": message_id }),
+    )
+}
+
+fn context_inject_request(context_id: String, agent_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_context_inject",
+        IpcCommand::ContextInject,
+        json!({ "context_id": context_id, "agent_id": agent_id }),
+    )
+}
+
+fn context_export_request(output: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_context_export",
+        IpcCommand::ContextExport,
+        json!({ "output": output }),
+    )
+}
+
+fn worktree_list_request() -> ClientRequest {
+    ClientRequest::new("req_worktree_list", IpcCommand::WorktreeList, json!({}))
+}
+
+fn worktree_diff_request(worktree_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_worktree_diff",
+        IpcCommand::WorktreeDiff,
+        json!({ "worktree_id": worktree_id }),
+    )
+}
+
+fn worktree_test_request(worktree_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_worktree_test",
+        IpcCommand::WorktreeTest,
+        json!({ "worktree_id": worktree_id }),
+    )
+}
+
+fn worktree_promote_request(worktree_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_worktree_promote",
+        IpcCommand::WorktreePromote,
+        json!({ "worktree_id": worktree_id }),
+    )
+}
+
+fn worktree_archive_request(worktree_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_worktree_archive",
+        IpcCommand::WorktreeArchive,
+        json!({ "worktree_id": worktree_id }),
+    )
+}
+
+fn approval_list_request() -> ClientRequest {
+    ClientRequest::new("req_approval_list", IpcCommand::ApprovalList, json!({}))
+}
+
+fn approval_approve_request(approval_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_approval_approve",
+        IpcCommand::ApprovalApprove,
+        json!({ "approval_id": approval_id }),
+    )
+}
+
+fn approval_reject_request(approval_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_approval_reject",
+        IpcCommand::ApprovalReject,
+        json!({ "approval_id": approval_id }),
+    )
+}
+
+fn layout_save_request(name: String) -> Result<ClientRequest> {
+    if name.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "layout name must not be empty".to_string(),
+        ));
+    }
+
+    Ok(ClientRequest::new(
+        "req_layout_save",
+        IpcCommand::LayoutSet,
+        json!({ "name": name }),
+    ))
+}
+
+fn layout_load_request(name: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_layout_load",
+        IpcCommand::LayoutGet,
+        json!({ "name": name }),
+    )
+}
+
+fn layout_list_request() -> ClientRequest {
+    ClientRequest::new("req_layout_list", IpcCommand::LayoutGet, json!({}))
+}
+
 fn init_project(path: &Path) -> Result<PathBuf> {
     let project_dir = path.canonicalize().map_err(|error| {
         AgentmuxError::UserError(format!(
@@ -513,7 +861,7 @@ fn init_project(path: &Path) -> Result<PathBuf> {
 
     let config_path = agentmux_dir.join("config.toml");
     if !config_path.exists() {
-        std::fs::write(&config_path, "version = 1\n").map_err(|error| {
+        std::fs::write(&config_path, DEFAULT_PROJECT_CONFIG).map_err(|error| {
             AgentmuxError::StoreError(format!(
                 "failed to write '{}': {error}",
                 config_path.display()
@@ -624,12 +972,11 @@ fn check_daemon_socket(socket_path: &Path) -> DoctorCheck {
 fn check_config_parse(project_dir: &Path) -> DoctorCheck {
     let config_path = project_dir.join(".agentmux/config.toml");
     match std::fs::read_to_string(&config_path) {
-        Ok(contents) => match parse_minimal_config_version(&contents) {
-            Some(version) => DoctorCheck::ok("config parse", format!("version={version}")),
-            None => DoctorCheck::fail(
-                "config parse",
-                format!("missing numeric version in {}", config_path.display()),
-            ),
+        Ok(contents) => match AgentmuxConfig::parse_str(&contents) {
+            Ok(config) => {
+                DoctorCheck::ok("config parse", format!("project={}", config.project.name))
+            }
+            Err(error) => DoctorCheck::fail("config parse", error.to_string()),
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => DoctorCheck::warn(
             "config parse",
@@ -640,16 +987,6 @@ fn check_config_parse(project_dir: &Path) -> DoctorCheck {
             format!("cannot read {}: {error}", config_path.display()),
         ),
     }
-}
-
-fn parse_minimal_config_version(contents: &str) -> Option<u64> {
-    contents.lines().find_map(|line| {
-        let line = line.split_once('#').map_or(line, |(head, _)| head).trim();
-        let (key, value) = line.split_once('=')?;
-        (key.trim() == "version")
-            .then(|| value.trim().parse::<u64>().ok())
-            .flatten()
-    })
 }
 
 fn check_sqlite_access(project_dir: &Path) -> DoctorCheck {
@@ -814,6 +1151,193 @@ mod tests {
     }
 
     #[test]
+    fn message_requests_target_daemon_ipc() {
+        let list = message_list_request();
+        assert_eq!(list.command, IpcCommand::MessageList);
+
+        let show = message_show_request("msg_01HX".to_string());
+        assert_eq!(show.command, IpcCommand::MessageShow);
+        assert_eq!(show.payload["message_id"], "msg_01HX");
+
+        let send = message_send_request("agent_01HX".to_string(), "hello".to_string()).unwrap();
+        assert_eq!(send.command, IpcCommand::MessageCreate);
+        assert_eq!(send.payload["to"], "agent_01HX");
+        assert_eq!(send.payload["body"], "hello");
+        assert_eq!(send.payload["kind"], "handoff");
+        assert_eq!(send.payload["delivery_mode"], "inject_when_idle");
+
+        let inject = message_inject_request("msg_01HX".to_string());
+        assert_eq!(inject.command, IpcCommand::MessageInject);
+        assert_eq!(inject.payload["message_id"], "msg_01HX");
+    }
+
+    #[test]
+    fn message_send_rejects_empty_body_before_ipc() {
+        let error = message_send_request("agent_01HX".to_string(), "  ".to_string()).unwrap_err();
+
+        assert!(error.to_string().contains("message body must not be empty"));
+    }
+
+    #[test]
+    fn context_requests_target_daemon_ipc() {
+        let add = context_add_request("decision log".to_string()).unwrap();
+        assert_eq!(add.command, IpcCommand::ContextCreate);
+        assert_eq!(add.payload["title"], "decision log");
+        assert_eq!(add.payload["kind"], "handoff_summary");
+
+        let list = context_list_request();
+        assert_eq!(list.command, IpcCommand::ContextSearch);
+        assert_eq!(list.payload, json!({}));
+
+        let show = context_show_request("ctx_01HX".to_string());
+        assert_eq!(show.command, IpcCommand::ContextSearch);
+        assert_eq!(show.payload["context_id"], "ctx_01HX");
+
+        let search = context_search_request("risk".to_string()).unwrap();
+        assert_eq!(search.command, IpcCommand::ContextSearch);
+        assert_eq!(search.payload["query"], "risk");
+
+        let attach = context_attach_request("ctx_01HX".to_string(), "msg_01HX".to_string());
+        assert_eq!(attach.command, IpcCommand::ContextAttach);
+        assert_eq!(attach.payload["context_id"], "ctx_01HX");
+        assert_eq!(attach.payload["message_id"], "msg_01HX");
+
+        let inject = context_inject_request("ctx_01HX".to_string(), "agent_01HX".to_string());
+        assert_eq!(inject.command, IpcCommand::ContextInject);
+        assert_eq!(inject.payload["context_id"], "ctx_01HX");
+        assert_eq!(inject.payload["agent_id"], "agent_01HX");
+
+        let export = context_export_request("contexts.json".to_string());
+        assert_eq!(export.command, IpcCommand::ContextExport);
+        assert_eq!(export.payload["output"], "contexts.json");
+    }
+
+    #[test]
+    fn context_request_builders_reject_empty_text_before_ipc() {
+        let add_error = context_add_request("  ".to_string()).unwrap_err();
+        assert!(
+            add_error
+                .to_string()
+                .contains("context title must not be empty")
+        );
+
+        let search_error = context_search_request("  ".to_string()).unwrap_err();
+        assert!(
+            search_error
+                .to_string()
+                .contains("context search query must not be empty")
+        );
+    }
+
+    #[test]
+    fn worktree_requests_target_daemon_ipc() {
+        let list = worktree_list_request();
+        assert_eq!(list.command, IpcCommand::WorktreeList);
+        assert_eq!(list.payload, json!({}));
+
+        let diff = worktree_diff_request("wt_01HX".to_string());
+        assert_eq!(diff.command, IpcCommand::WorktreeDiff);
+        assert_eq!(diff.payload["worktree_id"], "wt_01HX");
+
+        let test = worktree_test_request("wt_01HX".to_string());
+        assert_eq!(test.command, IpcCommand::WorktreeTest);
+        assert_eq!(test.payload["worktree_id"], "wt_01HX");
+
+        let promote = worktree_promote_request("wt_01HX".to_string());
+        assert_eq!(promote.command, IpcCommand::WorktreePromote);
+        assert_eq!(promote.payload["worktree_id"], "wt_01HX");
+
+        let archive = worktree_archive_request("wt_01HX".to_string());
+        assert_eq!(archive.command, IpcCommand::WorktreeArchive);
+        assert_eq!(archive.payload["worktree_id"], "wt_01HX");
+    }
+
+    #[test]
+    fn approval_requests_target_daemon_ipc() {
+        let list = approval_list_request();
+        assert_eq!(list.command, IpcCommand::ApprovalList);
+        assert_eq!(list.payload, json!({}));
+
+        let approve = approval_approve_request("appr_01HX".to_string());
+        assert_eq!(approve.command, IpcCommand::ApprovalApprove);
+        assert_eq!(approve.payload["approval_id"], "appr_01HX");
+
+        let reject = approval_reject_request("appr_01HY".to_string());
+        assert_eq!(reject.command, IpcCommand::ApprovalReject);
+        assert_eq!(reject.payload["approval_id"], "appr_01HY");
+    }
+
+    #[test]
+    fn agent_requests_target_daemon_ipc() {
+        let list = agent_ls_request();
+        assert_eq!(list.command, IpcCommand::DaemonStatus);
+        assert_eq!(list.payload, json!({}));
+
+        let spawn = agent_spawn_request("codex".to_string(), "implementer".to_string()).unwrap();
+        assert_eq!(spawn.command, IpcCommand::AgentSpawn);
+        assert_eq!(spawn.payload["provider"], "codex");
+        assert_eq!(spawn.payload["role"], "implementer");
+        assert_eq!(spawn.payload["name"], "implementer");
+
+        let stop = agent_stop_request("agent_01HX".to_string());
+        assert_eq!(stop.command, IpcCommand::AgentStop);
+        assert_eq!(stop.payload["agent_id"], "agent_01HX");
+
+        let send = agent_send_request("agent_01HX".to_string(), "hello".to_string()).unwrap();
+        assert_eq!(send.command, IpcCommand::MessageCreate);
+        assert_eq!(send.payload["to"], "agent_01HX");
+        assert_eq!(send.payload["body"], "hello");
+
+        let inject = agent_inject_request("msg_01HX".to_string(), "agent_01HX".to_string());
+        assert_eq!(inject.command, IpcCommand::MessageInject);
+        assert_eq!(inject.payload["message_id"], "msg_01HX");
+        assert_eq!(inject.payload["agent_id"], "agent_01HX");
+
+        let focus = agent_focus_request("agent_01HX".to_string());
+        assert_eq!(focus.command, IpcCommand::AgentFocus);
+        assert_eq!(focus.payload["agent_id"], "agent_01HX");
+
+        let interrupt = agent_interrupt_request("agent_01HX".to_string());
+        assert_eq!(interrupt.command, IpcCommand::AgentInterrupt);
+        assert_eq!(interrupt.payload["agent_id"], "agent_01HX");
+    }
+
+    #[test]
+    fn agent_request_builders_reject_empty_values_before_ipc() {
+        let provider_error =
+            agent_spawn_request(" ".to_string(), "implementer".to_string()).unwrap_err();
+        assert!(provider_error.to_string().contains("provider"));
+
+        let role_error = agent_spawn_request("codex".to_string(), " ".to_string()).unwrap_err();
+        assert!(role_error.to_string().contains("role"));
+
+        let body_error = agent_send_request("agent_01HX".to_string(), " ".to_string()).unwrap_err();
+        assert!(body_error.to_string().contains("agent message body"));
+    }
+
+    #[test]
+    fn layout_requests_target_daemon_ipc() {
+        let save = layout_save_request("default".to_string()).unwrap();
+        assert_eq!(save.command, IpcCommand::LayoutSet);
+        assert_eq!(save.payload["name"], "default");
+
+        let load = layout_load_request("default".to_string());
+        assert_eq!(load.command, IpcCommand::LayoutGet);
+        assert_eq!(load.payload["name"], "default");
+
+        let list = layout_list_request();
+        assert_eq!(list.command, IpcCommand::LayoutGet);
+        assert_eq!(list.payload, json!({}));
+    }
+
+    #[test]
+    fn layout_save_rejects_empty_name_before_ipc() {
+        let error = layout_save_request("  ".to_string()).unwrap_err();
+
+        assert!(error.to_string().contains("layout name must not be empty"));
+    }
+
+    #[test]
     fn project_init_creates_agentmux_config_without_overwriting_existing_file() {
         let root = std::env::temp_dir().join(format!("agentmux-cli-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -821,32 +1345,34 @@ mod tests {
 
         let project_dir = init_project(&root).unwrap();
         let config_path = project_dir.join(".agentmux/config.toml");
-        assert_eq!(
-            std::fs::read_to_string(&config_path).unwrap(),
-            "version = 1\n"
-        );
+        let contents = std::fs::read_to_string(&config_path).unwrap();
+        let config = AgentmuxConfig::parse_str(&contents).unwrap();
+        assert_eq!(config.project.name, "example");
 
-        std::fs::write(&config_path, "version = 1\ncustom = true\n").unwrap();
+        std::fs::write(
+            &config_path,
+            DEFAULT_PROJECT_CONFIG.replace("example", "custom"),
+        )
+        .unwrap();
         init_project(&root).unwrap();
-        assert_eq!(
-            std::fs::read_to_string(&config_path).unwrap(),
-            "version = 1\ncustom = true\n"
+        assert!(
+            std::fs::read_to_string(&config_path)
+                .unwrap()
+                .contains("custom")
         );
 
         std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
-    fn minimal_config_parser_accepts_version_key_and_ignores_comments() {
-        assert_eq!(
-            parse_minimal_config_version("# project\nversion = 1 # v0.1\n"),
-            Some(1)
-        );
-        assert_eq!(
-            parse_minimal_config_version("team = 'claude-codex'\n"),
-            None
-        );
-        assert_eq!(parse_minimal_config_version("version = invalid\n"), None);
+    fn config_parser_accepts_docs_example_and_rejects_invalid_values() {
+        let config = AgentmuxConfig::parse_str(DEFAULT_PROJECT_CONFIG).unwrap();
+        assert_eq!(config.team["claude-codex"].agents.len(), 5);
+
+        let invalid =
+            DEFAULT_PROJECT_CONFIG.replace("prefix_key = \"Ctrl-g\"", "prefix_key = \"F12\"");
+        let error = AgentmuxConfig::parse_str(&invalid).unwrap_err();
+        assert!(error.to_string().contains("tui.prefix_key"));
     }
 
     #[test]
@@ -873,7 +1399,7 @@ mod tests {
             std::env::temp_dir().join(format!("agentmux-cli-doctor-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(".agentmux")).unwrap();
-        std::fs::write(root.join(".agentmux/config.toml"), "version = 1\n").unwrap();
+        std::fs::write(root.join(".agentmux/config.toml"), DEFAULT_PROJECT_CONFIG).unwrap();
 
         let report = doctor_report(&root.join("agentmux.sock"), &root);
         let names = report.iter().map(|check| check.name).collect::<Vec<_>>();
@@ -893,7 +1419,7 @@ mod tests {
         assert!(report.iter().any(|check| {
             check.name == "config parse"
                 && check.status == DoctorStatus::Ok
-                && check.detail == "version=1"
+                && check.detail == "project=example"
         }));
 
         std::fs::remove_dir_all(&root).unwrap();

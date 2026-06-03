@@ -1,0 +1,289 @@
+//! Client-side keymap dispatching.
+
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+const CTRL_C: &[u8] = b"\x03";
+
+/// Pane focus direction selected from a prefixed arrow key.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
+/// TUI command produced by the prefix keymap.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TuiCommand {
+    Detach,
+    Help,
+    ToggleZoom,
+    Focus(FocusDirection),
+    ShowTaskTree,
+    ShowAgentList,
+    ShowMessageBus,
+    ShowContextBoard,
+    ShowApprovalQueue,
+    SplitVertical,
+    SplitHorizontal,
+    ClosePane,
+    ResizeMode,
+    RotateLayout,
+    PasteQueuedMessage,
+    InjectSelectedMessage,
+    RequestStatus,
+    AttachContext,
+    RunTests,
+    InterruptAgent,
+    CommandPalette,
+}
+
+/// Result of routing one terminal key event.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum KeyDispatch {
+    /// Forward raw bytes to the currently focused agent pane.
+    ForwardToFocusedPane(Vec<u8>),
+    /// Execute a client-side TUI command.
+    Command(TuiCommand),
+    /// Prefix key was consumed; the next key decides the command.
+    PrefixStarted,
+    /// Event was consumed or ignored without producing an action.
+    Consumed,
+}
+
+/// Stateful dispatcher for the tmux-like `Ctrl-g` prefix keymap.
+#[derive(Clone, Debug)]
+pub struct KeymapDispatcher {
+    prefix: KeyBinding,
+    awaiting_prefix_command: bool,
+}
+
+impl Default for KeymapDispatcher {
+    fn default() -> Self {
+        Self::new(KeyBinding::ctrl_char('g'))
+    }
+}
+
+impl KeymapDispatcher {
+    pub fn new(prefix: KeyBinding) -> Self {
+        Self {
+            prefix,
+            awaiting_prefix_command: false,
+        }
+    }
+
+    pub fn is_awaiting_prefix_command(&self) -> bool {
+        self.awaiting_prefix_command
+    }
+
+    pub fn dispatch(&mut self, key: KeyEvent) -> KeyDispatch {
+        if matches!(key.kind, KeyEventKind::Release) {
+            return KeyDispatch::Consumed;
+        }
+
+        if self.prefix.matches(key) {
+            self.awaiting_prefix_command = true;
+            return KeyDispatch::PrefixStarted;
+        }
+
+        if self.awaiting_prefix_command {
+            self.awaiting_prefix_command = false;
+            return prefix_command(key)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        key_event_bytes(key)
+            .map(KeyDispatch::ForwardToFocusedPane)
+            .unwrap_or(KeyDispatch::Consumed)
+    }
+}
+
+/// A key binding matched by code plus required modifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeyBinding {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyBinding {
+    pub fn ctrl_char(ch: char) -> Self {
+        Self {
+            code: KeyCode::Char(ch.to_ascii_lowercase()),
+            modifiers: KeyModifiers::CONTROL,
+        }
+    }
+
+    fn matches(self, key: KeyEvent) -> bool {
+        key.code == self.code && key.modifiers == self.modifiers
+    }
+}
+
+fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Char('d') => Some(TuiCommand::Detach),
+        KeyCode::Char('?') => Some(TuiCommand::Help),
+        KeyCode::Char('z') => Some(TuiCommand::ToggleZoom),
+        KeyCode::Left => Some(TuiCommand::Focus(FocusDirection::Left)),
+        KeyCode::Right => Some(TuiCommand::Focus(FocusDirection::Right)),
+        KeyCode::Up => Some(TuiCommand::Focus(FocusDirection::Up)),
+        KeyCode::Down => Some(TuiCommand::Focus(FocusDirection::Down)),
+        KeyCode::Char('s') => Some(TuiCommand::ShowTaskTree),
+        KeyCode::Char('a') => Some(TuiCommand::ShowAgentList),
+        KeyCode::Char('m') => Some(TuiCommand::ShowMessageBus),
+        KeyCode::Char('c') => Some(TuiCommand::ShowContextBoard),
+        KeyCode::Char('A') => Some(TuiCommand::ShowApprovalQueue),
+        KeyCode::Char('%') => Some(TuiCommand::SplitVertical),
+        KeyCode::Char('"') => Some(TuiCommand::SplitHorizontal),
+        KeyCode::Char('x') => Some(TuiCommand::ClosePane),
+        KeyCode::Char('r') => Some(TuiCommand::ResizeMode),
+        KeyCode::Char(' ') => Some(TuiCommand::RotateLayout),
+        KeyCode::Char('p') => Some(TuiCommand::PasteQueuedMessage),
+        KeyCode::Char('i') => Some(TuiCommand::InjectSelectedMessage),
+        KeyCode::Char('R') => Some(TuiCommand::RequestStatus),
+        KeyCode::Char('C') => Some(TuiCommand::AttachContext),
+        KeyCode::Char('T') => Some(TuiCommand::RunTests),
+        KeyCode::Char('I') => Some(TuiCommand::InterruptAgent),
+        KeyCode::Char(':') => Some(TuiCommand::CommandPalette),
+        _ => None,
+    }
+}
+
+fn key_event_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        return match key.code {
+            KeyCode::Char('c') | KeyCode::Char('C') => Some(CTRL_C.to_vec()),
+            KeyCode::Char(ch) if ch.is_ascii_alphabetic() => {
+                Some(vec![ch.to_ascii_lowercase() as u8 - b'a' + 1])
+            }
+            _ => None,
+        };
+    }
+
+    match key.code {
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Enter => Some(b"\r".to_vec()),
+        KeyCode::Left => Some(b"\x1b[D".to_vec()),
+        KeyCode::Right => Some(b"\x1b[C".to_vec()),
+        KeyCode::Up => Some(b"\x1b[A".to_vec()),
+        KeyCode::Down => Some(b"\x1b[B".to_vec()),
+        KeyCode::Home => Some(b"\x1b[H".to_vec()),
+        KeyCode::End => Some(b"\x1b[F".to_vec()),
+        KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
+        KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
+        KeyCode::Tab => Some(b"\t".to_vec()),
+        KeyCode::Esc => Some(b"\x1b".to_vec()),
+        KeyCode::Char(ch) => Some(ch.to_string().into_bytes()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyEventState;
+
+    fn key(code: KeyCode, modifiers: KeyModifiers) -> KeyEvent {
+        KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        }
+    }
+
+    #[test]
+    fn prefix_key_is_consumed_and_not_forwarded_to_agent() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        assert_eq!(dispatch, KeyDispatch::PrefixStarted);
+        assert!(dispatcher.is_awaiting_prefix_command());
+    }
+
+    #[test]
+    fn prefixed_key_maps_to_tui_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        assert_eq!(
+            dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            KeyDispatch::PrefixStarted
+        );
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('z'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ToggleZoom));
+        assert!(!dispatcher.is_awaiting_prefix_command());
+    }
+
+    #[test]
+    fn prefixed_arrow_maps_to_focus_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Right, KeyModifiers::NONE));
+
+        assert_eq!(
+            dispatch,
+            KeyDispatch::Command(TuiCommand::Focus(FocusDirection::Right))
+        );
+    }
+
+    #[test]
+    fn shifted_prefixed_keys_map_to_commands() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(
+            dispatcher.dispatch(key(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+            KeyDispatch::Command(TuiCommand::ShowApprovalQueue)
+        );
+
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert_eq!(
+            dispatcher.dispatch(key(KeyCode::Char('%'), KeyModifiers::SHIFT)),
+            KeyDispatch::Command(TuiCommand::SplitVertical)
+        );
+    }
+
+    #[test]
+    fn regular_keys_are_forwarded_to_focused_pane() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch(key(KeyCode::Char('a'), KeyModifiers::NONE)),
+            KeyDispatch::ForwardToFocusedPane(b"a".to_vec())
+        );
+        assert_eq!(
+            dispatcher.dispatch(key(KeyCode::Enter, KeyModifiers::NONE)),
+            KeyDispatch::ForwardToFocusedPane(b"\r".to_vec())
+        );
+    }
+
+    #[test]
+    fn ctrl_c_is_forwarded_to_focused_pane() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+
+        assert_eq!(dispatch, KeyDispatch::ForwardToFocusedPane(CTRL_C.to_vec()));
+    }
+
+    #[test]
+    fn unknown_prefixed_key_is_consumed() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::F(1), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Consumed);
+        assert!(!dispatcher.is_awaiting_prefix_command());
+    }
+}
