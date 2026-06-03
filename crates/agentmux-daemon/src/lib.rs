@@ -2458,8 +2458,17 @@ fn json_error(error: serde_json::Error) -> AgentmuxError {
 }
 
 fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<PtySpawnSpec>> {
-    let Some(command) = payload.get("command").and_then(|value| value.as_str()) else {
-        return Ok(None);
+    let command = match payload.get("command").and_then(|value| value.as_str()) {
+        Some(command) => command.to_string(),
+        // No explicit command: derive the launch command from the provider so a
+        // bare `shell` pane (or claude/codex) actually gets a live PTY instead of
+        // a metadata-only session that nothing can be typed into (spec §05 adapters).
+        None => match payload.get("provider").and_then(|value| value.as_str()) {
+            Some("shell") => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            Some("claude") => "claude".to_string(),
+            Some("codex") => "codex".to_string(),
+            _ => return Ok(None),
+        },
     };
 
     let args = payload
@@ -2477,7 +2486,7 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
         .unwrap_or(std::env::current_dir().map_err(|error| {
             AgentmuxError::Internal(format!("failed to resolve current directory: {error}"))
         })?);
-    let env = payload
+    let mut env: BTreeMap<String, String> = payload
         .get("env")
         .map(|value| serde_json::from_value(value.clone()))
         .transpose()
@@ -2485,6 +2494,13 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
             AgentmuxError::UserError(format!("agent.spawn env must be a string map: {error}"))
         })?
         .unwrap_or_default();
+    // A spawned shell/agent needs a usable environment (PATH, HOME, ...). When the
+    // caller does not pass env, inherit the daemon's; always ensure TERM is set.
+    if env.is_empty() {
+        env = std::env::vars().collect();
+    }
+    env.entry("TERM".to_string())
+        .or_insert_with(|| "xterm-256color".to_string());
     let size = payload
         .get("size")
         .map(|value| serde_json::from_value(value.clone()))
@@ -2497,7 +2513,7 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
         .unwrap_or_default();
 
     Ok(Some(PtySpawnSpec {
-        command: command.to_string(),
+        command,
         args,
         cwd,
         env,
@@ -2516,6 +2532,36 @@ mod tests {
     use agentmux_core::InputScriptId;
     use agentmux_ipc::{IpcCommand, JsonlReader, JsonlWriter};
     use agentmux_store::EventLog;
+
+    #[test]
+    fn shell_provider_without_command_maps_to_a_live_pty_spec() {
+        // Regression: a bare `shell` spawn carries no `command`, which used to
+        // fall through to a PTY-less metadata session ("nothing can be typed in").
+        let spec = pty_spawn_spec_from_payload(&json!({
+            "provider": "shell",
+            "role": "shell",
+            "name": "shell",
+        }))
+        .expect("spec builds")
+        .expect("shell provider yields a live PTY spec");
+
+        assert!(!spec.command.is_empty(), "shell command resolved");
+        assert!(spec.env.contains_key("TERM"), "TERM is set for the shell");
+        assert!(
+            spec.env.contains_key("PATH"),
+            "daemon environment is inherited so the shell is usable"
+        );
+    }
+
+    #[test]
+    fn unknown_provider_without_command_stays_metadata_only() {
+        let spec =
+            pty_spawn_spec_from_payload(&json!({ "provider": "mystery" })).expect("spec builds");
+        assert!(
+            spec.is_none(),
+            "unknown provider with no command is metadata-only"
+        );
+    }
 
     #[tokio::test]
     async fn runtime_registers_attaches_and_detaches_client() {
@@ -3509,7 +3555,9 @@ mod tests {
             .write(&ClientRequest::new(
                 "req_spawn",
                 IpcCommand::AgentSpawn,
-                json!({ "name": "reviewer", "provider": "codex", "role": "reviewer" }),
+                // No provider/command → metadata-only agent (no live PTY), which is
+                // exactly what the interrupt-failure path below needs to exercise.
+                json!({ "name": "reviewer", "role": "reviewer" }),
             ))
             .await
             .unwrap();
