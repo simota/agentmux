@@ -3,9 +3,9 @@
 use agentmux_terminal::{CellStyle, CellWidth, ScreenGrid, TerminalColor};
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
-    widgets::{Block, Borders, Widget},
+    widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
 use crate::state::TuiSessionState;
@@ -109,6 +109,55 @@ impl TuiSessionRenderer {
             self.pane_renderer
                 .render(rect, pane.grid(), &chrome, buffer);
         }
+
+        if state.keybinding_help_visible() {
+            render_keybinding_help(area, buffer);
+        }
+    }
+}
+
+const KEYBINDING_HELP_LINES: &[&str] = &[
+    "Prefix: Ctrl-g",
+    "",
+    "Ctrl-g ?      Toggle this help",
+    "Ctrl-g d      Detach session",
+    "Ctrl-g q      Quit session",
+    "Ctrl-g x      Close focused pane",
+    "Ctrl-g z      Toggle pane zoom",
+    "Ctrl-g arrows Move focus",
+    "Ctrl-g %      Split vertical",
+    "Ctrl-g \"      Split horizontal",
+    "Ctrl-g Space  Rotate split direction",
+    "Ctrl-g :      Command palette",
+];
+
+fn render_keybinding_help(area: Rect, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let popup = centered_rect(area, 46, 15);
+    Clear.render(popup, buffer);
+    let paragraph = Paragraph::new(KEYBINDING_HELP_LINES.join("\n"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Key Bindings")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Left)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    paragraph.render(popup, buffer);
+}
+
+fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
+    let width = area.width.min(max_width);
+    let height = area.height.min(max_height);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
     }
 }
 
@@ -238,6 +287,29 @@ mod tests {
                 .iter()
                 .any(|cell| cell.symbol() == "i" && cell.fg == Color::Cyan)
         );
+    }
+
+    #[test]
+    fn render_session_draws_keybinding_help_overlay_when_visible() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [{"id": "shell", "name": "shell"}]
+        }));
+        state.apply_command(crate::keymap::TuiCommand::Help);
+
+        let area = Rect::new(0, 0, 60, 20);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Key Bindings"));
+        assert!(rendered.contains("Ctrl-g ?"));
+        assert!(rendered.contains("Toggle this help"));
     }
 
     #[test]
