@@ -193,6 +193,16 @@ impl ErrorBody {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EventSubscribeFilter {
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub roles: Vec<String>,
+    #[serde(default)]
+    pub kinds: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum IpcCommand {
     #[serde(rename = "daemon.status")]
@@ -201,6 +211,8 @@ pub enum IpcCommand {
     ClientAttach,
     #[serde(rename = "client.detach")]
     ClientDetach,
+    #[serde(rename = "event.subscribe")]
+    EventSubscribe,
     #[serde(rename = "layout.get")]
     LayoutGet,
     #[serde(rename = "layout.set")]
@@ -417,6 +429,33 @@ mod tests {
         let encoded = serde_json::to_value(&request).unwrap();
         assert_eq!(encoded["type"], "client.attach");
         assert_eq!(encoded["payload"]["agent_id"], "agent_001");
+    }
+
+    #[test]
+    fn event_subscribe_command_round_trips_filter_payload() {
+        let request = ClientRequest::new(
+            "req_event_subscribe",
+            IpcCommand::EventSubscribe,
+            serde_json::to_value(EventSubscribeFilter {
+                task_id: Some("task_001".to_string()),
+                roles: vec!["implementer".to_string()],
+                kinds: vec!["agent.status_changed".to_string()],
+            })
+            .unwrap(),
+        );
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["type"], "event.subscribe");
+        assert_eq!(encoded["payload"]["task_id"], "task_001");
+        assert_eq!(encoded["payload"]["roles"][0], "implementer");
+        assert_eq!(encoded["payload"]["kinds"][0], "agent.status_changed");
+
+        let decoded: ClientRequest = serde_json::from_value(encoded).unwrap();
+        let filter: EventSubscribeFilter = serde_json::from_value(decoded.payload).unwrap();
+        assert_eq!(decoded.command, IpcCommand::EventSubscribe);
+        assert_eq!(filter.task_id.as_deref(), Some("task_001"));
+        assert_eq!(filter.roles, ["implementer"]);
+        assert_eq!(filter.kinds, ["agent.status_changed"]);
     }
 
     #[test]
