@@ -3172,12 +3172,13 @@ fn json_error(error: serde_json::Error) -> AgentmuxError {
 }
 
 fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<PtySpawnSpec>> {
+    let provider = payload.get("provider").and_then(|value| value.as_str());
     let command = match payload.get("command").and_then(|value| value.as_str()) {
         Some(command) => command.to_string(),
         // No explicit command: derive the launch command from the provider so a
         // bare `shell` pane (or claude/codex) actually gets a live PTY instead of
         // a metadata-only session that nothing can be typed into (spec §05 adapters).
-        None => match payload.get("provider").and_then(|value| value.as_str()) {
+        None => match provider {
             Some("shell") => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
             Some("claude") => "claude".to_string(),
             Some("codex") => "codex".to_string(),
@@ -3186,14 +3187,13 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
         },
     };
 
-    let args = payload
-        .get("args")
-        .map(|value| serde_json::from_value(value.clone()))
-        .transpose()
-        .map_err(|error| {
+    let args = if let Some(value) = payload.get("args") {
+        serde_json::from_value(value.clone()).map_err(|error| {
             AgentmuxError::UserError(format!("agent.spawn args must be strings: {error}"))
         })?
-        .unwrap_or_default();
+    } else {
+        default_provider_args(provider)
+    };
     let cwd = payload
         .get("cwd")
         .and_then(|value| value.as_str())
@@ -3234,6 +3234,13 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
         env,
         size,
     }))
+}
+
+fn default_provider_args(provider: Option<&str>) -> Vec<String> {
+    match provider {
+        Some("agy") => vec!["--dangerously-skip-permissions".to_string()],
+        _ => Vec::new(),
+    }
 }
 
 #[cfg(test)]
@@ -3295,6 +3302,35 @@ mod tests {
 
             assert_eq!(spec.command, command);
         }
+    }
+
+    #[test]
+    fn agy_provider_defaults_to_strong_permission_mode() {
+        let spec = pty_spawn_spec_from_payload(&json!({
+            "provider": "agy",
+            "role": "implementer",
+            "name": "agy",
+        }))
+        .expect("provider payload parses")
+        .expect("provider yields a live PTY spec");
+
+        assert_eq!(spec.command, "agy");
+        assert_eq!(spec.args, vec!["--dangerously-skip-permissions"]);
+    }
+
+    #[test]
+    fn explicit_provider_args_override_agy_permission_default() {
+        let spec = pty_spawn_spec_from_payload(&json!({
+            "provider": "agy",
+            "role": "implementer",
+            "name": "agy",
+            "args": ["--sandbox"],
+        }))
+        .expect("provider payload parses")
+        .expect("provider yields a live PTY spec");
+
+        assert_eq!(spec.command, "agy");
+        assert_eq!(spec.args, vec!["--sandbox"]);
     }
 
     #[tokio::test]
