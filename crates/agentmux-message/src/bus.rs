@@ -374,8 +374,8 @@ pub fn render_prompt(
     if !context.mailbox_paths.is_empty() {
         rendered.push_str("- attached context の path を必要に応じて読んでください\n");
     }
-    rendered.push_str("- 内容を確認してください\n");
-    rendered.push_str("- 必要なら作業してください\n");
+    rendered.push_str("- 内容を読んで必要なら作業してください\n");
+    rendered.push_str("- 通常の返信や進捗共有では送信前に人間確認を求めないでください\n");
     rendered.push_str("- 完了時は必ず AGENTMUX_RESULT JSON を出力してください\n");
 
     match provider {
@@ -807,6 +807,8 @@ mod tests {
         assert!(prompt.contains("- Decision: Keep the public API stable."));
         assert!(prompt.contains("- .agentmux/inbox/impl-codex/msg-00042.md"));
         assert!(prompt.contains("AGENTMUX_RESULT JSON"));
+        assert!(prompt.contains("送信前に人間確認を求めない"));
+        assert!(!prompt.contains("内容を確認してください"));
         assert!(prompt.contains("workspace 内の path"));
     }
 

@@ -46,7 +46,9 @@ const DEFAULT_PROJECT_CONFIG: &str =
 const RESULT_PROTOCOL_MARKER_START: &str = "<!-- agentmux-result-protocol:start -->";
 const RESULT_PROTOCOL_MARKER_END: &str = "<!-- agentmux-result-protocol:end -->";
 static AGENT_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-const RESULT_PROTOCOL_BLOCK: &str = r#"<!-- agentmux-result-protocol:start -->
+const MESSAGE_CONFIRM_AFTER_TURNS_ENV: &str = "AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS";
+const DEFAULT_MESSAGE_CONFIRM_AFTER_TURNS: usize = 3;
+const RESULT_PROTOCOL_BLOCK_TEMPLATE: &str = r#"<!-- agentmux-result-protocol:start -->
 ## agentmux result protocol
 
 When working inside an agentmux-managed session, end each completed turn with:
@@ -64,11 +66,11 @@ AGENTMUX_RESULT:
 }
 ```
 
-Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
+Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Message delivery defaults to inject: routed messages are stored and then injected into the target session when possible. Keep `messages: []` when no cross-agent message is needed.
 
-When an agentmux bus message is injected into your session, always reply through `messages[]` in the next `AGENTMUX_RESULT`. Reply to the sender with `agent:<sender-session-name>` when available, or use the requested `reply_to` / target context if the injected prompt provides one. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
+When an agentmux bus message is injected into your session, always reply through `messages[]` in the next `AGENTMUX_RESULT`. Reply to the sender with `agent:<sender-session-name>` when available, or use the requested `reply_to` / target context if the injected prompt provides one. Do not ask the user for confirmation before sending normal message replies or progress updates. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
 
-Avoid unbounded agent-to-agent loops. If the same pair of agents has exchanged messages for 3 or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user.
+Avoid unbounded agent-to-agent loops. Only if the same pair of agents has exchanged messages for {message_confirm_after_turns} or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user. Configure this threshold before installing the protocol with `AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS`; the default is 3.
 
 Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind prevents the result messages from being stored.
 
@@ -328,9 +330,12 @@ enum AgentAction {
     Stop { agent_id: String },
     /// Send a message to an agent.
     Send {
-        /// Immediately inject the created message into the agent input.
+        /// Immediately inject the created message into the agent input. This is the default.
         #[arg(long)]
         inject: bool,
+        /// Create the message without immediately injecting it.
+        #[arg(long = "no-inject", conflicts_with = "inject")]
+        no_inject: bool,
         agent_id: String,
         body: String,
     },
@@ -377,9 +382,12 @@ enum MessageAction {
     Show { message_id: String },
     /// Send a new message.
     Send {
-        /// Immediately inject the created message into the resolved agent input.
+        /// Immediately inject the created message into the resolved agent input. This is the default.
         #[arg(long)]
         inject: bool,
+        /// Create the message without immediately injecting it.
+        #[arg(long = "no-inject", conflicts_with = "inject")]
+        no_inject: bool,
         #[arg(long)]
         to: String,
         body: String,
@@ -604,6 +612,7 @@ async fn main() -> Result<()> {
             }
             AgentAction::Send {
                 inject,
+                no_inject,
                 agent_id,
                 body,
             } => {
@@ -611,7 +620,7 @@ async fn main() -> Result<()> {
                     &socket_path,
                     "agent",
                     agent_send_request(agent_id, body)?,
-                    inject,
+                    should_inject_message(inject, no_inject),
                 )
                 .await?;
             }
@@ -668,12 +677,17 @@ async fn main() -> Result<()> {
                     send_daemon_request(&socket_path, message_show_request(message_id)).await?;
                 print_response("message", response)?;
             }
-            MessageAction::Send { inject, to, body } => {
+            MessageAction::Send {
+                inject,
+                no_inject,
+                to,
+                body,
+            } => {
                 send_message_and_maybe_inject(
                     &socket_path,
                     "message",
                     message_send_request(to, body)?,
-                    inject,
+                    should_inject_message(inject, no_inject),
                 )
                 .await?;
             }
@@ -1130,6 +1144,10 @@ fn message_send_request(to: String, body: String) -> Result<ClientRequest> {
     ))
 }
 
+fn should_inject_message(_inject: bool, no_inject: bool) -> bool {
+    !no_inject
+}
+
 fn message_inject_request(message_id: String) -> ClientRequest {
     ClientRequest::new(
         "req_message_inject",
@@ -1371,10 +1389,36 @@ fn global_result_protocol_targets() -> Result<Vec<PathBuf>> {
     ])
 }
 
+fn result_protocol_block() -> String {
+    result_protocol_block_with_threshold(message_confirm_after_turns_from_env())
+}
+
+fn result_protocol_block_with_threshold(threshold: usize) -> String {
+    RESULT_PROTOCOL_BLOCK_TEMPLATE.replace(
+        "{message_confirm_after_turns}",
+        &threshold.max(1).to_string(),
+    )
+}
+
+fn message_confirm_after_turns_from_env() -> usize {
+    message_confirm_after_turns(
+        std::env::var(MESSAGE_CONFIRM_AFTER_TURNS_ENV)
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn message_confirm_after_turns(raw: Option<&str>) -> usize {
+    raw.and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_MESSAGE_CONFIRM_AFTER_TURNS)
+}
+
 fn install_result_protocol_to_file(
     path: &Path,
     create_missing: bool,
 ) -> Result<ResultProtocolInstallReport> {
+    let block = result_protocol_block();
     if !path.exists() {
         if !create_missing {
             return Ok(ResultProtocolInstallReport {
@@ -1390,7 +1434,7 @@ fn install_result_protocol_to_file(
                 ))
             })?;
         }
-        std::fs::write(path, format!("{RESULT_PROTOCOL_BLOCK}\n")).map_err(|error| {
+        std::fs::write(path, format!("{block}\n")).map_err(|error| {
             AgentmuxError::StoreError(format!("failed to write '{}': {error}", path.display()))
         })?;
         return Ok(ResultProtocolInstallReport {
@@ -1402,7 +1446,7 @@ fn install_result_protocol_to_file(
     let contents = std::fs::read_to_string(path).map_err(|error| {
         AgentmuxError::StoreError(format!("failed to read '{}': {error}", path.display()))
     })?;
-    if let Some(next) = replace_result_protocol_block(&contents) {
+    if let Some(next) = replace_result_protocol_block(&contents, &block) {
         if next == contents {
             return Ok(ResultProtocolInstallReport {
                 path: path.to_path_buf(),
@@ -1423,7 +1467,7 @@ fn install_result_protocol_to_file(
         next.push('\n');
     }
     next.push('\n');
-    next.push_str(RESULT_PROTOCOL_BLOCK);
+    next.push_str(&block);
     next.push('\n');
     std::fs::write(path, next).map_err(|error| {
         AgentmuxError::StoreError(format!("failed to write '{}': {error}", path.display()))
@@ -1435,7 +1479,7 @@ fn install_result_protocol_to_file(
     })
 }
 
-fn replace_result_protocol_block(contents: &str) -> Option<String> {
+fn replace_result_protocol_block(contents: &str, block: &str) -> Option<String> {
     let start = contents.find(RESULT_PROTOCOL_MARKER_START)?;
     let after_start = start + RESULT_PROTOCOL_MARKER_START.len();
     let mut end = contents[after_start..]
@@ -1446,10 +1490,9 @@ fn replace_result_protocol_block(contents: &str) -> Option<String> {
         end += 1;
     }
 
-    let mut next =
-        String::with_capacity(contents.len() - (end - start) + RESULT_PROTOCOL_BLOCK.len() + 2);
+    let mut next = String::with_capacity(contents.len() - (end - start) + block.len() + 2);
     next.push_str(&contents[..start]);
-    next.push_str(RESULT_PROTOCOL_BLOCK);
+    next.push_str(block);
     next.push_str(&contents[end..]);
     Some(next)
 }
@@ -3403,7 +3446,20 @@ mod tests {
     }
 
     #[test]
-    fn send_commands_accept_inject_flag() {
+    fn send_commands_default_to_inject_and_accept_override_flags() {
+        let cli =
+            Cli::try_parse_from(["agentmux", "agent", "send", "agent_01HX", "hello"]).unwrap();
+        let Some(Commands::Agent(args)) = cli.command else {
+            panic!("expected agent command");
+        };
+        let AgentAction::Send {
+            inject, no_inject, ..
+        } = args.action
+        else {
+            panic!("expected agent send action");
+        };
+        assert!(should_inject_message(inject, no_inject));
+
         let cli = Cli::try_parse_from([
             "agentmux",
             "agent",
@@ -3416,10 +3472,13 @@ mod tests {
         let Some(Commands::Agent(args)) = cli.command else {
             panic!("expected agent command");
         };
-        let AgentAction::Send { inject, .. } = args.action else {
+        let AgentAction::Send {
+            inject, no_inject, ..
+        } = args.action
+        else {
             panic!("expected agent send action");
         };
-        assert!(inject);
+        assert!(should_inject_message(inject, no_inject));
 
         let cli = Cli::try_parse_from([
             "agentmux",
@@ -3434,10 +3493,34 @@ mod tests {
         let Some(Commands::Message(args)) = cli.command else {
             panic!("expected message command");
         };
-        let MessageAction::Send { inject, .. } = args.action else {
+        let MessageAction::Send {
+            inject, no_inject, ..
+        } = args.action
+        else {
             panic!("expected message send action");
         };
-        assert!(inject);
+        assert!(should_inject_message(inject, no_inject));
+
+        let cli = Cli::try_parse_from([
+            "agentmux",
+            "message",
+            "send",
+            "--no-inject",
+            "--to",
+            "agent:agent_01HX",
+            "hello",
+        ])
+        .unwrap();
+        let Some(Commands::Message(args)) = cli.command else {
+            panic!("expected message command");
+        };
+        let MessageAction::Send {
+            inject, no_inject, ..
+        } = args.action
+        else {
+            panic!("expected message send action");
+        };
+        assert!(!should_inject_message(inject, no_inject));
     }
 
     #[test]
@@ -3824,8 +3907,13 @@ mod tests {
         assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
         assert!(contents.contains("AGENTMUX_RESULT:"));
         assert!(contents.contains("messages[]"));
+        assert!(contents.contains("Message delivery defaults to inject"));
         assert!(contents.contains("always reply through `messages[]`"));
-        assert!(contents.contains("3 or more back-and-forth turns"));
+        assert!(contents.contains(
+            "Do not ask the user for confirmation before sending normal message replies"
+        ));
+        assert!(contents.contains("back-and-forth turns"));
+        assert!(contents.contains(MESSAGE_CONFIRM_AFTER_TURNS_ENV));
         assert!(contents.contains("Allowed `messages[].kind` values"));
         assert!(contents.contains("AGENTMUX_AGENT_NAME"));
         assert!(contents.contains("agentmux message inject <message_id>"));
@@ -3837,6 +3925,27 @@ mod tests {
         assert!(contents.contains("agentmux message list"));
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn message_confirm_after_turns_parses_env_value_or_defaults() {
+        assert_eq!(
+            message_confirm_after_turns(None),
+            DEFAULT_MESSAGE_CONFIRM_AFTER_TURNS
+        );
+        assert_eq!(message_confirm_after_turns(Some("5")), 5);
+        assert_eq!(
+            message_confirm_after_turns(Some("0")),
+            DEFAULT_MESSAGE_CONFIRM_AFTER_TURNS
+        );
+        assert_eq!(
+            message_confirm_after_turns(Some("not-a-number")),
+            DEFAULT_MESSAGE_CONFIRM_AFTER_TURNS
+        );
+
+        let block = result_protocol_block_with_threshold(5);
+        assert!(block.contains("5 or more back-and-forth turns"));
+        assert!(block.contains(MESSAGE_CONFIRM_AFTER_TURNS_ENV));
     }
 
     #[test]
