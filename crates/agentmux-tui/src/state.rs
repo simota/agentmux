@@ -17,6 +17,7 @@ use crate::layout::{PaneLayout, SplitDirection};
 pub struct AgentPaneState {
     agent_id: String,
     name: String,
+    role: Option<String>,
     process_id: Option<u32>,
     status: Option<String>,
     terminal: TerminalParser,
@@ -29,6 +30,7 @@ impl AgentPaneState {
         Self {
             agent_id,
             name,
+            role: None,
             process_id,
             status: None,
             terminal: TerminalParser::new(size.rows, size.cols),
@@ -49,6 +51,10 @@ impl AgentPaneState {
         self.process_id
     }
 
+    pub fn role(&self) -> Option<&str> {
+        self.role.as_deref()
+    }
+
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }
@@ -66,9 +72,11 @@ impl AgentPaneState {
     }
 
     pub fn chrome_title(&self) -> String {
-        match self.status.as_deref() {
-            Some(status) => format!("{} | {}", self.name, status),
-            None => self.name.clone(),
+        match (self.role.as_deref(), self.status.as_deref()) {
+            (Some(role), Some(status)) => format!("{} ({}) | {}", self.name, role, status),
+            (Some(role), None) => format!("{} ({})", self.name, role),
+            (None, Some(status)) => format!("{} | {}", self.name, status),
+            (None, None) => self.name.clone(),
         }
     }
 }
@@ -454,9 +462,11 @@ impl TuiSessionState {
                 .and_then(|value| value.as_u64())
                 .and_then(|value| u32::try_from(value).ok());
             let status = string_field(agent, "status");
+            let role = string_field(agent, "role");
 
             if let Some(pane) = self.panes.get_mut(&agent_id) {
                 pane.name = name;
+                pane.role = role;
                 pane.process_id = process_id;
                 pane.status = status;
                 pane.last_event = None;
@@ -467,6 +477,7 @@ impl TuiSessionState {
                     process_id,
                     self.default_terminal_size,
                 );
+                pane.role = role;
                 pane.status = status;
                 pane.last_event = None;
                 self.layout.add_pane(agent_id.clone());
@@ -518,6 +529,7 @@ impl TuiSessionState {
             .filter(|value| *value > 0)
             .unwrap_or(self.default_terminal_size.cols);
         let name = string_field(payload, "name").unwrap_or_else(|| agent_id.clone());
+        let role = string_field(payload, "role");
         let process_id = payload
             .get("process_id")
             .and_then(|value| value.as_u64())
@@ -540,6 +552,7 @@ impl TuiSessionState {
             return StateChange::Ignored;
         };
         pane.name = name;
+        pane.role = role;
         pane.process_id = process_id;
         pane.terminal = TerminalParser::new(rows, cols);
         pane.scroll_offset = 0;
@@ -619,6 +632,7 @@ impl TuiSessionState {
             return StateChange::Ignored;
         };
         let name = string_field(&event.payload, "name").unwrap_or_else(|| agent_id.clone());
+        let role = string_field(&event.payload, "role");
         let process_id = event
             .payload
             .get("process_id")
@@ -627,17 +641,19 @@ impl TuiSessionState {
 
         if let Some(pane) = self.panes.get_mut(&agent_id) {
             pane.name = name;
+            pane.role = role;
             pane.process_id = process_id;
             pane.last_event = Some(IpcEventKind::AgentSpawned);
             return StateChange::UpdatedPane(agent_id);
         }
 
-        let pane = AgentPaneState::new(
+        let mut pane = AgentPaneState::new(
             agent_id.clone(),
             name,
             process_id,
             self.default_terminal_size,
         );
+        pane.role = role;
         self.layout.add_pane(agent_id.clone());
         self.layout.focus(&agent_id);
         self.panes.insert(agent_id.clone(), pane);
@@ -931,6 +947,7 @@ mod tests {
             json!({
                 "agent_id": "agent_001",
                 "name": "impl-codex",
+                "role": "implementer",
                 "process_id": 42
             }),
         ));
@@ -940,7 +957,9 @@ mod tests {
         assert_eq!(state.layout().focused(), Some("agent_001"));
         let pane = state.pane("agent_001").expect("pane");
         assert_eq!(pane.name(), "impl-codex");
+        assert_eq!(pane.role(), Some("implementer"));
         assert_eq!(pane.process_id(), Some(42));
+        assert_eq!(pane.chrome_title(), "impl-codex (implementer)");
     }
 
     #[test]

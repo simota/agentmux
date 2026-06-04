@@ -45,7 +45,7 @@ agentmux project install-result-protocol .
 agentmux project install-result-protocol --global
 ```
 
-ローカル実行では、指定ディレクトリに既存の `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` がある場合だけ `agentmux result protocol` を追記する。既に同じmarkerがある場合は追記しない。
+ローカル実行では、指定ディレクトリに既存の `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` がある場合だけ `agentmux result protocol` を追記する。既に同じ managed marker がある場合は、その marker 範囲を最新の `agentmux result protocol` に置換する。これにより、再実行で `messages[]` の使い方、2セッション間の対話例、確認手順が最新化される。
 
 `--global` は以下のグローバル指示ファイルへ設定する。
 
@@ -54,6 +54,10 @@ agentmux project install-result-protocol --global
 ~/.claude/CLAUDE.md
 ~/.gemini/GEMINI.md
 ```
+
+### 3.1.2 agent role registration
+
+`agent spawn --role <role>` と TUI/provider picker から生成される agent は、daemon 側の session metadata に role を保存する。message bus の `to: "role:<role>"` はこの metadata を使って解決し、agent 名からの推定は role が明示されない場合の fallback とする。`agentmux sessions` と TUI の session list は role を表示し、agent / human が利用可能な宛先を確認できるようにする。
 
 ### 3.2 task run
 

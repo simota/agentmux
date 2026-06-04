@@ -43,6 +43,7 @@ use tokio::task::JoinHandle;
 const DEFAULT_PROJECT_CONFIG: &str =
     include_str!("../../../docs/config/agentmux.config.example.toml");
 const RESULT_PROTOCOL_MARKER_START: &str = "<!-- agentmux-result-protocol:start -->";
+const RESULT_PROTOCOL_MARKER_END: &str = "<!-- agentmux-result-protocol:end -->";
 const RESULT_PROTOCOL_BLOCK: &str = r#"<!-- agentmux-result-protocol:start -->
 ## agentmux result protocol
 
@@ -61,7 +62,9 @@ AGENTMUX_RESULT:
 }
 ```
 
-Use `messages[]` to send work to another coding agent through the agentmux message bus.
+Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
+
+Agent sessions register a role at startup. Prefer role targets (`role:tester`, `role:implementer`, `role:reviewer`) instead of session ids or display names unless a specific id is required. Check available sessions and roles with `Ctrl-g s` in the TUI or `agentmux sessions`.
 
 ```json
 {
@@ -71,6 +74,52 @@ Use `messages[]` to send work to another coding agent through the agentmux messa
   "priority": "normal"
 }
 ```
+
+Two-session exchange example:
+
+```text
+impl finishes work:
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Implemented copy mode.",
+  "changed_files": ["crates/agentmux-cli/src/main.rs"],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "Please verify copy mode: Ctrl-g [, drag inside the focused pane, release to copy, Esc/q to exit.",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+```
+
+```text
+tester replies:
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Copy mode verification completed.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:implementer",
+      "kind": "Finding",
+      "body": "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal.",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+```
+
+Check delivery with `Ctrl-g m` in the TUI or `agentmux message list`.
 <!-- agentmux-result-protocol:end -->
 "#;
 
@@ -1114,6 +1163,7 @@ struct ResultProtocolInstallReport {
 enum ResultProtocolInstallStatus {
     Added,
     AlreadyPresent,
+    Updated,
     Missing,
 }
 
@@ -1189,10 +1239,19 @@ fn install_result_protocol_to_file(
     let contents = std::fs::read_to_string(path).map_err(|error| {
         AgentmuxError::StoreError(format!("failed to read '{}': {error}", path.display()))
     })?;
-    if contents.contains(RESULT_PROTOCOL_MARKER_START) {
+    if let Some(next) = replace_result_protocol_block(&contents) {
+        if next == contents {
+            return Ok(ResultProtocolInstallReport {
+                path: path.to_path_buf(),
+                status: ResultProtocolInstallStatus::AlreadyPresent,
+            });
+        }
+        std::fs::write(path, next).map_err(|error| {
+            AgentmuxError::StoreError(format!("failed to write '{}': {error}", path.display()))
+        })?;
         return Ok(ResultProtocolInstallReport {
             path: path.to_path_buf(),
-            status: ResultProtocolInstallStatus::AlreadyPresent,
+            status: ResultProtocolInstallStatus::Updated,
         });
     }
 
@@ -1213,11 +1272,31 @@ fn install_result_protocol_to_file(
     })
 }
 
+fn replace_result_protocol_block(contents: &str) -> Option<String> {
+    let start = contents.find(RESULT_PROTOCOL_MARKER_START)?;
+    let after_start = start + RESULT_PROTOCOL_MARKER_START.len();
+    let mut end = contents[after_start..]
+        .find(RESULT_PROTOCOL_MARKER_END)
+        .map(|relative| after_start + relative + RESULT_PROTOCOL_MARKER_END.len())
+        .unwrap_or(contents.len());
+    if contents[end..].starts_with('\n') {
+        end += 1;
+    }
+
+    let mut next =
+        String::with_capacity(contents.len() - (end - start) + RESULT_PROTOCOL_BLOCK.len() + 2);
+    next.push_str(&contents[..start]);
+    next.push_str(RESULT_PROTOCOL_BLOCK);
+    next.push_str(&contents[end..]);
+    Some(next)
+}
+
 fn print_result_protocol_report(report: &[ResultProtocolInstallReport]) {
     for entry in report {
         let status = match entry.status {
             ResultProtocolInstallStatus::Added => "added",
             ResultProtocolInstallStatus::AlreadyPresent => "already-present",
+            ResultProtocolInstallStatus::Updated => "updated",
             ResultProtocolInstallStatus::Missing => "missing",
         };
         println!("{status}: {}", entry.path.display());
@@ -2287,10 +2366,11 @@ fn format_sessions_payload(payload: &Value) -> String {
         return "no running sessions\n".to_string();
     }
 
-    let mut output = String::from("ID NAME PID CLIENTS\n");
+    let mut output = String::from("ID NAME ROLE PID CLIENTS\n");
     for session in sessions {
         let id = session.get("id").and_then(Value::as_str).unwrap_or("-");
         let name = session.get("name").and_then(Value::as_str).unwrap_or("-");
+        let role = session.get("role").and_then(Value::as_str).unwrap_or("-");
         let pid = session
             .get("process_id")
             .and_then(Value::as_u64)
@@ -2301,7 +2381,7 @@ fn format_sessions_payload(payload: &Value) -> String {
             .and_then(Value::as_array)
             .map(|clients| clients.len().to_string())
             .unwrap_or_else(|| "0".to_string());
-        output.push_str(&format!("{id} {name} {pid} {clients}\n"));
+        output.push_str(&format!("{id} {name} {role} {pid} {clients}\n"));
     }
     output
 }
@@ -3184,6 +3264,7 @@ mod tests {
                 {
                     "id": "agent_live",
                     "name": "shell",
+                    "role": "tester",
                     "process_id": 1234,
                     "has_process": true,
                     "attached_clients": ["csess_1", "csess_2"]
@@ -3200,7 +3281,7 @@ mod tests {
 
         assert_eq!(
             format_sessions_payload(&payload),
-            "ID NAME PID CLIENTS\nagent_live shell 1234 2\n"
+            "ID NAME ROLE PID CLIENTS\nagent_live shell tester 1234 2\n"
         );
     }
 
@@ -3311,6 +3392,34 @@ mod tests {
         assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
         assert!(contents.contains("AGENTMUX_RESULT:"));
         assert!(contents.contains("messages[]"));
+        assert!(contents.contains("Two-session exchange example"));
+        assert!(contents.contains("agentmux message list"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn result_protocol_install_refreshes_stale_managed_block() {
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-result-protocol-refresh-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let agents_path = root.join("AGENTS.md");
+        std::fs::write(
+            &agents_path,
+            "# Agents\n\n<!-- agentmux-result-protocol:start -->\nold instructions\n<!-- agentmux-result-protocol:end -->\n",
+        )
+        .unwrap();
+
+        let report = install_result_protocol(&root, false).unwrap();
+
+        assert_eq!(report[0].status, ResultProtocolInstallStatus::Updated);
+        let contents = std::fs::read_to_string(&agents_path).unwrap();
+        assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
+        assert!(!contents.contains("old instructions"));
+        assert!(contents.contains("Two-session exchange example"));
 
         std::fs::remove_dir_all(&root).unwrap();
     }

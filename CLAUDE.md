@@ -146,7 +146,9 @@ AGENTMUX_RESULT:
 }
 ```
 
-Use `messages[]` to send work to another coding agent through the agentmux message bus.
+Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
+
+Agent sessions register a role at startup. Prefer role targets (`role:tester`, `role:implementer`, `role:reviewer`) instead of session ids or display names unless a specific id is required. Check available sessions and roles with `Ctrl-g s` in the TUI or `agentmux sessions`.
 
 ```json
 {
@@ -156,5 +158,51 @@ Use `messages[]` to send work to another coding agent through the agentmux messa
   "priority": "normal"
 }
 ```
+
+Two-session exchange example:
+
+```text
+impl finishes work:
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Implemented copy mode.",
+  "changed_files": ["crates/agentmux-cli/src/main.rs"],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "Please verify copy mode: Ctrl-g [, drag inside the focused pane, release to copy, Esc/q to exit.",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+```
+
+```text
+tester replies:
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Copy mode verification completed.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:implementer",
+      "kind": "Finding",
+      "body": "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal.",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+```
+
+Check delivery with `Ctrl-g m` in the TUI or `agentmux message list`.
 <!-- agentmux-result-protocol:end -->
 

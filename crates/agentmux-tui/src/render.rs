@@ -282,7 +282,7 @@ fn render_session_list(area: Rect, state: &TuiSessionState, buffer: &mut Buffer)
     let mut lines = vec![
         "Use Up/Down or j/k, Enter to focus, Esc to close".to_string(),
         "".to_string(),
-        "  ID NAME PID".to_string(),
+        "  ID NAME ROLE PID".to_string(),
     ];
     for (index, pane) in state
         .panes()
@@ -293,15 +293,17 @@ fn render_session_list(area: Rect, state: &TuiSessionState, buffer: &mut Buffer)
             .process_id()
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let role = pane.role().unwrap_or("-");
         let marker = if index == state.session_list_selected_index() {
             ">"
         } else {
             " "
         };
         lines.push(format!(
-            "{marker} {} {} {}",
+            "{marker} {} {} {} {}",
             pane.agent_id(),
             pane.name(),
+            role,
             pid
         ));
     }

@@ -62,24 +62,27 @@ impl DaemonConfig {
 pub struct RegisteredAgentSession {
     pub id: AgentSessionId,
     pub name: String,
+    pub role: AgentRole,
     pub process_id: Option<u32>,
     pub attached_clients: BTreeSet<ClientSessionId>,
 }
 
 impl RegisteredAgentSession {
-    fn new(name: String, process_id: Option<u32>) -> Self {
+    fn with_role(name: String, role: AgentRole, process_id: Option<u32>) -> Self {
         Self {
             id: AgentSessionId::new(),
             name,
+            role,
             process_id,
             attached_clients: BTreeSet::new(),
         }
     }
 
-    fn restored(id: AgentSessionId, name: String) -> Self {
+    fn restored_with_role(id: AgentSessionId, name: String, role: AgentRole) -> Self {
         Self {
             id,
             name,
+            role,
             process_id: None,
             attached_clients: BTreeSet::new(),
         }
@@ -189,11 +192,18 @@ impl DaemonRuntime {
                     )
                 })?
                 .to_string();
-            recovered_message_agents
-                .push(AgentDescriptor::new(id.clone(), inferred_agent_role(&name)));
+            let role = agent
+                .get("role")
+                .and_then(|role| role.as_str())
+                .map(parse_agent_role)
+                .transpose()?
+                .unwrap_or_else(|| inferred_agent_role(&name));
+            recovered_message_agents.push(AgentDescriptor::new(id.clone(), role.clone()));
             recovered.insert(
                 id.clone(),
-                LiveAgentSession::metadata(RegisteredAgentSession::restored(id, name)),
+                LiveAgentSession::metadata(RegisteredAgentSession::restored_with_role(
+                    id, name, role,
+                )),
             );
         }
 
@@ -214,21 +224,30 @@ impl DaemonRuntime {
     }
 
     pub async fn register_agent(&self, name: String) -> RegisteredAgentSession {
-        let agent = RegisteredAgentSession::new(name.clone(), None);
+        let role = inferred_agent_role(&name);
+        self.register_agent_with_role(name, role).await
+    }
+
+    pub async fn register_agent_with_role(
+        &self,
+        name: String,
+        role: AgentRole,
+    ) -> RegisteredAgentSession {
+        let agent = RegisteredAgentSession::with_role(name, role, None);
         let mut state = self.state.write().await;
         state
             .agents
             .insert(agent.id.clone(), LiveAgentSession::metadata(agent.clone()));
-        state.messages.register_agent(AgentDescriptor::new(
-            agent.id.clone(),
-            inferred_agent_role(&name),
-        ));
+        state
+            .messages
+            .register_agent(AgentDescriptor::new(agent.id.clone(), agent.role.clone()));
         drop(state);
         self.publish(DaemonEvent::new(
             IpcEventKind::AgentSpawned,
             json!({
                 "agent_id": agent.id.to_string(),
                 "name": agent.name,
+                "role": agent_role_label(&agent.role),
                 "process_id": agent.process_id,
             }),
         ));
@@ -240,13 +259,23 @@ impl DaemonRuntime {
         name: String,
         spec: PtySpawnSpec,
     ) -> Result<RegisteredAgentSession> {
+        let role = inferred_agent_role(&name);
+        self.spawn_agent_with_role(name, role, spec).await
+    }
+
+    pub async fn spawn_agent_with_role(
+        &self,
+        name: String,
+        role: AgentRole,
+        spec: PtySpawnSpec,
+    ) -> Result<RegisteredAgentSession> {
         let terminal = Arc::new(Mutex::new(TerminalParser::new(
             spec.size.rows,
             spec.size.cols,
         )));
         let pty = PtyHandle::spawn(spec)?;
         let read_loop = pty.spawn_read_loop(16)?;
-        let agent = RegisteredAgentSession::new(name.clone(), pty.process_id());
+        let agent = RegisteredAgentSession::with_role(name.clone(), role, pty.process_id());
         self.spawn_pty_output_forwarder(
             agent.id.clone(),
             name.clone(),
@@ -262,16 +291,16 @@ impl DaemonRuntime {
                 terminal,
             },
         );
-        state.messages.register_agent(AgentDescriptor::new(
-            agent.id.clone(),
-            inferred_agent_role(&name),
-        ));
+        state
+            .messages
+            .register_agent(AgentDescriptor::new(agent.id.clone(), agent.role.clone()));
         drop(state);
         self.publish(DaemonEvent::new(
             IpcEventKind::AgentSpawned,
             json!({
                 "agent_id": agent.id.to_string(),
                 "name": agent.name,
+                "role": agent_role_label(&agent.role),
                 "process_id": agent.process_id,
             }),
         ));
@@ -1057,6 +1086,7 @@ impl DaemonRuntime {
         Ok(json!({
             "agent_id": metadata.id.to_string(),
             "name": metadata.name,
+            "role": agent_role_label(&metadata.role),
             "process_id": metadata.process_id,
             "rows": grid.rows(),
             "cols": grid.cols(),
@@ -1073,6 +1103,7 @@ impl DaemonRuntime {
                 json!({
                     "id": agent.metadata.id.to_string(),
                     "name": agent.metadata.name,
+                    "role": agent_role_label(&agent.metadata.role),
                     "process_id": agent.metadata.process_id,
                     "has_process": agent.pty.is_some(),
                     "attached_clients": agent
@@ -1716,9 +1747,25 @@ async fn handle_request(
                 .and_then(|value| value.as_str())
                 .unwrap_or("agent")
                 .to_string();
+            let role = match request
+                .payload
+                .get("role")
+                .and_then(|value| value.as_str())
+                .map(parse_agent_role)
+                .transpose()
+            {
+                Ok(Some(role)) => role,
+                Ok(None) => inferred_agent_role(&name),
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("AGENT_SPAWN_FAILED", error.to_string()),
+                    );
+                }
+            };
             let agent = match pty_spawn_spec_from_payload(&request.payload) {
-                Ok(Some(spec)) => runtime.spawn_agent(name, spec).await,
-                Ok(None) => Ok(runtime.register_agent(name).await),
+                Ok(Some(spec)) => runtime.spawn_agent_with_role(name, role, spec).await,
+                Ok(None) => Ok(runtime.register_agent_with_role(name, role).await),
                 Err(error) => Err(error),
             };
             match agent {
@@ -1727,6 +1774,7 @@ async fn handle_request(
                     json!({
                         "agent_id": agent.id.to_string(),
                         "name": agent.name,
+                        "role": agent_role_label(&agent.role),
                         "process_id": agent.process_id,
                     }),
                 ),
@@ -2516,6 +2564,22 @@ fn inferred_agent_role(name: &str) -> AgentRole {
     }
 }
 
+fn agent_role_label(role: &AgentRole) -> String {
+    match role {
+        AgentRole::Planner => "planner".to_string(),
+        AgentRole::Implementer => "implementer".to_string(),
+        AgentRole::Reviewer => "reviewer".to_string(),
+        AgentRole::Tester => "tester".to_string(),
+        AgentRole::Debugger => "debugger".to_string(),
+        AgentRole::Refactorer => "refactorer".to_string(),
+        AgentRole::SecurityReviewer => "security_reviewer".to_string(),
+        AgentRole::DocsWriter => "docs_writer".to_string(),
+        AgentRole::Integrator => "integrator".to_string(),
+        AgentRole::ContextManager => "context_manager".to_string(),
+        AgentRole::Custom(role) => role.clone(),
+    }
+}
+
 fn trim_result_detection_tail(output_tail: &mut String) {
     const MAX_RESULT_DETECTION_TAIL: usize = 64 * 1024;
     if output_tail.len() <= MAX_RESULT_DETECTION_TAIL {
@@ -2637,9 +2701,26 @@ fn parse_message_target(raw: &str) -> Result<MessageTarget> {
 }
 
 fn parse_agent_role(raw: &str) -> Result<AgentRole> {
-    serde_json::from_value(json!(raw)).map_err(|error| {
-        AgentmuxError::UserError(format!("invalid message role target '{raw}': {error}"))
-    })
+    let normalized = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if normalized.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "agent role must not be empty".to_string(),
+        ));
+    }
+    let role = match normalized.as_str() {
+        "planner" => AgentRole::Planner,
+        "implementer" | "impl" => AgentRole::Implementer,
+        "reviewer" | "review" => AgentRole::Reviewer,
+        "tester" | "qa" => AgentRole::Tester,
+        "debugger" | "debug" => AgentRole::Debugger,
+        "refactorer" | "refactor" => AgentRole::Refactorer,
+        "security_reviewer" | "security" => AgentRole::SecurityReviewer,
+        "docs_writer" | "docs" | "docswriter" => AgentRole::DocsWriter,
+        "integrator" => AgentRole::Integrator,
+        "context_manager" | "context" => AgentRole::ContextManager,
+        _ => AgentRole::Custom(normalized),
+    };
+    Ok(role)
 }
 
 fn parse_message_kind(raw: &str) -> Result<MessageKind> {
@@ -3206,6 +3287,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn registered_agent_role_is_used_for_message_routing() {
+        let runtime = DaemonRuntime::new(8);
+        runtime
+            .register_agent_with_role("custom-name".to_string(), AgentRole::Tester)
+            .await;
+
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                from: MessageSource::Orchestrator,
+                to: MessageTarget::Role(AgentRole::Tester),
+                kind: MessageKind::TestResult,
+                priority: Priority::Normal,
+                body: "verify role routing".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect("role target resolves");
+
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].id, message.id);
+        assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Tester));
+
+        let status = runtime.status_payload().await;
+        assert_eq!(status["agents"][0]["name"], "custom-name");
+        assert_eq!(status["agents"][0]["role"], "tester");
+    }
+
+    #[tokio::test]
     async fn live_agent_result_output_is_persisted_to_message_bus() {
         let runtime = DaemonRuntime::new(8);
         runtime.register_agent("tester".to_string()).await;
@@ -3315,10 +3429,9 @@ AGENTMUX_RESULT:
 
         let spawn_response = read_response(&mut reader).await;
         assert!(spawn_response.ok);
-        let agent_id = spawn_response.payload.unwrap()["agent_id"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let spawn_payload = spawn_response.payload.unwrap();
+        assert_eq!(spawn_payload["role"], "implementer");
+        let agent_id = spawn_payload["agent_id"].as_str().unwrap().to_string();
         assert_no_frame(&mut reader).await;
 
         writer
