@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 
+use unicode_width::UnicodeWidthChar;
+
 /// One styled terminal cell.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Cell {
@@ -105,7 +107,11 @@ impl Line {
     }
 
     pub fn text(&self) -> String {
-        self.cells.iter().map(|cell| cell.ch).collect()
+        self.cells
+            .iter()
+            .filter(|cell| cell.width != CellWidth::WideContinuation)
+            .map(|cell| cell.ch)
+            .collect()
     }
 }
 
@@ -179,6 +185,7 @@ impl ScreenGrid {
         Some(
             (0..self.cols)
                 .filter_map(|col| self.cell(row, col))
+                .filter(|cell| cell.width != CellWidth::WideContinuation)
                 .map(|cell| cell.ch)
                 .collect(),
         )
@@ -227,22 +234,54 @@ impl ScreenGrid {
             return;
         }
 
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width == 0 {
+            return;
+        }
+        let width = if width > 1 { 2 } else { 1 };
+
         if self.cursor.col >= self.cols {
             self.newline();
         }
 
+        if width == 2 && self.cursor.col + 1 >= self.cols {
+            self.newline();
+        }
+
+        if width == 2 && self.cols < 2 {
+            return;
+        }
+
         let row = self.cursor.row;
         let col = self.cursor.col;
+        let cleared = self.clear_range_for_write(row, col, width);
         if let Some(index) = self.index(row, col) {
             self.cells[index] = Cell {
                 ch,
-                style,
-                width: CellWidth::Narrow,
+                style: style.clone(),
+                width: if width == 2 {
+                    CellWidth::Wide
+                } else {
+                    CellWidth::Narrow
+                },
             };
-            self.mark_dirty(row, col, 1, 1);
         }
 
-        self.cursor.col += 1;
+        if width == 2 {
+            let continuation_col = col + 1;
+            if let Some(index) = self.index(row, continuation_col) {
+                self.cells[index] = Cell {
+                    ch: ' ',
+                    style,
+                    width: CellWidth::WideContinuation,
+                };
+            }
+        }
+
+        let dirty_start = cleared.map_or(col, |(start, _)| start.min(col));
+        let dirty_end = cleared.map_or(col + width, |(_, end)| end.max(col + width));
+        self.mark_dirty(row, dirty_start, 1, dirty_end.saturating_sub(dirty_start));
+        self.cursor.col += width;
         if self.cursor.col >= self.cols {
             self.cursor.col = self.cols;
         }
@@ -267,17 +306,9 @@ impl ScreenGrid {
             return;
         }
 
-        for col in self.cursor.col..self.cols {
-            if let Some(index) = self.index(row, col) {
-                self.cells[index] = Cell::blank();
-            }
+        if let Some((start, end)) = self.clear_range(row, self.cursor.col, self.cols) {
+            self.mark_dirty(row, start, 1, end.saturating_sub(start));
         }
-        self.mark_dirty(
-            row,
-            self.cursor.col,
-            1,
-            self.cols.saturating_sub(self.cursor.col),
-        );
     }
 
     pub fn clear_line_to_cursor(&mut self) {
@@ -286,12 +317,10 @@ impl ScreenGrid {
             return;
         }
 
-        for col in 0..=self.cursor.col.min(self.cols.saturating_sub(1)) {
-            if let Some(index) = self.index(row, col) {
-                self.cells[index] = Cell::blank();
-            }
+        let end = self.cursor.col.min(self.cols.saturating_sub(1)) + 1;
+        if let Some((start, end)) = self.clear_range(row, 0, end) {
+            self.mark_dirty(row, start, 1, end.saturating_sub(start));
         }
-        self.mark_dirty(row, 0, 1, self.cursor.col.saturating_add(1).min(self.cols));
     }
 
     pub fn clear_screen(&mut self) {
@@ -314,9 +343,7 @@ impl ScreenGrid {
                 0
             };
             for col in start_col..self.cols {
-                if let Some(index) = self.index(row, col) {
-                    self.cells[index] = Cell::blank();
-                }
+                let _ = self.clear_range(row, col, col + 1);
             }
         }
         self.mark_full_dirty();
@@ -333,11 +360,7 @@ impl ScreenGrid {
             } else {
                 self.cols.saturating_sub(1)
             };
-            for col in 0..=end_col {
-                if let Some(index) = self.index(row, col) {
-                    self.cells[index] = Cell::blank();
-                }
-            }
+            let _ = self.clear_range(row, 0, end_col + 1);
         }
         self.mark_full_dirty();
     }
@@ -379,6 +402,9 @@ impl ScreenGrid {
         self.rows = rows;
         self.cols = cols;
         self.cells = resized;
+        for row in 0..self.rows {
+            self.normalize_wide_cells(row);
+        }
         self.set_cursor(self.cursor.row, self.cursor.col);
         self.mark_full_dirty();
     }
@@ -401,6 +427,85 @@ impl ScreenGrid {
 
         while self.scrollback.len() > self.max_scrollback_lines {
             self.scrollback.pop_front();
+        }
+    }
+
+    fn clear_range_for_write(&mut self, row: u16, col: u16, width: u16) -> Option<(u16, u16)> {
+        self.clear_range(row, col, col.saturating_add(width))
+    }
+
+    fn clear_range(&mut self, row: u16, start: u16, end: u16) -> Option<(u16, u16)> {
+        if row >= self.rows || self.cols == 0 {
+            return None;
+        }
+
+        let mut start = start.min(self.cols);
+        let mut end = end.min(self.cols);
+        if start >= end {
+            return None;
+        }
+
+        if start > 0
+            && self
+                .cell(row, start)
+                .is_some_and(|cell| cell.width == CellWidth::WideContinuation)
+        {
+            start -= 1;
+        }
+        if end < self.cols
+            && self
+                .cell(row, end)
+                .is_some_and(|cell| cell.width == CellWidth::WideContinuation)
+        {
+            end += 1;
+        }
+        if end > start
+            && self
+                .cell(row, end - 1)
+                .is_some_and(|cell| cell.width == CellWidth::Wide)
+            && end < self.cols
+        {
+            end += 1;
+        }
+
+        for col in start..end {
+            if let Some(index) = self.index(row, col) {
+                self.cells[index] = Cell::blank();
+            }
+        }
+        Some((start, end))
+    }
+
+    fn normalize_wide_cells(&mut self, row: u16) {
+        if row >= self.rows || self.cols == 0 {
+            return;
+        }
+
+        for col in 0..self.cols {
+            let Some(index) = self.index(row, col) else {
+                continue;
+            };
+            match self.cells[index].width {
+                CellWidth::Wide => {
+                    let paired = col + 1 < self.cols
+                        && self
+                            .cell(row, col + 1)
+                            .is_some_and(|cell| cell.width == CellWidth::WideContinuation);
+                    if !paired {
+                        self.cells[index] = Cell::blank();
+                    }
+                }
+                CellWidth::WideContinuation => {
+                    let paired = col > 0
+                        && self
+                            .cell(row, col - 1)
+                            .is_some_and(|cell| cell.width == CellWidth::Wide);
+                    if !paired {
+                        self.cells[index] = Cell::blank();
+                    }
+                }
+                CellWidth::Narrow => {}
+            }
         }
     }
 
@@ -482,6 +587,112 @@ mod tests {
     }
 
     #[test]
+    fn wide_char_occupies_two_cells_and_advances_cursor_by_display_width() {
+        let mut grid = ScreenGrid::new(2, 6);
+        grid.clear_dirty();
+
+        grid.write_char('変', CellStyle::default());
+        grid.write_char('換', CellStyle::default());
+
+        assert_eq!(grid.cell(0, 0).map(|cell| cell.ch), Some('変'));
+        assert_eq!(
+            grid.cell(0, 0).map(|cell| cell.width),
+            Some(CellWidth::Wide)
+        );
+        assert_eq!(
+            grid.cell(0, 1).map(|cell| cell.width),
+            Some(CellWidth::WideContinuation)
+        );
+        assert_eq!(grid.cell(0, 2).map(|cell| cell.ch), Some('換'));
+        assert_eq!(grid.cursor().col, 4);
+        assert_eq!(grid.line_text(0).as_deref(), Some("変換  "));
+        assert_eq!(
+            grid.dirty_regions(),
+            &[
+                DirtyRegion {
+                    row: 0,
+                    col: 0,
+                    rows: 1,
+                    cols: 2,
+                },
+                DirtyRegion {
+                    row: 0,
+                    col: 2,
+                    rows: 1,
+                    cols: 2,
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn writing_over_wide_cells_clears_stale_continuations() {
+        let mut grid = ScreenGrid::new(1, 6);
+        grid.clear_dirty();
+
+        grid.write_char('変', CellStyle::default());
+        grid.set_cursor(0, 1);
+        grid.write_char('A', CellStyle::default());
+
+        assert_eq!(grid.cell(0, 0), Some(&Cell::blank()));
+        assert_eq!(grid.cell(0, 1).map(|cell| cell.ch), Some('A'));
+        assert_eq!(
+            grid.cell(0, 1).map(|cell| cell.width),
+            Some(CellWidth::Narrow)
+        );
+        assert_eq!(
+            grid.dirty_regions().last(),
+            Some(&DirtyRegion {
+                row: 0,
+                col: 0,
+                rows: 1,
+                cols: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn clearing_from_wide_continuation_removes_the_whole_wide_cell() {
+        let mut grid = ScreenGrid::new(1, 6);
+
+        grid.write_char('a', CellStyle::default());
+        grid.write_char('変', CellStyle::default());
+        grid.write_char('b', CellStyle::default());
+        grid.set_cursor(0, 2);
+        grid.clear_line_from_cursor();
+
+        assert_eq!(grid.line_text(0).as_deref(), Some("a     "));
+        assert_eq!(grid.cell(0, 1), Some(&Cell::blank()));
+        assert_eq!(grid.cell(0, 2), Some(&Cell::blank()));
+    }
+
+    #[test]
+    fn clearing_to_wide_head_removes_the_wide_continuation() {
+        let mut grid = ScreenGrid::new(1, 6);
+
+        grid.write_char('a', CellStyle::default());
+        grid.write_char('変', CellStyle::default());
+        grid.write_char('b', CellStyle::default());
+        grid.set_cursor(0, 1);
+        grid.clear_line_to_cursor();
+
+        assert_eq!(grid.line_text(0).as_deref(), Some("   b  "));
+        assert_eq!(grid.cell(0, 1), Some(&Cell::blank()));
+        assert_eq!(grid.cell(0, 2), Some(&Cell::blank()));
+    }
+
+    #[test]
+    fn zero_width_combining_marks_do_not_move_cursor() {
+        let mut grid = ScreenGrid::new(1, 4);
+
+        grid.write_char('a', CellStyle::default());
+        grid.write_char('\u{0301}', CellStyle::default());
+
+        assert_eq!(grid.cursor().col, 1);
+        assert_eq!(grid.line_text(0).as_deref(), Some("a   "));
+    }
+
+    #[test]
     fn newline_at_bottom_scrolls_into_bounded_scrollback() {
         let mut grid = ScreenGrid::with_scrollback(2, 3, 1);
 
@@ -526,6 +737,31 @@ mod tests {
                 cols: 2,
             }]
         );
+    }
+
+    #[test]
+    fn resize_drops_truncated_wide_cell_fragments() {
+        let mut grid = ScreenGrid::new(1, 4);
+        grid.write_char('A', CellStyle::default());
+        grid.write_char('変', CellStyle::default());
+        grid.write_char('B', CellStyle::default());
+
+        grid.resize(1, 2);
+
+        assert_eq!(grid.line_text(0).as_deref(), Some("A "));
+        assert_eq!(grid.cell(0, 1), Some(&Cell::blank()));
+    }
+
+    #[test]
+    fn resize_drops_leading_wide_continuation_fragments() {
+        let mut grid = ScreenGrid::new(1, 4);
+        grid.write_char('変', CellStyle::default());
+        grid.cells.remove(0);
+        grid.cells.push(Cell::blank());
+
+        grid.resize(1, 3);
+
+        assert_eq!(grid.cell(0, 0), Some(&Cell::blank()));
     }
 
     #[test]

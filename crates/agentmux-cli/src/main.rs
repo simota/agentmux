@@ -757,6 +757,7 @@ fn sessions_list_request() -> ClientRequest {
     ClientRequest::new("req_sessions_list", IpcCommand::DaemonStatus, json!({}))
 }
 
+#[cfg(test)]
 fn bare_session_spawn_request() -> ClientRequest {
     agent_spawn_for_provider_request(AgentProviderChoice::Codex)
 }
@@ -1502,6 +1503,7 @@ fn existing_agent_id_from_status(payload: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
+#[cfg(test)]
 fn agent_id_from_spawn_response(response: DaemonResponse) -> Result<String> {
     if !response.ok {
         return Err(response_error("agent.spawn", response));

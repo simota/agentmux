@@ -10,3 +10,4 @@ description = "ANSI/VT parser integration, screen grid, scrollback, and dirty-re
 [dependencies]
 agentmux-core = { workspace = true }
 vte           = { workspace = true }
+unicode-width = { workspace = true }

@@ -360,6 +360,25 @@ mod tests {
     }
 
     #[test]
+    fn csi_clear_from_wide_continuation_keeps_grid_aligned() {
+        let mut parser = TerminalParser::new(1, 8);
+
+        parser.advance("ab変\x1b[D\x1b[Kc".as_bytes());
+
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("ab c    "));
+    }
+
+    #[test]
+    fn ime_style_line_redraw_with_wide_text_keeps_display_width() {
+        let mut parser = TerminalParser::new(1, 8);
+
+        parser.advance("abc\r\x1b[K変換".as_bytes());
+
+        assert_eq!(parser.grid().cursor().col, 4);
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("変換    "));
+    }
+
+    #[test]
     fn alternate_screen_is_separate_from_primary() {
         let mut parser = TerminalParser::new(2, 5);
 

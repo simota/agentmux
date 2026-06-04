@@ -124,6 +124,7 @@ name = "agentmux-terminal"
 version = "0.1.0"
 dependencies = [
  "agentmux-core",
+ "unicode-width 0.2.0",
  "vte",
 ]
 
@@ -138,6 +139,7 @@ dependencies = [
  "crossterm",
  "ratatui",
  "serde_json",
+ "unicode-width 0.2.0",
 ]
 
 [[package]]

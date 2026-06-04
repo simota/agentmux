@@ -69,6 +69,7 @@ libc = { version = "0.2" }
 # ── Terminal parsing ─────────────────────────────────────────────────────────
 # vte is a widely-used VT/ANSI parser; alacritty uses it.
 vte = { version = "0.13" }
+unicode-width = { version = "0.2" }
 
 # ── TUI ──────────────────────────────────────────────────────────────────────
 ratatui   = { version = "0.29" }

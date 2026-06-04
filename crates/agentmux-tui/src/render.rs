@@ -408,6 +408,23 @@ mod tests {
     }
 
     #[test]
+    fn render_grid_respects_wide_character_continuation_cells() {
+        let mut grid = ScreenGrid::new(1, 4);
+        grid.write_char('変', CellStyle::default());
+        grid.write_char('A', CellStyle::default());
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+        AgentPaneRenderer.render_grid(Rect::new(0, 0, 4, 1), &grid, &mut buffer);
+
+        assert_eq!(buffer.cell((0, 0)).expect("wide head").symbol(), "変");
+        assert_eq!(
+            buffer.cell((1, 0)).expect("wide continuation").symbol(),
+            " "
+        );
+        assert_eq!(buffer.cell((2, 0)).expect("next cell").symbol(), "A");
+    }
+
+    #[test]
     fn render_pane_draws_border_title_and_inner_grid() {
         let mut grid = ScreenGrid::new(1, 3);
         for ch in "abc".chars() {

@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use agentmux_ipc::protocol::{DaemonEvent, IpcEventKind};
 use agentmux_terminal::{CellStyle, ScreenGrid, TerminalParser};
 use serde_json::Value;
+use unicode_width::UnicodeWidthChar;
 
 use crate::keymap::{FocusDirection, TuiCommand};
 use crate::layout::{PaneLayout, SplitDirection};
@@ -491,8 +492,18 @@ impl TuiSessionState {
                 };
                 let grid = pane.terminal.grid_mut();
                 grid.set_cursor(row, 0);
-                for ch in text.chars().take(usize::from(cols)) {
+                let mut display_cols = 0_u16;
+                for ch in text.chars() {
+                    let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if width == 0 {
+                        continue;
+                    }
+                    let width = if width > 1 { 2 } else { 1 };
+                    if display_cols.saturating_add(width) > cols {
+                        break;
+                    }
                     grid.write_char(ch, CellStyle::default());
+                    display_cols += width;
                 }
             }
         }
@@ -952,6 +963,32 @@ mod tests {
             pane.last_event(),
             Some(&IpcEventKind::TerminalSnapshotSaved)
         );
+    }
+
+    #[test]
+    fn snapshot_restore_clips_lines_by_display_width() {
+        let mut state =
+            TuiSessionState::default().with_terminal_size(TerminalSize { rows: 1, cols: 3 });
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_001", "name": "impl", "process_id": 7}
+            ]
+        }));
+
+        let change = state.apply_snapshot(&json!({
+            "agent_id": "agent_001",
+            "name": "impl",
+            "process_id": 7,
+            "rows": 1,
+            "cols": 3,
+            "lines": ["A変B"]
+        }));
+
+        assert_eq!(change, StateChange::UpdatedPane("agent_001".to_string()));
+        let pane = state.pane("agent_001").expect("pane");
+        assert_eq!(pane.grid().line_text(0).as_deref(), Some("A変"));
+        assert_eq!(pane.grid().cursor().row, 0);
+        assert_eq!(pane.grid().cursor().col, 3);
     }
 
     #[test]
