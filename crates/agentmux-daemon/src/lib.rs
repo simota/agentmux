@@ -383,6 +383,47 @@ impl DaemonRuntime {
         pty.write_bytes(CTRL_C)
     }
 
+    pub async fn resize_agent(
+        &self,
+        agent_id: &AgentSessionId,
+        size: agentmux_pty::TerminalSize,
+    ) -> Result<()> {
+        if size.rows == 0 || size.cols == 0 {
+            return Err(AgentmuxError::UserError(format!(
+                "agent.resize requires non-zero size, got {}x{}",
+                size.rows, size.cols
+            )));
+        }
+
+        let state = self.state.read().await;
+        let Some(agent) = state.agents.get(agent_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        };
+        let Some(pty) = &agent.pty else {
+            return Err(AgentmuxError::UserError(format!(
+                "agent session '{agent_id}' has no live PTY"
+            )));
+        };
+        let terminal = agent.terminal.clone();
+
+        {
+            let pty = pty.lock().map_err(|_| {
+                AgentmuxError::Internal(format!("PTY lock for agent '{agent_id}' is poisoned"))
+            })?;
+            pty.resize(size)?;
+        }
+
+        let mut terminal = terminal.lock().map_err(|_| {
+            AgentmuxError::Internal(format!(
+                "terminal buffer lock for agent '{agent_id}' is poisoned"
+            ))
+        })?;
+        terminal.resize(size.rows, size.cols);
+        Ok(())
+    }
+
     pub async fn save_layout(&self, name: String, layout: serde_json::Value) -> Result<()> {
         if name.trim().is_empty() {
             return Err(AgentmuxError::UserError(
@@ -1762,6 +1803,41 @@ async fn handle_request(
                 ),
             }
         }
+        IpcCommand::AgentResize => {
+            let agent_id = match agent_id_payload(&request.payload, "agent.resize") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ID", error.to_string()),
+                    );
+                }
+            };
+            let size = match terminal_size_payload(&request.payload, "agent.resize") {
+                Ok(size) => size,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_TERMINAL_SIZE", error.to_string()),
+                    );
+                }
+            };
+            match runtime.resize_agent(&agent_id, size).await {
+                Ok(()) => DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "agent_id": agent_id.to_string(),
+                        "rows": size.rows,
+                        "cols": size.cols,
+                        "resized": true,
+                    }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("AGENT_RESIZE_FAILED", error.to_string()),
+                ),
+            }
+        }
         IpcCommand::AgentSnapshot => {
             let agent_id = match agent_id_payload(&request.payload, "agent.snapshot") {
                 Ok(id) => id,
@@ -2390,6 +2466,20 @@ fn agent_id_payload(payload: &serde_json::Value, command: &str) -> Result<AgentS
         .map_err(|error| AgentmuxError::UserError(format!("invalid agent_id: {error}")))
 }
 
+fn terminal_size_payload(
+    payload: &serde_json::Value,
+    command: &str,
+) -> Result<agentmux_pty::TerminalSize> {
+    let rows = required_u16(payload, "rows", command)?;
+    let cols = required_u16(payload, "cols", command)?;
+    if rows == 0 || cols == 0 {
+        return Err(AgentmuxError::UserError(format!(
+            "{command} requires non-zero rows and cols, got {rows}x{cols}"
+        )));
+    }
+    Ok(agentmux_pty::TerminalSize { rows, cols })
+}
+
 fn parse_message_id(value: &str) -> Option<MessageId> {
     value.parse::<MessageId>().ok()
 }
@@ -2603,6 +2693,14 @@ fn required_string<'a>(
         .get(field)
         .and_then(|value| value.as_str())
         .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| AgentmuxError::UserError(format!("{command} requires {field}")))
+}
+
+fn required_u16(payload: &serde_json::Value, field: &str, command: &str) -> Result<u16> {
+    payload
+        .get(field)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u16::try_from(value).ok())
         .ok_or_else(|| AgentmuxError::UserError(format!("{command} requires {field}")))
 }
 
@@ -2859,6 +2957,17 @@ mod tests {
             spec.env.contains_key("PATH"),
             "daemon environment is inherited so the shell is usable"
         );
+    }
+
+    #[test]
+    fn terminal_size_payload_requires_positive_rows_and_cols() {
+        let size = terminal_size_payload(&json!({ "rows": 22, "cols": 78 }), "agent.resize")
+            .expect("valid size");
+
+        assert_eq!(size.rows, 22);
+        assert_eq!(size.cols, 78);
+        assert!(terminal_size_payload(&json!({ "rows": 0, "cols": 78 }), "agent.resize").is_err());
+        assert!(terminal_size_payload(&json!({ "rows": 22 }), "agent.resize").is_err());
     }
 
     #[test]

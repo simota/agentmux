@@ -171,6 +171,7 @@ v0.1はJSON Lines over Unix domain socket。
 - agent.spawn
 - agent.stop
 - agent.interrupt
+- agent.resize
 - agent.focus
 - agent.send_input_script
 - agent.snapshot

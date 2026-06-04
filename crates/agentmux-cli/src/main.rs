@@ -21,8 +21,9 @@ use agentmux_store::Store;
 use agentmux_tui::{
     input::{InputForwardError, dispatch_to_daemon_request},
     keymap::KeymapDispatcher,
+    layout::{PaneLayout, Rect},
     render::TuiSessionRenderer,
-    state::{AgentProviderChoice, CommandEffect, TuiSessionState},
+    state::{AgentProviderChoice, CommandEffect, TerminalSize as TuiTerminalSize, TuiSessionState},
     terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
 };
 use clap::{Parser, Subcommand};
@@ -848,6 +849,18 @@ fn agent_interrupt_request(agent_id: String) -> ClientRequest {
     )
 }
 
+fn agent_resize_request(id: String, agent_id: String, size: TuiTerminalSize) -> ClientRequest {
+    ClientRequest::new(
+        id,
+        IpcCommand::AgentResize,
+        json!({
+            "agent_id": agent_id,
+            "rows": size.rows,
+            "cols": size.cols,
+        }),
+    )
+}
+
 fn message_list_request() -> ClientRequest {
     ClientRequest::new("req_message_list", IpcCommand::MessageList, json!({}))
 }
@@ -1597,6 +1610,7 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
     let renderer = TuiSessionRenderer::default();
     let mut keymap = KeymapDispatcher::default();
     let mut input_sequence = 0_u64;
+    let mut resize_sequence = 0_u64;
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
     let signal_task = spawn_tui_signal_forwarder(signal_tx);
 
@@ -1632,11 +1646,28 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
             }
         }
 
-        if let Some(Event::Key(key)) = terminal
+        if let Some(event) = terminal
             .io_mut()
             .poll_event(Duration::from_millis(16))
             .map_err(|error| AgentmuxError::TerminalError(format!("failed to read key: {error}")))?
         {
+            let Event::Key(key) = event else {
+                if let Event::Resize(cols, rows) = event {
+                    for (agent_id, size) in resize_pane_sizes(&state, cols, rows) {
+                        resize_sequence = resize_sequence.saturating_add(1);
+                        state.resize_pane(&agent_id, size);
+                        writer
+                            .write(&agent_resize_request(
+                                format!("req_resize_{resize_sequence}"),
+                                agent_id,
+                                size,
+                            ))
+                            .await?;
+                    }
+                    draw_tui_frame(&mut terminal, &renderer, &state)?;
+                }
+                continue;
+            };
             let dispatch = keymap.dispatch_with_overlays(
                 key,
                 state.session_list_visible(),
@@ -1805,6 +1836,23 @@ fn draw_tui_frame<T: TerminalIo>(
         .io_mut()
         .draw(|frame| renderer.render(frame.area(), state, frame.buffer_mut()))
         .map_err(|error| AgentmuxError::TerminalError(format!("failed to draw TUI: {error}")))
+}
+
+fn resize_pane_sizes(
+    state: &TuiSessionState,
+    terminal_cols: u16,
+    terminal_rows: u16,
+) -> Vec<(String, TuiTerminalSize)> {
+    let area = Rect::new(0, 0, terminal_cols, terminal_rows);
+    state
+        .layout()
+        .pane_rects(area)
+        .into_iter()
+        .filter_map(|(agent_id, rect)| {
+            let (rows, cols) = PaneLayout::pane_inner_size(rect);
+            (rows > 0 && cols > 0).then_some((agent_id, TuiTerminalSize { rows, cols }))
+        })
+        .collect()
 }
 
 async fn send_daemon_request(socket_path: &Path, request: ClientRequest) -> Result<DaemonResponse> {
@@ -2229,6 +2277,49 @@ mod tests {
     #[test]
     fn sigint_requests_tui_detach_for_terminal_restoring_shutdown_path() {
         assert_eq!(tui_signal_effect(TuiSignal::Sigint), CommandEffect::Detach);
+    }
+
+    #[test]
+    fn agent_resize_request_uses_resize_ipc_command() {
+        let request = agent_resize_request(
+            "req_resize_1".to_string(),
+            "agent_001".to_string(),
+            TuiTerminalSize { rows: 22, cols: 78 },
+        );
+
+        assert_eq!(request.id, "req_resize_1");
+        assert_eq!(request.command, IpcCommand::AgentResize);
+        assert_eq!(
+            request.payload,
+            json!({ "agent_id": "agent_001", "rows": 22, "cols": 78 })
+        );
+    }
+
+    #[test]
+    fn resize_pane_sizes_use_inner_pane_dimensions() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_a", "name": "a"},
+                {"id": "agent_b", "name": "b"}
+            ]
+        }));
+
+        let sizes = resize_pane_sizes(&state, 100, 24);
+
+        assert_eq!(
+            sizes,
+            vec![
+                (
+                    "agent_a".to_string(),
+                    TuiTerminalSize { rows: 22, cols: 48 }
+                ),
+                (
+                    "agent_b".to_string(),
+                    TuiTerminalSize { rows: 22, cols: 48 }
+                ),
+            ]
+        );
     }
 
     #[test]

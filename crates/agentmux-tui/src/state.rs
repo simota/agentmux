@@ -146,6 +146,17 @@ impl TuiSessionState {
         self.layout.focused().and_then(|id| self.pane(id))
     }
 
+    pub fn resize_pane(&mut self, agent_id: &str, size: TerminalSize) -> StateChange {
+        if size.rows == 0 || size.cols == 0 {
+            return StateChange::Ignored;
+        }
+        let Some(pane) = self.panes.get_mut(agent_id) else {
+            return StateChange::Ignored;
+        };
+        pane.terminal.resize(size.rows, size.cols);
+        StateChange::UpdatedPane(agent_id.to_string())
+    }
+
     pub fn last_event(&self) -> Option<&IpcEventKind> {
         self.last_event.as_ref()
     }
@@ -907,6 +918,28 @@ mod tests {
             .line_text(0)
             .expect("line");
         assert_eq!(line, "hello   ");
+    }
+
+    #[test]
+    fn resize_pane_updates_terminal_grid_dimensions() {
+        let mut state =
+            TuiSessionState::default().with_terminal_size(TerminalSize { rows: 2, cols: 8 });
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::PtyOutputChunk,
+            json!({ "agent_id": "agent_001", "text": "hello" }),
+        ));
+
+        let change = state.resize_pane("agent_001", TerminalSize { rows: 4, cols: 12 });
+
+        assert_eq!(change, StateChange::UpdatedPane("agent_001".to_string()));
+        let pane = state.pane("agent_001").expect("pane");
+        assert_eq!(pane.grid().rows(), 4);
+        assert_eq!(pane.grid().cols(), 12);
+        assert_eq!(pane.grid().line_text(0).as_deref(), Some("hello       "));
     }
 
     #[test]

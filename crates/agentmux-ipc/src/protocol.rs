@@ -221,6 +221,8 @@ pub enum IpcCommand {
     AgentStop,
     #[serde(rename = "agent.interrupt")]
     AgentInterrupt,
+    #[serde(rename = "agent.resize")]
+    AgentResize,
     #[serde(rename = "agent.focus")]
     AgentFocus,
     #[serde(rename = "agent.send_input_script")]
