@@ -555,6 +555,20 @@ impl DaemonRuntime {
             .await
     }
 
+    pub async fn inject_message_to_agent(
+        &self,
+        id: &MessageId,
+        agent_id: &AgentSessionId,
+    ) -> Result<AgentMessage> {
+        let now = DateTimeUtc::now_utc();
+        let prepared = self
+            .prepare_manual_message_injection_for_agent(id, agent_id, now)
+            .await?;
+        let write_result = self.write_prepared_message_injection(&prepared).await;
+        self.finish_and_emit_message_injection(&prepared.message_id, now, write_result)
+            .await
+    }
+
     async fn finish_and_emit_message_injection(
         &self,
         id: &MessageId,
@@ -673,6 +687,36 @@ impl DaemonRuntime {
                 recipients.len()
             )));
         };
+        let (provider, context) = delivery_render_inputs(&state, agent_id, &message)?;
+        let prompt = agentmux_message::render_prompt(&message, provider, &context);
+        state
+            .messages
+            .update_delivery_status(id, DeliveryStatus::Injecting, now)?;
+
+        Ok(PreparedInjection {
+            message_id: id.clone(),
+            agent_id: agent_id.clone(),
+            prompt,
+        })
+    }
+
+    async fn prepare_manual_message_injection_for_agent(
+        &self,
+        id: &MessageId,
+        agent_id: &AgentSessionId,
+        now: DateTimeUtc,
+    ) -> Result<PreparedInjection> {
+        let mut state = self.state.write().await;
+        let message = state
+            .messages
+            .get_message(id)
+            .cloned()
+            .ok_or_else(|| AgentmuxError::UserError(format!("unknown message '{id}'")))?;
+        if !state.agents.contains_key(agent_id) {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        }
         let (provider, context) = delivery_render_inputs(&state, agent_id, &message)?;
         let prompt = agentmux_message::render_prompt(&message, provider, &context);
         state
@@ -2060,7 +2104,30 @@ async fn handle_request(
                     ErrorBody::new("INVALID_MESSAGE_ID", "message.inject requires message_id"),
                 );
             };
-            match runtime.inject_message(&message_id).await {
+            let agent_id = request
+                .payload
+                .get("agent_id")
+                .and_then(|value| value.as_str())
+                .map(str::parse::<AgentSessionId>)
+                .transpose();
+            let agent_id = match agent_id {
+                Ok(agent_id) => agent_id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ID", error.to_string()),
+                    );
+                }
+            };
+            let result = match agent_id {
+                Some(agent_id) => {
+                    runtime
+                        .inject_message_to_agent(&message_id, &agent_id)
+                        .await
+                }
+                None => runtime.inject_message(&message_id).await,
+            };
+            match result {
                 Ok(message) => DaemonResponse::ok(request.id, message_payload(&message)),
                 Err(error) => DaemonResponse::error(
                     request.id,
@@ -3981,6 +4048,92 @@ AGENTMUX_RESULT:
                 .delivery_status,
             DeliveryStatus::Failed
         );
+    }
+
+    #[tokio::test]
+    async fn manual_message_inject_can_target_explicit_agent_session() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-explicit-inject-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let first_output = root.join("first.txt");
+        let second_output = root.join("second.txt");
+        let runtime = DaemonRuntime::new(16);
+        let first = runtime
+            .spawn_agent_with_role(
+                "tester-first".to_string(),
+                AgentRole::Tester,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        first_output.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("first tester is spawned");
+        let second = runtime
+            .spawn_agent_with_role(
+                "tester-second".to_string(),
+                AgentRole::Tester,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        second_output.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("second tester is spawned");
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Role(AgentRole::Tester),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "explicit session injection".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: true,
+            })
+            .await
+            .expect("role-targeted message is created");
+
+        let delivered = runtime
+            .inject_message_to_agent(&message.id, &second.id)
+            .await
+            .expect("explicit agent injection succeeds");
+
+        assert_eq!(delivered.delivery_status, DeliveryStatus::Delivered);
+        assert!(
+            runtime.inject_message(&message.id).await.is_err(),
+            "role-targeted manual injection without an explicit agent remains ambiguous"
+        );
+        let output = wait_for_file_contains(&second_output, "message:\nexplicit session injection")
+            .await
+            .expect("message reached explicitly targeted PTY");
+        assert!(output.contains("message:\nexplicit session injection"));
+        assert!(
+            std::fs::read_to_string(&first_output)
+                .unwrap_or_default()
+                .is_empty(),
+            "non-targeted tester should not receive the injected message"
+        );
+
+        terminate_agent_process(&runtime, &first.id.to_string()).await;
+        terminate_agent_process(&runtime, &second.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
     }
 
     #[tokio::test]
