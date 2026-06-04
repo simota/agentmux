@@ -278,7 +278,7 @@ fn key_event_bytes(key: KeyEvent) -> Option<Vec<u8>> {
         KeyCode::PageUp => Some(b"\x1b[5~".to_vec()),
         KeyCode::PageDown => Some(b"\x1b[6~".to_vec()),
         KeyCode::Tab => Some(b"\t".to_vec()),
-        KeyCode::Esc => None,
+        KeyCode::Esc => Some(b"\x1b".to_vec()),
         KeyCode::Char(ch) => Some(ch.to_string().into_bytes()),
         _ => None,
     }
@@ -362,12 +362,15 @@ mod tests {
     }
 
     #[test]
-    fn bare_escape_is_consumed_instead_of_forwarded_to_agent() {
+    fn bare_escape_is_forwarded_to_focused_pane() {
         let mut dispatcher = KeymapDispatcher::default();
 
         let dispatch = dispatcher.dispatch(key(KeyCode::Esc, KeyModifiers::NONE));
 
-        assert_eq!(dispatch, KeyDispatch::Consumed);
+        assert_eq!(
+            dispatch,
+            KeyDispatch::ForwardToFocusedPane(b"\x1b".to_vec())
+        );
     }
 
     #[test]
