@@ -20,6 +20,7 @@ agentmux-core = { workspace = true }
 agentmux-ipc  = { workspace = true }
 agentmux-pty  = { workspace = true }
 agentmux-store = { workspace = true }
+agentmux-terminal = { workspace = true }
 agentmux-tui  = { workspace = true }
 clap          = { workspace = true }
 crossterm     = { workspace = true }

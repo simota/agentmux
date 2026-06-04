@@ -1,6 +1,6 @@
 //! Pane and view rendering.
 
-use agentmux_terminal::{CellStyle, CellWidth, ScreenGrid, TerminalColor};
+use agentmux_terminal::{Cell, CellStyle, CellWidth, ScreenGrid, TerminalColor};
 use ratatui::{
     buffer::Buffer,
     layout::{Alignment, Rect},
@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::state::TuiSessionState;
+use crate::state::{CopySelection, TuiSessionState};
 
 /// Border/status metadata for an agent pane.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -37,6 +37,29 @@ pub struct AgentPaneRenderer;
 
 impl AgentPaneRenderer {
     pub fn render(&self, area: Rect, grid: &ScreenGrid, chrome: &PaneChrome, buffer: &mut Buffer) {
+        self.render_scrolled(area, grid, 0, chrome, buffer);
+    }
+
+    pub fn render_scrolled(
+        &self,
+        area: Rect,
+        grid: &ScreenGrid,
+        scroll_offset: usize,
+        chrome: &PaneChrome,
+        buffer: &mut Buffer,
+    ) {
+        self.render_scrolled_with_selection(area, grid, scroll_offset, chrome, None, buffer);
+    }
+
+    pub fn render_scrolled_with_selection(
+        &self,
+        area: Rect,
+        grid: &ScreenGrid,
+        scroll_offset: usize,
+        chrome: &PaneChrome,
+        selection: Option<&CopySelection>,
+        buffer: &mut Buffer,
+    ) {
         if area.width == 0 || area.height == 0 {
             return;
         }
@@ -53,25 +76,55 @@ impl AgentPaneRenderer {
         let inner = block.inner(area);
         block.render(area, buffer);
 
-        self.render_grid(inner, grid, buffer);
+        self.render_grid_scrolled_with_selection(inner, grid, scroll_offset, selection, buffer);
     }
 
     pub fn render_grid(&self, area: Rect, grid: &ScreenGrid, buffer: &mut Buffer) {
+        self.render_grid_scrolled(area, grid, 0, buffer);
+    }
+
+    pub fn render_grid_scrolled(
+        &self,
+        area: Rect,
+        grid: &ScreenGrid,
+        scroll_offset: usize,
+        buffer: &mut Buffer,
+    ) {
+        self.render_grid_scrolled_with_selection(area, grid, scroll_offset, None, buffer);
+    }
+
+    pub fn render_grid_scrolled_with_selection(
+        &self,
+        area: Rect,
+        grid: &ScreenGrid,
+        scroll_offset: usize,
+        selection: Option<&CopySelection>,
+        buffer: &mut Buffer,
+    ) {
+        if scroll_offset == 0 {
+            render_current_grid(area, grid, selection, buffer);
+            return;
+        }
+
         if area.width == 0 || area.height == 0 {
             return;
         }
 
-        let rows = area.height.min(grid.rows());
         let cols = area.width.min(grid.cols());
+        let total_rows = grid.scrollback().len() + usize::from(grid.rows());
+        let rows = usize::from(area.height).min(total_rows);
+        let start = total_rows
+            .saturating_sub(rows)
+            .saturating_sub(scroll_offset.min(total_rows.saturating_sub(rows)));
 
         for row in 0..rows {
             for col in 0..cols {
-                let Some(cell) = grid.cell(row, col) else {
+                let Some(cell) = history_cell(grid, start + row, col) else {
                     continue;
                 };
 
                 let x = area.x + col;
-                let y = area.y + row;
+                let y = area.y + u16::try_from(row).unwrap_or(u16::MAX);
                 if let Some(target) = buffer.cell_mut((x, y)) {
                     if cell.width == CellWidth::WideContinuation {
                         target.set_symbol(" ");
@@ -79,16 +132,72 @@ impl AgentPaneRenderer {
                         target.set_char(cell.ch);
                     }
                     target.set_style(to_ratatui_style(&cell.style));
+                    if selection.is_some_and(|selection| selection.contains(row as u16, col)) {
+                        target.set_style(target.style().add_modifier(Modifier::REVERSED));
+                    }
                 }
             }
         }
 
         let cursor = grid.cursor();
-        if cursor.visible && cursor.row < rows && cursor.col < cols {
-            if let Some(cell) = buffer.cell_mut((area.x + cursor.col, area.y + cursor.row)) {
+        let cursor_history_row = grid.scrollback().len() + usize::from(cursor.row);
+        if cursor.visible && cursor.col < cols {
+            let cursor_screen_row = cursor_history_row
+                .checked_sub(start)
+                .filter(|row| *row < rows);
+            if let Some(cursor_screen_row) = cursor_screen_row
+                && let Ok(cursor_screen_row) = u16::try_from(cursor_screen_row)
+                && let Some(cell) =
+                    buffer.cell_mut((area.x + cursor.col, area.y + cursor_screen_row))
+            {
                 cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
             }
         }
+    }
+}
+
+fn render_current_grid(
+    area: Rect,
+    grid: &ScreenGrid,
+    selection: Option<&CopySelection>,
+    buffer: &mut Buffer,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let rows = area.height.min(grid.rows());
+    let cols = area.width.min(grid.cols());
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let Some(cell) = grid.cell(row, col) else {
+                continue;
+            };
+
+            let x = area.x + col;
+            let y = area.y + row;
+            if let Some(target) = buffer.cell_mut((x, y)) {
+                if cell.width == CellWidth::WideContinuation {
+                    target.set_symbol(" ");
+                } else {
+                    target.set_char(cell.ch);
+                }
+                target.set_style(to_ratatui_style(&cell.style));
+                if selection.is_some_and(|selection| selection.contains(row, col)) {
+                    target.set_style(target.style().add_modifier(Modifier::REVERSED));
+                }
+            }
+        }
+    }
+
+    let cursor = grid.cursor();
+    if cursor.visible
+        && cursor.row < rows
+        && cursor.col < cols
+        && let Some(cell) = buffer.cell_mut((area.x + cursor.col, area.y + cursor.row))
+    {
+        cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
     }
 }
 
@@ -106,8 +215,17 @@ impl TuiSessionRenderer {
             };
             let chrome = PaneChrome::new(pane.chrome_title())
                 .focused(state.layout().focused() == Some(pane.agent_id()));
-            self.pane_renderer
-                .render(rect, pane.grid(), &chrome, buffer);
+            let selection = state
+                .copy_selection()
+                .filter(|selection| selection.agent_id == pane.agent_id());
+            self.pane_renderer.render_scrolled_with_selection(
+                rect,
+                pane.grid(),
+                pane.scroll_offset(),
+                &chrome,
+                selection,
+                buffer,
+            );
         }
 
         if state.keybinding_help_visible() {
@@ -128,6 +246,16 @@ impl TuiSessionRenderer {
     }
 }
 
+fn history_cell(grid: &ScreenGrid, history_row: usize, col: u16) -> Option<&Cell> {
+    let scrollback_rows = grid.scrollback().len();
+    if history_row < scrollback_rows {
+        return grid.scrollback()[history_row].cells().get(usize::from(col));
+    }
+    let grid_row = history_row.checked_sub(scrollback_rows)?;
+    let grid_row = u16::try_from(grid_row).ok()?;
+    grid.cell(grid_row, col)
+}
+
 const KEYBINDING_HELP_LINES: &[&str] = &[
     "Prefix: Ctrl-g",
     "",
@@ -138,6 +266,7 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "Ctrl-g m      Message bus",
     "Ctrl-g x      Close focused pane",
     "Ctrl-g z      Toggle pane zoom",
+    "Ctrl-g [      Copy/scroll focused pane",
     "Ctrl-g arrows Move focus",
     "Ctrl-g %      Split vertical + choose agent",
     "Ctrl-g \"      Split horizontal + choose agent",
@@ -379,7 +508,7 @@ pub fn to_ratatui_color(color: TerminalColor) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use agentmux_terminal::{CellStyle, TerminalColor};
+    use agentmux_terminal::{CellStyle, TerminalColor, TerminalParser};
     use serde_json::json;
 
     use crate::state::TuiSessionState;
@@ -422,6 +551,24 @@ mod tests {
             " "
         );
         assert_eq!(buffer.cell((2, 0)).expect("next cell").symbol(), "A");
+    }
+
+    #[test]
+    fn render_grid_scrolled_reads_from_scrollback_history() {
+        let mut parser = TerminalParser::new(2, 4);
+        parser.advance(b"1111\n2222\n3333\n");
+        let grid = parser.grid();
+
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 2));
+        AgentPaneRenderer.render_grid_scrolled(Rect::new(0, 0, 4, 2), grid, 1, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("2222"));
+        assert!(rendered.contains("3333"));
     }
 
     #[test]

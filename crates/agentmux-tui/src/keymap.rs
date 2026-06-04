@@ -41,6 +41,7 @@ pub enum TuiCommand {
     RunTests,
     InterruptAgent,
     CommandPalette,
+    EnterCopyMode,
     SessionListNext,
     SessionListPrevious,
     FocusSelectedSession,
@@ -249,6 +250,7 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Char('T') => Some(TuiCommand::RunTests),
         KeyCode::Char('I') => Some(TuiCommand::InterruptAgent),
         KeyCode::Char(':') => Some(TuiCommand::CommandPalette),
+        KeyCode::Char('[') => Some(TuiCommand::EnterCopyMode),
         _ => None,
     }
 }
@@ -465,6 +467,16 @@ mod tests {
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('x'), KeyModifiers::NONE));
 
         assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ClosePane));
+    }
+
+    #[test]
+    fn prefixed_bracket_maps_to_copy_mode_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('['), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::EnterCopyMode));
     }
 
     #[test]

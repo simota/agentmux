@@ -303,6 +303,7 @@ impl DaemonRuntime {
                             IpcEventKind::PtyOutputChunk,
                             json!({
                                 "agent_id": agent_id.to_string(),
+                                "bytes": bytes,
                                 "text": text,
                             }),
                         ));

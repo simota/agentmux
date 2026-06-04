@@ -26,6 +26,7 @@ dependencies = [
  "agentmux-ipc",
  "agentmux-pty",
  "agentmux-store",
+ "agentmux-terminal",
  "agentmux-tui",
  "clap",
  "crossterm",

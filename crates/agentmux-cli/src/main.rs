@@ -23,11 +23,17 @@ use agentmux_tui::{
     keymap::KeymapDispatcher,
     layout::{PaneLayout, Rect},
     render::TuiSessionRenderer,
-    state::{AgentProviderChoice, CommandEffect, TerminalSize as TuiTerminalSize, TuiSessionState},
+    state::{
+        AgentProviderChoice, CommandEffect, CopyPoint, CopySelection, StateChange,
+        TerminalSize as TuiTerminalSize, TuiSessionState,
+    },
     terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
 };
 use clap::{Parser, Subcommand};
-use crossterm::{event::Event, terminal as crossterm_terminal};
+use crossterm::{
+    event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
+    terminal as crossterm_terminal,
+};
 use serde_json::{Value, json};
 use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
@@ -1596,6 +1602,8 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
     let mut keymap = KeymapDispatcher::default();
     let mut input_sequence = 0_u64;
     let mut resize_sequence = 0_u64;
+    let mut copy_mode = false;
+    let mut copy_drag_start: Option<CopyPoint> = None;
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
     let signal_task = spawn_tui_signal_forwarder(signal_tx);
 
@@ -1640,9 +1648,72 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
                         writer.write(&request).await?;
                     }
                     draw_tui_frame(&mut terminal, &renderer, &state)?;
+                } else if copy_mode && let Event::Mouse(mouse) = event {
+                    let (cols, rows) = current_terminal_size()?;
+                    if let Some(action) = copy_mode_mouse_action(
+                        &mut state,
+                        cols,
+                        rows,
+                        mouse.kind,
+                        mouse.column,
+                        mouse.row,
+                        &mut copy_drag_start,
+                    ) {
+                        match action {
+                            CopyModeAction::Redraw => {
+                                draw_tui_frame(&mut terminal, &renderer, &state)?;
+                            }
+                            CopyModeAction::CopyAndExit(text) => {
+                                terminal
+                                    .io_mut()
+                                    .copy_to_clipboard(&text)
+                                    .map_err(|error| {
+                                        AgentmuxError::TerminalError(format!(
+                                            "failed to copy selection to clipboard: {error}"
+                                        ))
+                                    })?;
+                                terminal
+                                    .io_mut()
+                                    .set_mouse_capture(false)
+                                    .map_err(|error| {
+                                        AgentmuxError::TerminalError(format!(
+                                            "failed to disable mouse capture: {error}"
+                                        ))
+                                    })?;
+                                copy_mode = false;
+                                copy_drag_start = None;
+                                state.reset_focused_pane_scroll();
+                                state.clear_copy_selection();
+                                draw_tui_frame(&mut terminal, &renderer, &state)?;
+                            }
+                        }
+                    }
+                } else if let Event::Mouse(mouse) = event
+                    && let Some(delta) = mouse_scroll_delta(mouse.kind)
+                {
+                    let (cols, rows) = current_terminal_size()?;
+                    if scroll_pane_at(&mut state, cols, rows, mouse.column, mouse.row, delta) {
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
                 }
                 continue;
             };
+            if copy_mode && copy_mode_key_exits(key.code, key.modifiers) {
+                terminal
+                    .io_mut()
+                    .set_mouse_capture(false)
+                    .map_err(|error| {
+                        AgentmuxError::TerminalError(format!(
+                            "failed to disable mouse capture: {error}"
+                        ))
+                    })?;
+                copy_mode = false;
+                copy_drag_start = None;
+                state.reset_focused_pane_scroll();
+                state.clear_copy_selection();
+                draw_tui_frame(&mut terminal, &renderer, &state)?;
+                continue;
+            }
             let dispatch = keymap.dispatch_with_overlays(
                 key,
                 state.session_list_visible(),
@@ -1679,6 +1750,19 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
                     CommandEffect::RefreshMessages => {
                         writer.write(&message_list_request()).await?;
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                    CommandEffect::Unhandled(agentmux_tui::keymap::TuiCommand::EnterCopyMode) => {
+                        if state.focused_pane().is_some() {
+                            terminal.io_mut().set_mouse_capture(true).map_err(|error| {
+                                AgentmuxError::TerminalError(format!(
+                                    "failed to enable mouse capture: {error}"
+                                ))
+                            })?;
+                            copy_mode = true;
+                            copy_drag_start = None;
+                            state.clear_copy_selection();
+                            draw_tui_frame(&mut terminal, &renderer, &state)?;
+                        }
                     }
                     CommandEffect::Detach => {
                         writer.write(&detach_request()).await?;
@@ -1879,6 +1963,194 @@ fn resize_panes_for_terminal(
             agent_resize_request(format!("req_resize_{resize_sequence}"), agent_id, size)
         })
         .collect()
+}
+
+fn mouse_scroll_delta(kind: MouseEventKind) -> Option<isize> {
+    match kind {
+        MouseEventKind::ScrollUp => Some(3),
+        MouseEventKind::ScrollDown => Some(-3),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum CopyModeAction {
+    Redraw,
+    CopyAndExit(String),
+}
+
+fn copy_mode_key_exits(code: KeyCode, modifiers: KeyModifiers) -> bool {
+    if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+        return false;
+    }
+    matches!(code, KeyCode::Esc | KeyCode::Char('q'))
+}
+
+fn copy_mode_mouse_action(
+    state: &mut TuiSessionState,
+    terminal_cols: u16,
+    terminal_rows: u16,
+    kind: MouseEventKind,
+    mouse_col: u16,
+    mouse_row: u16,
+    drag_start: &mut Option<CopyPoint>,
+) -> Option<CopyModeAction> {
+    if let Some(delta) = mouse_scroll_delta(kind) {
+        return (!matches!(state.scroll_focused_pane(delta), StateChange::Ignored))
+            .then_some(CopyModeAction::Redraw);
+    }
+
+    let agent_id = state.layout().focused()?.to_string();
+    let inner = focused_pane_inner_rect(state, terminal_cols, terminal_rows)?;
+
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !rect_contains(inner, mouse_col, mouse_row) {
+                return None;
+            }
+            let point = copy_point_from_mouse(inner, mouse_col, mouse_row);
+            *drag_start = Some(point);
+            state.set_copy_selection(CopySelection::new(agent_id, point, point));
+            Some(CopyModeAction::Redraw)
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            let start = (*drag_start)?;
+            let point = copy_point_from_mouse(inner, mouse_col, mouse_row);
+            state.set_copy_selection(CopySelection::new(agent_id, start, point));
+            Some(CopyModeAction::Redraw)
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let start = (*drag_start)?;
+            let point = copy_point_from_mouse(inner, mouse_col, mouse_row);
+            let selection = CopySelection::new(agent_id, start, point);
+            let text = selected_text(state, &selection, inner.height);
+            state.set_copy_selection(selection);
+            *drag_start = None;
+            Some(CopyModeAction::CopyAndExit(text))
+        }
+        _ => None,
+    }
+}
+
+fn focused_pane_inner_rect(
+    state: &TuiSessionState,
+    terminal_cols: u16,
+    terminal_rows: u16,
+) -> Option<Rect> {
+    let focused = state.layout().focused()?;
+    let area = Rect::new(0, 0, terminal_cols, terminal_rows);
+    state
+        .layout()
+        .pane_rects(area)
+        .into_iter()
+        .find_map(|(agent_id, rect)| (agent_id == focused).then_some(inner_rect(rect)))
+        .filter(|rect| rect.width > 0 && rect.height > 0)
+}
+
+fn inner_rect(rect: Rect) -> Rect {
+    Rect::new(
+        rect.x.saturating_add(1),
+        rect.y.saturating_add(1),
+        rect.width.saturating_sub(2),
+        rect.height.saturating_sub(2),
+    )
+}
+
+fn copy_point_from_mouse(inner: Rect, mouse_col: u16, mouse_row: u16) -> CopyPoint {
+    CopyPoint {
+        row: mouse_row
+            .saturating_sub(inner.y)
+            .min(inner.height.saturating_sub(1)),
+        col: mouse_col
+            .saturating_sub(inner.x)
+            .min(inner.width.saturating_sub(1)),
+    }
+}
+
+fn selected_text(
+    state: &TuiSessionState,
+    selection: &CopySelection,
+    viewport_height: u16,
+) -> String {
+    let Some(pane) = state.pane(&selection.agent_id) else {
+        return String::new();
+    };
+    let grid = pane.grid();
+    let total_rows = grid.scrollback().len() + usize::from(grid.rows());
+    let visible_rows = usize::from(viewport_height).min(total_rows);
+    if visible_rows == 0 {
+        return String::new();
+    }
+    let start_history_row = total_rows.saturating_sub(visible_rows).saturating_sub(
+        pane.scroll_offset()
+            .min(total_rows.saturating_sub(visible_rows)),
+    );
+
+    let (start, end) = selection.normalized();
+    let mut lines = Vec::new();
+    for row in start.row..=end.row {
+        let mut line = String::new();
+        let first_col = if row == start.row { start.col } else { 0 };
+        let last_col = if row == end.row {
+            end.col
+        } else {
+            grid.cols().saturating_sub(1)
+        };
+        let history_row = start_history_row + usize::from(row);
+        for col in first_col..=last_col.min(grid.cols().saturating_sub(1)) {
+            if let Some(ch) = visible_cell_char(grid, history_row, col) {
+                line.push(ch);
+            }
+        }
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+fn visible_cell_char(
+    grid: &agentmux_terminal::ScreenGrid,
+    history_row: usize,
+    col: u16,
+) -> Option<char> {
+    let scrollback_rows = grid.scrollback().len();
+    if history_row < scrollback_rows {
+        return grid
+            .scrollback()
+            .get(history_row)
+            .and_then(|line| line.cells().get(usize::from(col)))
+            .map(|cell| cell.ch);
+    }
+    let grid_row = history_row.checked_sub(scrollback_rows)?;
+    let grid_row = u16::try_from(grid_row).ok()?;
+    grid.cell(grid_row, col).map(|cell| cell.ch)
+}
+
+fn scroll_pane_at(
+    state: &mut TuiSessionState,
+    terminal_cols: u16,
+    terminal_rows: u16,
+    mouse_col: u16,
+    mouse_row: u16,
+    delta: isize,
+) -> bool {
+    let area = Rect::new(0, 0, terminal_cols, terminal_rows);
+    let target = state
+        .layout()
+        .pane_rects(area)
+        .into_iter()
+        .find_map(|(agent_id, rect)| rect_contains(rect, mouse_col, mouse_row).then_some(agent_id))
+        .or_else(|| state.layout().focused().map(ToOwned::to_owned));
+    let Some(agent_id) = target else {
+        return false;
+    };
+    !matches!(state.scroll_pane(&agent_id, delta), StateChange::Ignored)
+}
+
+fn rect_contains(rect: Rect, col: u16, row: u16) -> bool {
+    col >= rect.x
+        && row >= rect.y
+        && col < rect.x.saturating_add(rect.width)
+        && row < rect.y.saturating_add(rect.height)
 }
 
 fn resize_pane_sizes(
@@ -2387,6 +2659,86 @@ mod tests {
         let pane = state.pane("agent_a").expect("pane");
         assert_eq!(pane.grid().rows(), 28);
         assert_eq!(pane.grid().cols(), 88);
+    }
+
+    #[test]
+    fn mouse_scroll_helpers_target_hovered_pane() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_a", "name": "a"},
+                {"id": "agent_b", "name": "b"}
+            ]
+        }));
+
+        assert_eq!(mouse_scroll_delta(MouseEventKind::ScrollUp), Some(3));
+        assert_eq!(mouse_scroll_delta(MouseEventKind::ScrollDown), Some(-3));
+        assert!(scroll_pane_at(&mut state, 100, 24, 75, 2, 3));
+        assert_eq!(state.pane("agent_a").expect("pane a").scroll_offset(), 0);
+        assert_eq!(state.pane("agent_b").expect("pane b").scroll_offset(), 3);
+
+        assert!(scroll_pane_at(&mut state, 100, 24, 75, 2, -1));
+        assert_eq!(state.pane("agent_b").expect("pane b").scroll_offset(), 2);
+    }
+
+    #[test]
+    fn copy_mode_drag_targets_only_focused_pane_inner_area() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_a", "name": "a"},
+                {"id": "agent_b", "name": "b"}
+            ]
+        }));
+        assert!(state.layout_mut().focus("agent_b"));
+        state.resize_pane("agent_b", TuiTerminalSize { rows: 3, cols: 8 });
+        state.apply_event(&agentmux_ipc::DaemonEvent::new(
+            agentmux_ipc::protocol::IpcEventKind::PtyOutputChunk,
+            json!({ "agent_id": "agent_b", "text": "alpha\nbeta\n" }),
+        ));
+
+        let inner = focused_pane_inner_rect(&state, 20, 5).expect("focused inner rect");
+        assert_eq!(inner, Rect::new(11, 1, 8, 3));
+        let mut drag_start = None;
+
+        assert_eq!(
+            copy_mode_mouse_action(
+                &mut state,
+                20,
+                5,
+                MouseEventKind::Down(MouseButton::Left),
+                1,
+                1,
+                &mut drag_start,
+            ),
+            None
+        );
+        assert!(state.copy_selection().is_none());
+
+        assert_eq!(
+            copy_mode_mouse_action(
+                &mut state,
+                20,
+                5,
+                MouseEventKind::Down(MouseButton::Left),
+                inner.x + 1,
+                inner.y,
+                &mut drag_start,
+            ),
+            Some(CopyModeAction::Redraw)
+        );
+        assert_eq!(
+            copy_mode_mouse_action(
+                &mut state,
+                20,
+                5,
+                MouseEventKind::Up(MouseButton::Left),
+                inner.x + 3,
+                inner.y + 1,
+                &mut drag_start,
+            ),
+            Some(CopyModeAction::CopyAndExit("lpha\nbeta".to_string()))
+        );
     }
 
     #[test]

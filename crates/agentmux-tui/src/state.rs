@@ -20,6 +20,7 @@ pub struct AgentPaneState {
     process_id: Option<u32>,
     status: Option<String>,
     terminal: TerminalParser,
+    scroll_offset: usize,
     last_event: Option<IpcEventKind>,
 }
 
@@ -31,6 +32,7 @@ impl AgentPaneState {
             process_id,
             status: None,
             terminal: TerminalParser::new(size.rows, size.cols),
+            scroll_offset: 0,
             last_event: Some(IpcEventKind::AgentSpawned),
         }
     }
@@ -53,6 +55,10 @@ impl AgentPaneState {
 
     pub fn grid(&self) -> &ScreenGrid {
         self.terminal.grid()
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
     }
 
     pub fn last_event(&self) -> Option<&IpcEventKind> {
@@ -93,6 +99,7 @@ pub struct TuiSessionState {
     messages: Vec<MessageListItem>,
     provider_picker_visible: bool,
     provider_picker_selected: usize,
+    copy_selection: Option<CopySelection>,
 }
 
 impl Default for TuiSessionState {
@@ -115,6 +122,7 @@ impl TuiSessionState {
             messages: Vec::new(),
             provider_picker_visible: false,
             provider_picker_selected: 0,
+            copy_selection: None,
         }
     }
 
@@ -157,6 +165,32 @@ impl TuiSessionState {
         StateChange::UpdatedPane(agent_id.to_string())
     }
 
+    pub fn scroll_pane(&mut self, agent_id: &str, delta: isize) -> StateChange {
+        let Some(pane) = self.panes.get_mut(agent_id) else {
+            return StateChange::Ignored;
+        };
+        pane.scroll_offset = pane.scroll_offset.saturating_add_signed(delta);
+        StateChange::UpdatedPane(agent_id.to_string())
+    }
+
+    pub fn scroll_focused_pane(&mut self, delta: isize) -> StateChange {
+        let Some(agent_id) = self.layout.focused().map(ToOwned::to_owned) else {
+            return StateChange::Ignored;
+        };
+        self.scroll_pane(&agent_id, delta)
+    }
+
+    pub fn reset_focused_pane_scroll(&mut self) -> StateChange {
+        let Some(agent_id) = self.layout.focused().map(ToOwned::to_owned) else {
+            return StateChange::Ignored;
+        };
+        let Some(pane) = self.panes.get_mut(&agent_id) else {
+            return StateChange::Ignored;
+        };
+        pane.scroll_offset = 0;
+        StateChange::UpdatedPane(agent_id)
+    }
+
     pub fn last_event(&self) -> Option<&IpcEventKind> {
         self.last_event.as_ref()
     }
@@ -193,6 +227,18 @@ impl TuiSessionState {
         PROVIDER_OPTIONS
     }
 
+    pub fn copy_selection(&self) -> Option<&CopySelection> {
+        self.copy_selection.as_ref()
+    }
+
+    pub fn set_copy_selection(&mut self, selection: CopySelection) {
+        self.copy_selection = Some(selection);
+    }
+
+    pub fn clear_copy_selection(&mut self) {
+        self.copy_selection = None;
+    }
+
     pub fn focus_next(&mut self) {
         self.layout.focus_next();
     }
@@ -208,10 +254,12 @@ impl TuiSessionState {
     pub fn apply_command(&mut self, command: TuiCommand) -> CommandEffect {
         match command {
             TuiCommand::Focus(FocusDirection::Right | FocusDirection::Down) => {
+                self.clear_copy_selection();
                 self.focus_next();
                 CommandEffect::Continue
             }
             TuiCommand::Focus(FocusDirection::Left | FocusDirection::Up) => {
+                self.clear_copy_selection();
                 self.focus_previous();
                 CommandEffect::Continue
             }
@@ -299,6 +347,7 @@ impl TuiSessionState {
                 self.session_list_visible = false;
                 self.message_bus_visible = false;
                 self.provider_picker_visible = false;
+                self.clear_copy_selection();
                 CommandEffect::Continue
             }
             TuiCommand::Detach => CommandEffect::Detach,
@@ -493,6 +542,7 @@ impl TuiSessionState {
         pane.name = name;
         pane.process_id = process_id;
         pane.terminal = TerminalParser::new(rows, cols);
+        pane.scroll_offset = 0;
         if let Some(lines) = payload.get("lines").and_then(|value| value.as_array()) {
             for (row, line) in lines.iter().enumerate().take(usize::from(rows)) {
                 let Some(text) = line.as_str() else {
@@ -639,6 +689,10 @@ impl TuiSessionState {
             return StateChange::Ignored;
         };
         pane.terminal.advance(&bytes);
+        if pane.scroll_offset > 0 {
+            let max_offset = pane.terminal.grid().scrollback().len();
+            pane.scroll_offset = pane.scroll_offset.min(max_offset);
+        }
         pane.last_event = Some(event.kind.clone());
         StateChange::UpdatedPane(agent_id)
     }
@@ -717,6 +771,54 @@ pub struct ProviderOption {
     pub hint: &'static str,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CopySelection {
+    pub agent_id: String,
+    pub start: CopyPoint,
+    pub end: CopyPoint,
+}
+
+impl CopySelection {
+    pub fn new(agent_id: impl Into<String>, start: CopyPoint, end: CopyPoint) -> Self {
+        Self {
+            agent_id: agent_id.into(),
+            start,
+            end,
+        }
+    }
+
+    pub fn normalized(&self) -> (CopyPoint, CopyPoint) {
+        if (self.end.row, self.end.col) < (self.start.row, self.start.col) {
+            (self.end, self.start)
+        } else {
+            (self.start, self.end)
+        }
+    }
+
+    pub fn contains(&self, row: u16, col: u16) -> bool {
+        let (start, end) = self.normalized();
+        if row < start.row || row > end.row {
+            return false;
+        }
+        if start.row == end.row {
+            return col >= start.col && col <= end.col;
+        }
+        if row == start.row {
+            return col >= start.col;
+        }
+        if row == end.row {
+            return col <= end.col;
+        }
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CopyPoint {
+    pub row: u16,
+    pub col: u16,
+}
+
 const PROVIDER_OPTIONS: &[ProviderOption] = &[
     ProviderOption {
         provider: AgentProviderChoice::Claude,
@@ -783,16 +885,7 @@ fn endpoint_label(value: Option<&Value>) -> String {
 }
 
 fn output_bytes(payload: &serde_json::Value) -> Option<Vec<u8>> {
-    if let Some(text) = payload
-        .get("text")
-        .or_else(|| payload.get("data"))
-        .or_else(|| payload.get("chunk"))
-        .and_then(|value| value.as_str())
-    {
-        return Some(text.as_bytes().to_vec());
-    }
-
-    payload
+    if let Some(bytes) = payload
         .get("bytes")
         .and_then(|value| value.as_array())
         .map(|bytes| {
@@ -803,6 +896,20 @@ fn output_bytes(payload: &serde_json::Value) -> Option<Vec<u8>> {
                 .collect::<Vec<_>>()
         })
         .filter(|bytes| !bytes.is_empty())
+    {
+        return Some(bytes);
+    }
+
+    if let Some(text) = payload
+        .get("text")
+        .or_else(|| payload.get("data"))
+        .or_else(|| payload.get("chunk"))
+        .and_then(|value| value.as_str())
+    {
+        return Some(text.as_bytes().to_vec());
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -921,6 +1028,40 @@ mod tests {
     }
 
     #[test]
+    fn focused_pane_scroll_offset_tracks_mouse_history_navigation() {
+        let mut state =
+            TuiSessionState::default().with_terminal_size(TerminalSize { rows: 2, cols: 4 });
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::PtyOutputChunk,
+            json!({ "agent_id": "agent_001", "text": "aaaa\nbbbb\ncccc\n" }),
+        ));
+
+        let change = state.scroll_focused_pane(3);
+
+        assert_eq!(change, StateChange::UpdatedPane("agent_001".to_string()));
+        assert_eq!(state.pane("agent_001").expect("pane").scroll_offset(), 3);
+
+        state.apply_event(&event(
+            IpcEventKind::PtyOutputChunk,
+            json!({ "agent_id": "agent_001", "text": "dddd\n" }),
+        ));
+
+        let pane = state.pane("agent_001").expect("pane");
+        assert_eq!(pane.scroll_offset(), pane.grid().scrollback().len());
+
+        let previous = pane.scroll_offset();
+        state.scroll_focused_pane(-1);
+        assert_eq!(
+            state.pane("agent_001").expect("pane").scroll_offset(),
+            previous.saturating_sub(1)
+        );
+    }
+
+    #[test]
     fn resize_pane_updates_terminal_grid_dimensions() {
         let mut state =
             TuiSessionState::default().with_terminal_size(TerminalSize { rows: 2, cols: 8 });
@@ -964,6 +1105,35 @@ mod tests {
                 .line_text(0)
                 .expect("line"),
             "ABC"
+        );
+    }
+
+    #[test]
+    fn output_bytes_preserve_split_utf8_sequences() {
+        let mut state =
+            TuiSessionState::default().with_terminal_size(TerminalSize { rows: 1, cols: 4 });
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+
+        state.apply_event(&event(
+            IpcEventKind::PtyOutputChunk,
+            json!({ "agent_id": "agent_001", "bytes": [0xE2] }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::PtyOutputChunk,
+            json!({ "agent_id": "agent_001", "bytes": [0x94, 0x80] }),
+        ));
+
+        assert_eq!(
+            state
+                .pane("agent_001")
+                .expect("pane")
+                .grid()
+                .line_text(0)
+                .expect("line"),
+            "─   "
         );
     }
 

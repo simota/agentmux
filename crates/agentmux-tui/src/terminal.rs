@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use crossterm::{
     cursor,
-    event::{self, Event},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -31,6 +31,16 @@ pub trait TerminalIo {
 
     /// Poll for one terminal event without blocking longer than `timeout`.
     fn poll_event(&mut self, timeout: Duration) -> io::Result<Option<Event>>;
+
+    /// Enable or disable terminal mouse capture for app-managed pointer gestures.
+    fn set_mouse_capture(&mut self, _enabled: bool) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Copy text through OSC52 when the host terminal supports it.
+    fn copy_to_clipboard(&mut self, _text: &str) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 /// Real crossterm + ratatui implementation for interactive sessions.
@@ -82,6 +92,7 @@ impl<W: Write> TerminalIo for CrosstermTerminalIo<W> {
         let raw_mode_error = disable_raw_mode().err();
         let screen_error = execute!(
             self.terminal.backend_mut(),
+            DisableMouseCapture,
             LeaveAlternateScreen,
             cursor::Show
         )
@@ -111,6 +122,47 @@ impl<W: Write> TerminalIo for CrosstermTerminalIo<W> {
             Ok(None)
         }
     }
+
+    fn set_mouse_capture(&mut self, enabled: bool) -> io::Result<()> {
+        if enabled {
+            execute!(self.terminal.backend_mut(), EnableMouseCapture)
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)
+        }
+    }
+
+    fn copy_to_clipboard(&mut self, text: &str) -> io::Result<()> {
+        let encoded = base64_encode(text.as_bytes());
+        write!(self.terminal.backend_mut(), "\x1b]52;c;{encoded}\x07")?;
+        self.terminal.backend_mut().flush()
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let value = (u32::from(first) << 16) | (u32::from(second) << 8) | u32::from(third);
+
+        encoded.push(TABLE[((value >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((value >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[((value >> 6) & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(value & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
 }
 
 /// RAII guard for an active terminal session.
@@ -299,5 +351,14 @@ mod tests {
 
         assert!(event.is_none());
         assert_eq!(*calls.borrow(), vec![Call::Poll(timeout)]);
+    }
+
+    #[test]
+    fn base64_encoder_handles_osc52_payloads() {
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode("hello\n".as_bytes()), "aGVsbG8K");
     }
 }
