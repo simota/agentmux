@@ -30,13 +30,14 @@ use agentmux_message::{
     NewAgentMessage,
 };
 use agentmux_policy::{ApprovalEvent, ApprovalQueue, ApprovalQueueError, ApprovalRequest};
-use agentmux_pty::{CTRL_C, PtyHandle, PtySpawnSpec};
+use agentmux_pty::{CTRL_C, PtyHandle, PtyReadEvent, PtySpawnSpec};
 use agentmux_store::{EventLog, EventLogEntry};
+use agentmux_terminal::TerminalParser;
 use agentmux_worktree::{CaptureDiff, TestCommand, TestRunStatus, Worktree};
 use serde_json::json;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 use tokio::task::JoinSet;
 
 #[derive(Debug, Clone)]
@@ -83,6 +84,7 @@ impl RegisteredAgentSession {
 struct LiveAgentSession {
     metadata: RegisteredAgentSession,
     pty: Option<Mutex<PtyHandle>>,
+    terminal: Arc<Mutex<TerminalParser>>,
 }
 
 struct DaemonState {
@@ -235,14 +237,21 @@ impl DaemonRuntime {
         name: String,
         spec: PtySpawnSpec,
     ) -> Result<RegisteredAgentSession> {
+        let terminal = Arc::new(Mutex::new(TerminalParser::new(
+            spec.size.rows,
+            spec.size.cols,
+        )));
         let pty = PtyHandle::spawn(spec)?;
+        let read_loop = pty.spawn_read_loop(16)?;
         let agent = RegisteredAgentSession::new(name.clone(), pty.process_id());
+        self.spawn_pty_output_forwarder(agent.id.clone(), terminal.clone(), read_loop);
         let mut state = self.state.write().await;
         state.agents.insert(
             agent.id.clone(),
             LiveAgentSession {
                 metadata: agent.clone(),
                 pty: Some(Mutex::new(pty)),
+                terminal,
             },
         );
         state.messages.register_agent(AgentDescriptor::new(
@@ -259,6 +268,46 @@ impl DaemonRuntime {
             }),
         ));
         Ok(agent)
+    }
+
+    fn spawn_pty_output_forwarder(
+        &self,
+        agent_id: AgentSessionId,
+        terminal: Arc<Mutex<TerminalParser>>,
+        mut read_loop: agentmux_pty::PtyReadLoop,
+    ) {
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            while let Some(event) = read_loop.recv().await {
+                match event {
+                    PtyReadEvent::Output(bytes) => {
+                        if let Ok(mut terminal) = terminal.lock() {
+                            terminal.advance(&bytes);
+                        }
+                        let text = String::from_utf8_lossy(&bytes).into_owned();
+                        let _ = events.send(DaemonEvent::new(
+                            IpcEventKind::PtyOutputChunk,
+                            json!({
+                                "agent_id": agent_id.to_string(),
+                                "text": text,
+                            }),
+                        ));
+                    }
+                    PtyReadEvent::Eof => break,
+                    PtyReadEvent::Error(error) => {
+                        let _ = events.send(DaemonEvent::new(
+                            IpcEventKind::AgentStatusSignal,
+                            json!({
+                                "agent_id": agent_id.to_string(),
+                                "signal": "pty_read_error",
+                                "error": error,
+                            }),
+                        ));
+                        break;
+                    }
+                }
+            }
+        });
     }
 
     pub async fn attach_client(
@@ -723,6 +772,37 @@ impl DaemonRuntime {
         detached_agent_id
     }
 
+    pub async fn snapshot_agent(&self, agent_id: &AgentSessionId) -> Result<serde_json::Value> {
+        let state = self.state.read().await;
+        let Some(agent) = state.agents.get(agent_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        };
+        let metadata = agent.metadata.clone();
+        let terminal = agent.terminal.clone();
+        drop(state);
+
+        let terminal = terminal.lock().map_err(|_| {
+            AgentmuxError::Internal(format!(
+                "terminal buffer lock for agent '{agent_id}' is poisoned"
+            ))
+        })?;
+        let grid = terminal.grid();
+        let lines = (0..grid.rows())
+            .filter_map(|row| grid.line_text(row))
+            .collect::<Vec<_>>();
+
+        Ok(json!({
+            "agent_id": metadata.id.to_string(),
+            "name": metadata.name,
+            "process_id": metadata.process_id,
+            "rows": grid.rows(),
+            "cols": grid.cols(),
+            "lines": lines,
+        }))
+    }
+
     pub async fn status_payload(&self) -> serde_json::Value {
         let state = self.state.read().await;
         let agents: Vec<_> = state
@@ -1001,6 +1081,7 @@ impl LiveAgentSession {
         Self {
             metadata,
             pty: None,
+            terminal: Arc::new(Mutex::new(TerminalParser::default())),
         }
     }
 }
@@ -1155,6 +1236,7 @@ pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result
     let mut reader = JsonlReader::new(BufReader::new(reader));
     let mut events = runtime.subscribe();
     let (frames, mut frame_receiver) = mpsc::channel::<ServerFrame>(32);
+    let (attached, mut attached_events) = watch::channel(false);
 
     let writer_task = tokio::spawn(async move {
         let mut writer = JsonlWriter::new(writer);
@@ -1172,6 +1254,9 @@ pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result
         loop {
             match events.recv().await {
                 Ok(event) => {
+                    if !*attached_events.borrow_and_update() {
+                        continue;
+                    }
                     if event_frames.send(ServerFrame::Event(event)).await.is_err() {
                         break;
                     }
@@ -1213,8 +1298,19 @@ pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result
         .insert(client_id.clone(), None);
 
     while let Some(request) = reader.read::<ClientRequest>().await? {
+        let command = request.command.clone();
+        if matches!(command, IpcCommand::ClientAttach | IpcCommand::AgentFocus) {
+            let _ = attached.send(true);
+        } else if command == IpcCommand::ClientDetach {
+            let _ = attached.send(false);
+        }
         let response = handle_request(&runtime, &client_id, request).await;
+        let attach_failed =
+            matches!(command, IpcCommand::ClientAttach | IpcCommand::AgentFocus) && !response.ok;
         send_frame(&frames, ServerFrame::Response(response)).await?;
+        if attach_failed {
+            let _ = attached.send(false);
+        }
     }
 
     runtime.detach_client(&client_id).await;
@@ -1414,6 +1510,24 @@ async fn handle_request(
                 Err(error) => DaemonResponse::error(
                     request.id,
                     ErrorBody::new("AGENT_INTERRUPT_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::AgentSnapshot => {
+            let agent_id = match agent_id_payload(&request.payload, "agent.snapshot") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.snapshot_agent(&agent_id).await {
+                Ok(payload) => DaemonResponse::ok(request.id, payload),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("AGENT_SNAPSHOT_FAILED", error.to_string()),
                 ),
             }
         }
@@ -2344,8 +2458,17 @@ fn json_error(error: serde_json::Error) -> AgentmuxError {
 }
 
 fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<PtySpawnSpec>> {
-    let Some(command) = payload.get("command").and_then(|value| value.as_str()) else {
-        return Ok(None);
+    let command = match payload.get("command").and_then(|value| value.as_str()) {
+        Some(command) => command.to_string(),
+        // No explicit command: derive the launch command from the provider so a
+        // bare `shell` pane (or claude/codex) actually gets a live PTY instead of
+        // a metadata-only session that nothing can be typed into (spec §05 adapters).
+        None => match payload.get("provider").and_then(|value| value.as_str()) {
+            Some("shell") => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+            Some("claude") => "claude".to_string(),
+            Some("codex") => "codex".to_string(),
+            _ => return Ok(None),
+        },
     };
 
     let args = payload
@@ -2363,7 +2486,7 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
         .unwrap_or(std::env::current_dir().map_err(|error| {
             AgentmuxError::Internal(format!("failed to resolve current directory: {error}"))
         })?);
-    let env = payload
+    let mut env: BTreeMap<String, String> = payload
         .get("env")
         .map(|value| serde_json::from_value(value.clone()))
         .transpose()
@@ -2371,6 +2494,13 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
             AgentmuxError::UserError(format!("agent.spawn env must be a string map: {error}"))
         })?
         .unwrap_or_default();
+    // A spawned shell/agent needs a usable environment (PATH, HOME, ...). When the
+    // caller does not pass env, inherit the daemon's; always ensure TERM is set.
+    if env.is_empty() {
+        env = std::env::vars().collect();
+    }
+    env.entry("TERM".to_string())
+        .or_insert_with(|| "xterm-256color".to_string());
     let size = payload
         .get("size")
         .map(|value| serde_json::from_value(value.clone()))
@@ -2383,7 +2513,7 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
         .unwrap_or_default();
 
     Ok(Some(PtySpawnSpec {
-        command: command.to_string(),
+        command,
         args,
         cwd,
         env,
@@ -2402,6 +2532,36 @@ mod tests {
     use agentmux_core::InputScriptId;
     use agentmux_ipc::{IpcCommand, JsonlReader, JsonlWriter};
     use agentmux_store::EventLog;
+
+    #[test]
+    fn shell_provider_without_command_maps_to_a_live_pty_spec() {
+        // Regression: a bare `shell` spawn carries no `command`, which used to
+        // fall through to a PTY-less metadata session ("nothing can be typed in").
+        let spec = pty_spawn_spec_from_payload(&json!({
+            "provider": "shell",
+            "role": "shell",
+            "name": "shell",
+        }))
+        .expect("spec builds")
+        .expect("shell provider yields a live PTY spec");
+
+        assert!(!spec.command.is_empty(), "shell command resolved");
+        assert!(spec.env.contains_key("TERM"), "TERM is set for the shell");
+        assert!(
+            spec.env.contains_key("PATH"),
+            "daemon environment is inherited so the shell is usable"
+        );
+    }
+
+    #[test]
+    fn unknown_provider_without_command_stays_metadata_only() {
+        let spec =
+            pty_spawn_spec_from_payload(&json!({ "provider": "mystery" })).expect("spec builds");
+        assert!(
+            spec.is_none(),
+            "unknown provider with no command is metadata-only"
+        );
+    }
 
     #[tokio::test]
     async fn runtime_registers_attaches_and_detaches_client() {
@@ -2485,13 +2645,13 @@ mod tests {
             .await
             .unwrap();
 
-        let (spawn_response, spawned_event) = read_response_and_event(&mut reader).await;
+        let spawn_response = read_response(&mut reader).await;
         assert!(spawn_response.ok);
         let agent_id = spawn_response.payload.unwrap()["agent_id"]
             .as_str()
             .unwrap()
             .to_string();
-        assert_eq!(spawned_event.kind, IpcEventKind::AgentSpawned);
+        assert_no_frame(&mut reader).await;
 
         writer
             .write(&ClientRequest::new(
@@ -2507,16 +2667,106 @@ mod tests {
 
         writer
             .write(&ClientRequest::new(
+                "req_spawn_after_attach",
+                IpcCommand::AgentSpawn,
+                json!({ "name": "tester" }),
+            ))
+            .await
+            .unwrap();
+        let (second_spawn_response, second_spawn_event) =
+            read_response_and_event(&mut reader).await;
+        assert!(second_spawn_response.ok);
+        assert_eq!(second_spawn_event.kind, IpcEventKind::AgentSpawned);
+
+        writer
+            .write(&ClientRequest::new(
                 "req_detach",
                 IpcCommand::ClientDetach,
                 json!({}),
             ))
             .await
             .unwrap();
-        let (detach_response, detach_event) = read_response_and_event(&mut reader).await;
+        let detach_response = read_response(&mut reader).await;
         assert!(detach_response.ok);
-        assert_eq!(detach_event.kind, IpcEventKind::ClientDetached);
 
+        runtime.register_agent("after-detach".to_string()).await;
+        assert_no_frame(&mut reader).await;
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_agent_snapshot_restores_existing_terminal_buffer() {
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_spawn",
+                IpcCommand::AgentSpawn,
+                json!({
+                    "name": "snapshot-shell",
+                    "command": "/bin/sh",
+                    "args": ["-c", "printf snapshot-ready; sleep 1"],
+                    "cwd": std::env::current_dir().unwrap(),
+                    "env": { "TERM": "xterm-256color" },
+                    "size": { "rows": 2, "cols": 20 },
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let spawn_response = read_response(&mut reader).await;
+        assert!(spawn_response.ok);
+        let agent_id = spawn_response.payload.unwrap()["agent_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let mut snapshot_response = None;
+        for _ in 0..40 {
+            writer
+                .write(&ClientRequest::new(
+                    "req_snapshot",
+                    IpcCommand::AgentSnapshot,
+                    json!({ "agent_id": agent_id }),
+                ))
+                .await
+                .unwrap();
+            let response = read_response(&mut reader).await;
+            assert!(response.ok, "snapshot response was {response:?}");
+            let contains_output = response
+                .payload
+                .as_ref()
+                .and_then(|payload| payload["lines"].as_array())
+                .is_some_and(|lines| {
+                    lines.iter().any(|line| {
+                        line.as_str()
+                            .is_some_and(|text| text.contains("snapshot-ready"))
+                    })
+                });
+            if contains_output {
+                snapshot_response = Some(response);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snapshot_response = snapshot_response.expect("snapshot output should be captured");
+
+        let payload = snapshot_response.payload.unwrap();
+        assert_eq!(payload["agent_id"], agent_id);
+        assert_eq!(payload["rows"], 2);
+        assert_eq!(payload["cols"], 20);
+
+        terminate_agent_process(&runtime, &agent_id).await;
         server.abort();
     }
 
@@ -2549,7 +2799,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (spawn_response, _) = read_response_and_event(&mut reader).await;
+        let spawn_response = read_response(&mut reader).await;
         assert!(spawn_response.ok);
         let spawn_payload = spawn_response.payload.unwrap();
         let agent_id = spawn_payload["agent_id"].as_str().unwrap().to_string();
@@ -2628,11 +2878,23 @@ mod tests {
             ))
             .await
             .unwrap();
-        let (spawn_response, _) = read_response_and_event(&mut reader).await;
+        let spawn_response = read_response(&mut reader).await;
+        assert!(spawn_response.ok);
         let agent_id = spawn_response.payload.unwrap()["agent_id"]
             .as_str()
             .unwrap()
             .to_string();
+        writer
+            .write(&ClientRequest::new(
+                "req_attach",
+                IpcCommand::ClientAttach,
+                json!({ "agent_id": agent_id }),
+            ))
+            .await
+            .unwrap();
+        let (attach_response, attach_event) = read_response_and_event(&mut reader).await;
+        assert!(attach_response.ok);
+        assert_eq!(attach_event.kind, IpcEventKind::ClientAttached);
 
         writer
             .write(&ClientRequest::new(
@@ -2752,11 +3014,23 @@ mod tests {
             ))
             .await
             .unwrap();
-        let (spawn_response, _) = read_response_and_event(&mut reader).await;
+        let spawn_response = read_response(&mut reader).await;
+        assert!(spawn_response.ok);
         let agent_id = spawn_response.payload.unwrap()["agent_id"]
             .as_str()
             .unwrap()
             .to_string();
+        writer
+            .write(&ClientRequest::new(
+                "req_attach",
+                IpcCommand::ClientAttach,
+                json!({ "agent_id": agent_id }),
+            ))
+            .await
+            .unwrap();
+        let (attach_response, attach_event) = read_response_and_event(&mut reader).await;
+        assert!(attach_response.ok);
+        assert_eq!(attach_event.kind, IpcEventKind::ClientAttached);
 
         writer
             .write(&ClientRequest::new(
@@ -2953,6 +3227,9 @@ mod tests {
             std::env::temp_dir().join(format!("agentmux-worktree-ipc-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("temporary worktree root is created");
         let runtime = DaemonRuntime::new(16);
+        let attached_agent = runtime
+            .register_agent("worktree-observer".to_string())
+            .await;
         let worktree = Worktree {
             id: WorktreeId::new(),
             project_id: ProjectId::new(),
@@ -2977,6 +3254,18 @@ mod tests {
         let mut writer = JsonlWriter::new(writer);
 
         writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_attach",
+                IpcCommand::ClientAttach,
+                json!({ "agent_id": attached_agent.id.to_string() }),
+            ))
+            .await
+            .unwrap();
+        let (attach_response, attach_event) = read_response_and_event(&mut reader).await;
+        assert!(attach_response.ok);
+        assert_eq!(attach_event.kind, IpcEventKind::ClientAttached);
+
         writer
             .write(&ClientRequest::new(
                 "req_worktree_list",
@@ -3104,6 +3393,9 @@ mod tests {
     #[tokio::test]
     async fn ipc_approval_commands_list_approve_and_reject() {
         let runtime = DaemonRuntime::new(16);
+        let attached_agent = runtime
+            .register_agent("approval-observer".to_string())
+            .await;
         let approve_request = runtime
             .submit_approval_request(ApprovalRequest::command(
                 agentmux_core::ApprovalKind::ShellCommand,
@@ -3129,6 +3421,18 @@ mod tests {
         let mut writer = JsonlWriter::new(writer);
 
         writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_attach",
+                IpcCommand::ClientAttach,
+                json!({ "agent_id": attached_agent.id.to_string() }),
+            ))
+            .await
+            .unwrap();
+        let (attach_response, attach_event) = read_response_and_event(&mut reader).await;
+        assert!(attach_response.ok);
+        assert_eq!(attach_event.kind, IpcEventKind::ClientAttached);
+
         writer
             .write(&ClientRequest::new(
                 "req_approval_list",
@@ -3251,17 +3555,19 @@ mod tests {
             .write(&ClientRequest::new(
                 "req_spawn",
                 IpcCommand::AgentSpawn,
-                json!({ "name": "reviewer", "provider": "codex", "role": "reviewer" }),
+                // No provider/command → metadata-only agent (no live PTY), which is
+                // exactly what the interrupt-failure path below needs to exercise.
+                json!({ "name": "reviewer", "role": "reviewer" }),
             ))
             .await
             .unwrap();
-        let (spawn_response, spawned_event) = read_response_and_event(&mut reader).await;
+        let spawn_response = read_response(&mut reader).await;
         assert!(spawn_response.ok);
-        assert_eq!(spawned_event.kind, IpcEventKind::AgentSpawned);
         let agent_id = spawn_response.payload.unwrap()["agent_id"]
             .as_str()
             .unwrap()
             .to_string();
+        assert_no_frame(&mut reader).await;
 
         writer
             .write(&ClientRequest::new(
@@ -3595,6 +3901,34 @@ mod tests {
             }
         }
         (response.unwrap(), event.unwrap())
+    }
+
+    async fn read_response<R>(reader: &mut JsonlReader<R>) -> DaemonResponse
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let frame: serde_json::Value = tokio::time::timeout(Duration::from_secs(2), reader.read())
+            .await
+            .expect("response frame is not timed out")
+            .expect("response frame is readable")
+            .expect("response frame exists");
+        assert!(
+            frame.get("ok").is_some(),
+            "expected response frame, got {frame:?}"
+        );
+        serde_json::from_value(frame).expect("response frame is valid")
+    }
+
+    async fn assert_no_frame<R>(reader: &mut JsonlReader<R>)
+    where
+        R: tokio::io::AsyncBufRead + Unpin,
+    {
+        let frame = tokio::time::timeout(
+            Duration::from_millis(50),
+            reader.read::<serde_json::Value>(),
+        )
+        .await;
+        assert!(frame.is_err(), "unexpected daemon frame: {frame:?}");
     }
 
     async fn terminate_agent_process(runtime: &DaemonRuntime, agent_id: &str) {

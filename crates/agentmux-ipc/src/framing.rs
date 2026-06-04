@@ -120,7 +120,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::{ClientRequest, IpcCommand};
+    use crate::protocol::{
+        ClientRequest, DaemonEvent, DaemonResponse, DaemonStreamFrame, IpcCommand, IpcEventKind,
+    };
     use serde_json::json;
     use tokio::io::{AsyncWriteExt, BufReader, duplex};
 
@@ -175,5 +177,33 @@ mod tests {
 
         let error = writer.write(&request).await.unwrap_err();
         assert!(error.to_string().contains("JSONL frame exceeds"));
+    }
+
+    #[tokio::test]
+    async fn reads_mixed_daemon_stream_frames() {
+        let (client, server) = duplex(4096);
+        let mut writer = JsonlWriter::new(client);
+        let mut reader = JsonlReader::new(BufReader::new(server));
+
+        writer
+            .write(&DaemonStreamFrame::from(DaemonResponse::ok(
+                "req_attach",
+                json!({ "client_id": "client_001" }),
+            )))
+            .await
+            .unwrap();
+        writer
+            .write(&DaemonStreamFrame::from(DaemonEvent::new(
+                IpcEventKind::AgentSpawned,
+                json!({ "agent_id": "agent_001" }),
+            )))
+            .await
+            .unwrap();
+
+        let first: DaemonStreamFrame = reader.read().await.unwrap().unwrap();
+        let second: DaemonStreamFrame = reader.read().await.unwrap().unwrap();
+
+        assert!(matches!(first, DaemonStreamFrame::Response(_)));
+        assert!(matches!(second, DaemonStreamFrame::Event(_)));
     }
 }

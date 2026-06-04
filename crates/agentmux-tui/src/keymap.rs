@@ -17,10 +17,11 @@ pub enum FocusDirection {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TuiCommand {
     Detach,
+    Quit,
     Help,
     ToggleZoom,
     Focus(FocusDirection),
-    ShowTaskTree,
+    ShowSessionList,
     ShowAgentList,
     ShowMessageBus,
     ShowContextBoard,
@@ -37,6 +38,10 @@ pub enum TuiCommand {
     RunTests,
     InterruptAgent,
     CommandPalette,
+    SessionListNext,
+    SessionListPrevious,
+    FocusSelectedSession,
+    CloseOverlay,
 }
 
 /// Result of routing one terminal key event.
@@ -78,6 +83,14 @@ impl KeymapDispatcher {
     }
 
     pub fn dispatch(&mut self, key: KeyEvent) -> KeyDispatch {
+        self.dispatch_with_session_list(key, false)
+    }
+
+    pub fn dispatch_with_session_list(
+        &mut self,
+        key: KeyEvent,
+        session_list_visible: bool,
+    ) -> KeyDispatch {
         if matches!(key.kind, KeyEventKind::Release) {
             return KeyDispatch::Consumed;
         }
@@ -90,6 +103,12 @@ impl KeymapDispatcher {
         if self.awaiting_prefix_command {
             self.awaiting_prefix_command = false;
             return prefix_command(key)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        if session_list_visible {
+            return session_list_command(key)
                 .map(KeyDispatch::Command)
                 .unwrap_or(KeyDispatch::Consumed);
         }
@@ -120,6 +139,23 @@ impl KeyBinding {
     }
 }
 
+fn session_list_command(key: KeyEvent) -> Option<TuiCommand> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some(TuiCommand::SessionListNext),
+        KeyCode::Up | KeyCode::Char('k') => Some(TuiCommand::SessionListPrevious),
+        KeyCode::Enter => Some(TuiCommand::FocusSelectedSession),
+        KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
+        _ => None,
+    }
+}
+
 fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
     if key
         .modifiers
@@ -130,13 +166,14 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
 
     match key.code {
         KeyCode::Char('d') => Some(TuiCommand::Detach),
+        KeyCode::Char('q') => Some(TuiCommand::Quit),
         KeyCode::Char('?') => Some(TuiCommand::Help),
         KeyCode::Char('z') => Some(TuiCommand::ToggleZoom),
         KeyCode::Left => Some(TuiCommand::Focus(FocusDirection::Left)),
         KeyCode::Right => Some(TuiCommand::Focus(FocusDirection::Right)),
         KeyCode::Up => Some(TuiCommand::Focus(FocusDirection::Up)),
         KeyCode::Down => Some(TuiCommand::Focus(FocusDirection::Down)),
-        KeyCode::Char('s') => Some(TuiCommand::ShowTaskTree),
+        KeyCode::Char('s') => Some(TuiCommand::ShowSessionList),
         KeyCode::Char('a') => Some(TuiCommand::ShowAgentList),
         KeyCode::Char('m') => Some(TuiCommand::ShowMessageBus),
         KeyCode::Char('c') => Some(TuiCommand::ShowContextBoard),
@@ -222,6 +259,87 @@ mod tests {
 
         assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ToggleZoom));
         assert!(!dispatcher.is_awaiting_prefix_command());
+    }
+
+    #[test]
+    fn prefixed_q_maps_to_quit_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Quit));
+    }
+
+    #[test]
+    fn prefixed_question_mark_maps_to_help_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('?'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Help));
+    }
+
+    #[test]
+    fn prefixed_s_maps_to_session_list_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ShowSessionList));
+    }
+
+    #[test]
+    fn bare_q_is_forwarded_to_focused_pane() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::ForwardToFocusedPane(b"q".to_vec()));
+    }
+
+    #[test]
+    fn session_list_keys_map_to_selection_commands_when_visible() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Down, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::SessionListNext)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Up, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::SessionListPrevious)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Enter, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::FocusSelectedSession)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Esc, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::CloseOverlay)
+        );
+    }
+
+    #[test]
+    fn session_list_consumes_regular_keys_when_visible() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        let dispatch = dispatcher
+            .dispatch_with_session_list(key(KeyCode::Char('a'), KeyModifiers::NONE), true);
+
+        assert_eq!(dispatch, KeyDispatch::Consumed);
+    }
+
+    #[test]
+    fn prefixed_x_maps_to_close_pane_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('x'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ClosePane));
     }
 
     #[test]

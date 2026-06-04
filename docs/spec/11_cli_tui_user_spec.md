@@ -9,6 +9,7 @@ CLIはnon-interactive操作、daemon操作、task起動、message/context操作�
 ```bash
 agentmux --help
 agentmux doctor
+agentmux sessions
 agentmux attach [task|session]
 agentmux daemon start|stop|status
 agentmux project init|open|status
@@ -58,7 +59,15 @@ agentmux attach task-123
 
 既存task sessionへ再接続する。
 
-### 3.4 send message
+### 3.4 sessions
+
+```bash
+agentmux sessions
+```
+
+起動中のinteractive sessionを一覧表示する。
+
+### 3.5 send message
 
 ```bash
 agentmux send impl-codex "testerの失敗ログを確認してください"
@@ -70,7 +79,7 @@ agentmux send impl-codex "testerの失敗ログを確認してください"
 agentmux message send --to role:reviewer --kind ReviewComment --context ctx_123 "このdiffをレビューしてください"
 ```
 
-### 3.5 inject
+### 3.6 inject
 
 ```bash
 agentmux message inject msg_123 --to impl-codex
@@ -119,7 +128,7 @@ Ctrl-g d        detach
 Ctrl-g ?        help
 Ctrl-g z        zoom current pane
 Ctrl-g arrow    focus pane
-Ctrl-g s        task/session tree
+Ctrl-g s        running session list
 Ctrl-g a        agent list
 Ctrl-g m        message bus
 Ctrl-g c        context board
@@ -145,6 +154,14 @@ Ctrl-g R        request AGENTMUX_RESULT/status
 Ctrl-g C        attach context to current agent
 Ctrl-g T        run tests for current worktree
 Ctrl-g I        interrupt current agent
+```
+
+Running session list操作:
+
+```text
+Up/Down, j/k    move selection
+Enter           focus selected session
+Esc, q          close list
 ```
 
 ## 7. Command palette
