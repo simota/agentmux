@@ -166,6 +166,7 @@ agentmux message history --kind handoff
 | WorktreeDiff | diff表示 |
 | TaskTimeline | event timeline |
 | AgentList | agent状態一覧 |
+| ActivityFeed | live activity feed（sitrep header + event tail）。Cargofeature `activity-feed` が必要。 |
 
 ## 6. Keymap
 
@@ -183,6 +184,7 @@ Ctrl-g a        agent list
 Ctrl-g m        message bus
 Ctrl-g c        context board
 Ctrl-g A        approval queue
+Ctrl-g f        activity feed toggle（feature: activity-feed）
 ```
 
 ### 6.2 Pane操作
@@ -230,6 +232,25 @@ Message history表示:
 compact: delivery_status / kind / message_id / created_at, route, body
 detail: delivery_status, kind, message_id, created_at, from, to, body
 ```
+
+## 6.4 Activity Feed操作
+
+`Ctrl-g f` でActivityFeed paneをトグルする（Cargo feature `activity-feed` が必要）。
+
+```text
+j / Down    次のeventを選択
+k / Up      前のeventを選択
+Enter       選択中のeventに紐づくagent paneへfocus
+Esc / q     paneを閉じる
+```
+
+Activity Feed paneの構成:
+
+- **sitrep header**: 全live sessionのAgentStatus集約。要介入状態（`awaiting_input` / `needs_human` / `awaiting_approval` / `blocked` / `stalled`）を上位ソートして表示。
+- **event tail**: actor / action / target を正規化して表示。最大500件のring buffer。PTY output chunkとscreen diffは表示から除外。
+- **tail追従**: 末尾のentryを選択しているときのみ自動追従する。
+
+daemon側のprotocol versionが`EVENT_SUBSCRIBE_PROTOCOL_VERSION`未満の場合、`event.subscribe`は送らず "Activity Feed unsupported by this daemon" をnoticeとして表示し、TUIは落とさない。
 
 ## 7. Command palette
 
