@@ -56,7 +56,7 @@ agentmux project install-result-protocol .
 agentmux project install-result-protocol --global
 ```
 
-ローカル実行では、指定ディレクトリに既存の `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` がある場合だけ `agentmux result protocol` を追記する。既に同じ managed marker がある場合は、その marker 範囲を最新の `agentmux result protocol` に置換する。これにより、再実行で `messages[]` の使い方、message受信時の返信必須ルール、3往復以上続くagent間対話で人間確認を求めるルール、2セッション間の対話例、確認手順が最新化される。
+ローカル実行では、指定ディレクトリに既存の `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` がある場合だけ `agentmux result protocol` を追記する。既に同じ managed marker がある場合は、その marker 範囲を最新の `agentmux result protocol` に置換する。これにより、再実行で `messages[]` の使い方、message受信時の返信必須ルール、通常返信では送信前確認を求めないルール、一定回数以上続くagent間対話でのみ人間確認を求めるルール、2セッション間の対話例、確認手順が最新化される。人間確認を求める往復回数は `AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS` で指定でき、未設定時は `3`。
 
 `--global` は以下のグローバル指示ファイルへ設定する。
 
@@ -111,6 +111,8 @@ agentmux send impl-codex "testerの失敗ログを確認してください"
 ```bash
 agentmux message send --to role:reviewer --kind ReviewComment --context ctx_123 "このdiffをレビューしてください"
 ```
+
+message送信は既定でinjectする。つまりmessageは保存された後、宛先sessionが解決できれば入力可能なタイミングでagent paneへ注入される。保存だけにしたい場合は `--no-inject` を指定する。互換性のため `--inject` も受け付けるが、既定と同じ挙動になる。
 
 ### 3.6 inject
 
