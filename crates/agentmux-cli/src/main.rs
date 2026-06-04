@@ -9,7 +9,8 @@ use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentmux_core::{AgentmuxConfig, AgentmuxError, error::Result};
 use agentmux_ipc::{
@@ -44,6 +45,7 @@ const DEFAULT_PROJECT_CONFIG: &str =
     include_str!("../../../docs/config/agentmux.config.example.toml");
 const RESULT_PROTOCOL_MARKER_START: &str = "<!-- agentmux-result-protocol:start -->";
 const RESULT_PROTOCOL_MARKER_END: &str = "<!-- agentmux-result-protocol:end -->";
+static AGENT_NAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const RESULT_PROTOCOL_BLOCK: &str = r#"<!-- agentmux-result-protocol:start -->
 ## agentmux result protocol
 
@@ -64,7 +66,11 @@ AGENTMUX_RESULT:
 
 Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
 
-Agent sessions register a role at startup. Prefer role targets (`role:tester`, `role:implementer`, `role:reviewer`) instead of session ids or display names unless a specific id is required. Check available sessions and roles with `Ctrl-g s` in the TUI or `agentmux sessions`.
+Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind prevents the result messages from being stored.
+
+Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
+
+Each live session receives its own identity through environment variables: `AGENTMUX_AGENT_NAME`, `AGENTMUX_AGENT_ROLE`, and `AGENTMUX_AGENT_ID`. Use `AGENTMUX_AGENT_NAME` when another session needs to reply to exactly this session.
 
 ```json
 {
@@ -107,7 +113,7 @@ AGENTMUX_RESULT:
   "changed_files": [],
   "messages": [
     {
-      "to": "role:implementer",
+      "to": "agent:codex-a1b2c3",
       "kind": "Finding",
       "body": "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal.",
       "priority": "normal"
@@ -837,7 +843,7 @@ fn agent_spawn_for_provider_request_with_size(
     let mut payload = json!({
         "provider": provider.provider(),
         "role": "implementer",
-        "name": provider.default_name(),
+        "name": unique_agent_name(provider.default_name()),
     });
     if let Some(size) = size {
         payload["size"] = json!({
@@ -867,9 +873,52 @@ fn agent_spawn_request(provider: String, role: String) -> Result<ClientRequest> 
         json!({
             "provider": provider,
             "role": role,
-            "name": role,
+            "name": unique_agent_name(&role),
         }),
     ))
+}
+
+fn unique_agent_name(prefix: &str) -> String {
+    let prefix = sanitize_agent_name_prefix(prefix);
+    let sequence = AGENT_NAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as u64;
+    let entropy = nanos ^ ((std::process::id() as u64) << 32) ^ sequence;
+    format!("{prefix}-{}", base36_suffix(entropy, 6))
+}
+
+fn sanitize_agent_name_prefix(prefix: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_separator = false;
+    for ch in prefix.trim().chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch.to_ascii_lowercase());
+            last_was_separator = false;
+        } else if !last_was_separator && !output.is_empty() {
+            output.push('-');
+            last_was_separator = true;
+        }
+    }
+    while output.ends_with('-') {
+        output.pop();
+    }
+    if output.is_empty() {
+        "agent".to_string()
+    } else {
+        output
+    }
+}
+
+fn base36_suffix(mut value: u64, len: usize) -> String {
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut chars = vec!['0'; len];
+    for slot in chars.iter_mut().rev() {
+        *slot = DIGITS[(value % 36) as usize] as char;
+        value /= 36;
+    }
+    chars.into_iter().collect()
 }
 
 fn agent_stop_request(agent_id: String) -> ClientRequest {
@@ -881,6 +930,11 @@ fn agent_stop_request(agent_id: String) -> ClientRequest {
 }
 
 fn agent_send_request(agent_id: String, body: String) -> Result<ClientRequest> {
+    if agent_id.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "agent message target must not be empty".to_string(),
+        ));
+    }
     if body.trim().is_empty() {
         return Err(AgentmuxError::UserError(
             "agent message body must not be empty".to_string(),
@@ -890,13 +944,22 @@ fn agent_send_request(agent_id: String, body: String) -> Result<ClientRequest> {
         "req_agent_send",
         IpcCommand::MessageCreate,
         json!({
-            "to": agent_id,
+            "to": normalize_agent_target(&agent_id),
             "body": body,
             "kind": "handoff",
             "priority": "normal",
             "delivery_mode": "inject_when_idle",
         }),
     ))
+}
+
+fn normalize_agent_target(raw: &str) -> String {
+    let target = raw.trim();
+    if target.starts_with("agent:") {
+        target.to_string()
+    } else {
+        format!("agent:{target}")
+    }
 }
 
 fn agent_inject_request(message_id: String, agent_id: String) -> ClientRequest {
@@ -2582,7 +2645,9 @@ mod tests {
         assert_eq!(request.command, IpcCommand::AgentSpawn);
         assert_eq!(request.payload["provider"], "codex");
         assert_eq!(request.payload["role"], "implementer");
-        assert_eq!(request.payload["name"], "codex");
+        let name = request.payload["name"].as_str().unwrap();
+        assert!(name.starts_with("codex-"));
+        assert_eq!(name.len(), "codex-".len() + 6);
     }
 
     #[test]
@@ -2593,7 +2658,9 @@ mod tests {
         assert_eq!(request.command, IpcCommand::AgentSpawn);
         assert_eq!(request.payload["provider"], "agy");
         assert_eq!(request.payload["role"], "implementer");
-        assert_eq!(request.payload["name"], "agy");
+        let name = request.payload["name"].as_str().unwrap();
+        assert!(name.starts_with("agy-"));
+        assert_eq!(name.len(), "agy-".len() + 6);
     }
 
     #[test]
@@ -3223,7 +3290,13 @@ mod tests {
         assert_eq!(spawn.command, IpcCommand::AgentSpawn);
         assert_eq!(spawn.payload["provider"], "codex");
         assert_eq!(spawn.payload["role"], "implementer");
-        assert_eq!(spawn.payload["name"], "implementer");
+        let spawn_name = spawn.payload["name"].as_str().unwrap();
+        assert!(spawn_name.starts_with("implementer-"));
+        assert_eq!(spawn_name.len(), "implementer-".len() + 6);
+
+        let second_spawn =
+            agent_spawn_request("codex".to_string(), "implementer".to_string()).unwrap();
+        assert_ne!(spawn.payload["name"], second_spawn.payload["name"]);
 
         let stop = agent_stop_request("agent_01HX".to_string());
         assert_eq!(stop.command, IpcCommand::AgentStop);
@@ -3231,8 +3304,12 @@ mod tests {
 
         let send = agent_send_request("agent_01HX".to_string(), "hello".to_string()).unwrap();
         assert_eq!(send.command, IpcCommand::MessageCreate);
-        assert_eq!(send.payload["to"], "agent_01HX");
+        assert_eq!(send.payload["to"], "agent:agent_01HX");
         assert_eq!(send.payload["body"], "hello");
+
+        let send_by_name =
+            agent_send_request("codex-a1b2c3".to_string(), "hello".to_string()).unwrap();
+        assert_eq!(send_by_name.payload["to"], "agent:codex-a1b2c3");
 
         let inject = agent_inject_request("msg_01HX".to_string(), "agent_01HX".to_string());
         assert_eq!(inject.command, IpcCommand::MessageInject);
@@ -3392,6 +3469,8 @@ mod tests {
         assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
         assert!(contents.contains("AGENTMUX_RESULT:"));
         assert!(contents.contains("messages[]"));
+        assert!(contents.contains("Allowed `messages[].kind` values"));
+        assert!(contents.contains("AGENTMUX_AGENT_NAME"));
         assert!(contents.contains("Two-session exchange example"));
         assert!(contents.contains("agentmux message list"));
 

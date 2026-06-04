@@ -102,6 +102,7 @@ pub enum MessageSource {
 #[serde(rename_all = "snake_case", tag = "kind", content = "id")]
 pub enum MessageTarget {
     Agent(AgentSessionId),
+    AgentName(String),
     Role(AgentRole),
     Task(TaskId),
     Team(String),

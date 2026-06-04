@@ -16,6 +16,7 @@ use crate::message::{AgentMessage, MessageKind, MessageSource, MessageTarget, Ne
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDescriptor {
     pub id: AgentSessionId,
+    pub name: Option<String>,
     pub role: AgentRole,
     pub task_id: Option<TaskId>,
     pub teams: BTreeSet<String>,
@@ -25,10 +26,16 @@ impl AgentDescriptor {
     pub fn new(id: AgentSessionId, role: AgentRole) -> Self {
         Self {
             id,
+            name: None,
             role,
             task_id: None,
             teams: BTreeSet::new(),
         }
+    }
+
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
     }
 
     pub fn with_task_id(mut self, task_id: TaskId) -> Self {
@@ -271,6 +278,12 @@ impl MessageBus {
                     Vec::new()
                 }
             }
+            MessageTarget::AgentName(name) => self
+                .agents
+                .values()
+                .filter(|agent| agent.name.as_deref() == Some(name.as_str()))
+                .map(|agent| agent.id.clone())
+                .collect(),
             MessageTarget::Role(role) => self
                 .agents
                 .values()
@@ -400,6 +413,7 @@ fn source_label(source: &MessageSource) -> String {
 fn target_label(target: &MessageTarget) -> String {
     match target {
         MessageTarget::Agent(id) => format!("agent:{id}"),
+        MessageTarget::AgentName(name) => format!("agent:{name}"),
         MessageTarget::Role(role) => format!("role:{role:?}"),
         MessageTarget::Task(id) => format!("task:{id}"),
         MessageTarget::Team(team) => format!("team:{team}"),
@@ -510,6 +524,7 @@ mod tests {
         let tester = AgentSessionId::new();
         bus.register_agent(
             AgentDescriptor::new(planner.clone(), AgentRole::Planner)
+                .with_name("planner-a1b2c3")
                 .with_task_id(task_id.clone())
                 .with_team("alpha"),
         );
@@ -517,6 +532,11 @@ mod tests {
 
         assert_eq!(
             bus.resolve_target(&MessageTarget::Agent(planner.clone()))
+                .unwrap(),
+            vec![planner.clone()]
+        );
+        assert_eq!(
+            bus.resolve_target(&MessageTarget::AgentName("planner-a1b2c3".to_string()))
                 .unwrap(),
             vec![planner.clone()]
         );

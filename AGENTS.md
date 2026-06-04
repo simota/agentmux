@@ -51,7 +51,11 @@ AGENTMUX_RESULT:
 
 Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
 
-Agent sessions register a role at startup. Prefer role targets (`role:tester`, `role:implementer`, `role:reviewer`) instead of session ids or display names unless a specific id is required. Check available sessions and roles with `Ctrl-g s` in the TUI or `agentmux sessions`.
+Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind prevents the result messages from being stored.
+
+Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
+
+Each live session receives its own identity through environment variables: `AGENTMUX_AGENT_NAME`, `AGENTMUX_AGENT_ROLE`, and `AGENTMUX_AGENT_ID`. Use `AGENTMUX_AGENT_NAME` when another session needs to reply to exactly this session.
 
 ```json
 {
@@ -94,7 +98,7 @@ AGENTMUX_RESULT:
   "changed_files": [],
   "messages": [
     {
-      "to": "role:implementer",
+      "to": "agent:codex-a1b2c3",
       "kind": "Finding",
       "body": "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal.",
       "priority": "normal"
@@ -108,4 +112,3 @@ AGENTMUX_RESULT:
 
 Check delivery with `Ctrl-g m` in the TUI or `agentmux message list`.
 <!-- agentmux-result-protocol:end -->
-

@@ -198,7 +198,8 @@ impl DaemonRuntime {
                 .map(parse_agent_role)
                 .transpose()?
                 .unwrap_or_else(|| inferred_agent_role(&name));
-            recovered_message_agents.push(AgentDescriptor::new(id.clone(), role.clone()));
+            recovered_message_agents
+                .push(AgentDescriptor::new(id.clone(), role.clone()).with_name(name.clone()));
             recovered.insert(
                 id.clone(),
                 LiveAgentSession::metadata(RegisteredAgentSession::restored_with_role(
@@ -238,9 +239,10 @@ impl DaemonRuntime {
         state
             .agents
             .insert(agent.id.clone(), LiveAgentSession::metadata(agent.clone()));
-        state
-            .messages
-            .register_agent(AgentDescriptor::new(agent.id.clone(), agent.role.clone()));
+        state.messages.register_agent(
+            AgentDescriptor::new(agent.id.clone(), agent.role.clone())
+                .with_name(agent.name.clone()),
+        );
         drop(state);
         self.publish(DaemonEvent::new(
             IpcEventKind::AgentSpawned,
@@ -267,15 +269,24 @@ impl DaemonRuntime {
         &self,
         name: String,
         role: AgentRole,
-        spec: PtySpawnSpec,
+        mut spec: PtySpawnSpec,
     ) -> Result<RegisteredAgentSession> {
+        let mut agent = RegisteredAgentSession::with_role(name.clone(), role, None);
+        spec.env
+            .insert("AGENTMUX_AGENT_ID".to_string(), agent.id.to_string());
+        spec.env
+            .insert("AGENTMUX_AGENT_NAME".to_string(), agent.name.clone());
+        spec.env.insert(
+            "AGENTMUX_AGENT_ROLE".to_string(),
+            agent_role_label(&agent.role).to_string(),
+        );
         let terminal = Arc::new(Mutex::new(TerminalParser::new(
             spec.size.rows,
             spec.size.cols,
         )));
         let pty = PtyHandle::spawn(spec)?;
         let read_loop = pty.spawn_read_loop(16)?;
-        let agent = RegisteredAgentSession::with_role(name.clone(), role, pty.process_id());
+        agent.process_id = pty.process_id();
         self.spawn_pty_output_forwarder(
             agent.id.clone(),
             name.clone(),
@@ -291,9 +302,10 @@ impl DaemonRuntime {
                 terminal,
             },
         );
-        state
-            .messages
-            .register_agent(AgentDescriptor::new(agent.id.clone(), agent.role.clone()));
+        state.messages.register_agent(
+            AgentDescriptor::new(agent.id.clone(), agent.role.clone())
+                .with_name(agent.name.clone()),
+        );
         drop(state);
         self.publish(DaemonEvent::new(
             IpcEventKind::AgentSpawned,
@@ -1234,6 +1246,7 @@ impl DaemonRuntime {
             let agent_id = AgentSessionId::new();
             state.messages.register_agent(
                 AgentDescriptor::new(agent_id, agent.role.clone())
+                    .with_name(agent.name.clone())
                     .with_task_id(task_id.clone())
                     .with_team(team.name.clone()),
             );
@@ -2686,18 +2699,34 @@ fn message_create_payload(payload: &serde_json::Value) -> Result<NewAgentMessage
 }
 
 fn parse_message_target(raw: &str) -> Result<MessageTarget> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "message target must not be empty".to_string(),
+        ));
+    }
     if raw == "broadcast" {
         return Ok(MessageTarget::Broadcast);
     }
     if let Some(role) = raw.strip_prefix("role:") {
         return Ok(MessageTarget::Role(parse_agent_role(role)?));
     }
+    if let Some(agent) = raw.strip_prefix("agent:") {
+        let agent = agent.trim();
+        if agent.is_empty() {
+            return Err(AgentmuxError::UserError(
+                "agent message target must not be empty".to_string(),
+            ));
+        }
+        if let Ok(agent_id) = agent.parse::<AgentSessionId>() {
+            return Ok(MessageTarget::Agent(agent_id));
+        }
+        return Ok(MessageTarget::AgentName(agent.to_string()));
+    }
     if let Ok(agent_id) = raw.parse::<AgentSessionId>() {
         return Ok(MessageTarget::Agent(agent_id));
     }
-    Err(AgentmuxError::UserError(format!(
-        "unsupported message target '{raw}'"
-    )))
+    Ok(MessageTarget::AgentName(raw.to_string()))
 }
 
 fn parse_agent_role(raw: &str) -> Result<AgentRole> {
@@ -3155,6 +3184,50 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn spawned_agent_receives_identity_environment() {
+        let runtime = DaemonRuntime::new(8);
+        let root = std::env::temp_dir().join(format!("agentmux-env-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("env.txt");
+        let script = "printf '%s\n%s\n%s\n' \"$AGENTMUX_AGENT_NAME\" \"$AGENTMUX_AGENT_ROLE\" \"$AGENTMUX_AGENT_ID\" > \"$1\"";
+
+        let agent = runtime
+            .spawn_agent_with_role(
+                "codex-a1b2c3".to_string(),
+                AgentRole::Implementer,
+                PtySpawnSpec {
+                    command: "/bin/sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        script.to_string(),
+                        "agentmux-env-test".to_string(),
+                        output_path.to_string_lossy().into_owned(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: agentmux_pty::TerminalSize::default(),
+                },
+            )
+            .await
+            .expect("agent spawns");
+
+        for _ in 0..20 {
+            if output_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let contents = std::fs::read_to_string(&output_path).expect("env output is written");
+        let lines = contents.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "codex-a1b2c3");
+        assert_eq!(lines[1], "implementer");
+        assert_eq!(lines[2], agent.id.to_string());
+
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn unknown_provider_without_command_stays_metadata_only() {
         let spec =
@@ -3358,6 +3431,47 @@ AGENTMUX_RESULT:
         );
         assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Tester));
         assert_eq!(messages[0].body, "Run the focused daemon message tests.");
+    }
+
+    #[tokio::test]
+    async fn live_agent_result_can_target_unique_agent_name() {
+        let runtime = DaemonRuntime::new(8);
+        runtime
+            .register_agent_with_role("tester-a1b2c3".to_string(), AgentRole::Tester)
+            .await;
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Implementation is ready for named test.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "agent:tester-a1b2c3",
+      "kind": "TestResult",
+      "body": "Run only the named tester session.",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+
+        let persisted = runtime
+            .persist_live_agent_result("impl-codex", output)
+            .await
+            .expect("live result persists");
+
+        assert!(persisted);
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].to,
+            MessageTarget::AgentName("tester-a1b2c3".to_string())
+        );
+        assert_eq!(messages[0].body, "Run only the named tester session.");
     }
 
     #[tokio::test]
@@ -3709,6 +3823,34 @@ AGENTMUX_RESULT:
 
         writer
             .write(&ClientRequest::new(
+                "req_message_create_by_name",
+                IpcCommand::MessageCreate,
+                json!({
+                    "to": "impl-codex",
+                    "body": "message by session name",
+                    "kind": "handoff",
+                    "priority": "normal",
+                    "delivery_mode": "inject_when_idle",
+                }),
+            ))
+            .await
+            .unwrap();
+        let (create_by_name_response, created_by_name_event) =
+            read_response_and_event(&mut reader).await;
+        assert!(create_by_name_response.ok);
+        assert_eq!(created_by_name_event.kind, IpcEventKind::MessageCreated);
+        let create_by_name_payload = create_by_name_response.payload.unwrap();
+        let message_by_name_id = create_by_name_payload["message_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(
+            create_by_name_payload["to"],
+            json!({ "kind": "agent_name", "id": "impl-codex" })
+        );
+
+        writer
+            .write(&ClientRequest::new(
                 "req_message_list",
                 IpcCommand::MessageList,
                 json!({}),
@@ -3718,8 +3860,18 @@ AGENTMUX_RESULT:
         let list_response: DaemonResponse = reader.read().await.unwrap().unwrap();
         assert!(list_response.ok);
         let list_payload = list_response.payload.unwrap();
-        assert_eq!(list_payload["messages"].as_array().unwrap().len(), 1);
-        assert_eq!(list_payload["messages"][0]["message_id"], message_id);
+        let listed_messages = list_payload["messages"].as_array().unwrap();
+        assert_eq!(listed_messages.len(), 2);
+        assert!(
+            listed_messages
+                .iter()
+                .any(|message| message["message_id"] == message_id)
+        );
+        assert!(
+            listed_messages
+                .iter()
+                .any(|message| message["message_id"] == message_by_name_id)
+        );
 
         writer
             .write(&ClientRequest::new(

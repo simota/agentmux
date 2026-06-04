@@ -837,6 +837,18 @@ fn resolve_result_target(team: &TeamTemplate, raw: &str) -> Result<MessageTarget
     if let Some(role) = target.strip_prefix("role:") {
         return parse_role_target(role);
     }
+    if let Some(agent) = target.strip_prefix("agent:") {
+        let agent = agent.trim();
+        if agent.is_empty() {
+            return Err(AgentmuxError::OrchestratorError(
+                "empty agent result target".to_string(),
+            ));
+        }
+        if let Ok(agent_id) = agent.parse::<agentmux_core::AgentSessionId>() {
+            return Ok(MessageTarget::Agent(agent_id));
+        }
+        return Ok(MessageTarget::AgentName(agent.to_string()));
+    }
     if let Some(team_name) = target.strip_prefix("team:") {
         return Ok(MessageTarget::Team(team_name.to_string()));
     }
