@@ -11,11 +11,14 @@
 pub mod framing;
 pub mod protocol;
 
-/// Current protocol version. Bump on breaking changes.
-pub const PROTOCOL_VERSION: u32 = 1;
+/// Current protocol version. Bump on protocol shape changes.
+pub const PROTOCOL_VERSION: u32 = 2;
+
+/// First daemon protocol version that understands `event.subscribe`.
+pub const EVENT_SUBSCRIBE_PROTOCOL_VERSION: u32 = 2;
 
 pub use framing::{JsonlReader, JsonlWriter, MAX_JSONL_FRAME_BYTES, read_jsonl, write_jsonl};
 pub use protocol::{
     ClientHello, ClientRequest, DaemonEvent, DaemonResponse, DaemonStreamFrame, ErrorBody,
-    IpcCommand, IpcEventKind, ProtocolCompatibility,
+    EventSubscribeFilter, IpcCommand, IpcEventKind, ProtocolCompatibility,
 };
