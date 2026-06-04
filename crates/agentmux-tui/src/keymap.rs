@@ -28,6 +28,9 @@ pub enum TuiCommand {
     ShowApprovalQueue,
     SplitVertical,
     SplitHorizontal,
+    ProviderNext,
+    ProviderPrevious,
+    SelectProvider,
     ClosePane,
     ResizeMode,
     RotateLayout,
@@ -91,7 +94,7 @@ impl KeymapDispatcher {
         key: KeyEvent,
         session_list_visible: bool,
     ) -> KeyDispatch {
-        self.dispatch_with_overlays(key, session_list_visible, false)
+        self.dispatch_with_overlays(key, session_list_visible, false, false)
     }
 
     pub fn dispatch_with_overlays(
@@ -99,6 +102,7 @@ impl KeymapDispatcher {
         key: KeyEvent,
         session_list_visible: bool,
         message_bus_visible: bool,
+        provider_picker_visible: bool,
     ) -> KeyDispatch {
         if matches!(key.kind, KeyEventKind::Release) {
             return KeyDispatch::Consumed;
@@ -118,6 +122,12 @@ impl KeymapDispatcher {
 
         if session_list_visible {
             return overlay_navigation_command(key)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        if provider_picker_visible {
+            return provider_picker_command(key)
                 .map(KeyDispatch::Command)
                 .unwrap_or(KeyDispatch::Consumed);
         }
@@ -166,6 +176,26 @@ fn overlay_navigation_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Down | KeyCode::Char('j') => Some(TuiCommand::SessionListNext),
         KeyCode::Up | KeyCode::Char('k') => Some(TuiCommand::SessionListPrevious),
         KeyCode::Enter => Some(TuiCommand::FocusSelectedSession),
+        KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
+        _ => None,
+    }
+}
+
+fn provider_picker_command(key: KeyEvent) -> Option<TuiCommand> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some(TuiCommand::ProviderNext),
+        KeyCode::Up | KeyCode::Char('k') => Some(TuiCommand::ProviderPrevious),
+        KeyCode::Char('1') => Some(TuiCommand::SelectProvider),
+        KeyCode::Char('2') => Some(TuiCommand::ProviderNext),
+        KeyCode::Char('3') => Some(TuiCommand::ProviderPrevious),
+        KeyCode::Enter => Some(TuiCommand::SelectProvider),
         KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
         _ => None,
     }
@@ -366,14 +396,20 @@ mod tests {
         let mut dispatcher = KeymapDispatcher::default();
 
         assert_eq!(
-            dispatcher.dispatch_with_overlays(key(KeyCode::Esc, KeyModifiers::NONE), false, true),
+            dispatcher.dispatch_with_overlays(
+                key(KeyCode::Esc, KeyModifiers::NONE),
+                false,
+                true,
+                false
+            ),
             KeyDispatch::Command(TuiCommand::CloseOverlay)
         );
         assert_eq!(
             dispatcher.dispatch_with_overlays(
                 key(KeyCode::Char('q'), KeyModifiers::NONE),
                 false,
-                true
+                true,
+                false
             ),
             KeyDispatch::Command(TuiCommand::CloseOverlay)
         );
@@ -381,9 +417,43 @@ mod tests {
             dispatcher.dispatch_with_overlays(
                 key(KeyCode::Char('a'), KeyModifiers::NONE),
                 false,
-                true
+                true,
+                false
             ),
             KeyDispatch::Consumed
+        );
+    }
+
+    #[test]
+    fn provider_picker_keys_map_to_selection_commands_when_visible() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch_with_overlays(
+                key(KeyCode::Down, KeyModifiers::NONE),
+                false,
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::ProviderNext)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_overlays(
+                key(KeyCode::Up, KeyModifiers::NONE),
+                false,
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::ProviderPrevious)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_overlays(
+                key(KeyCode::Enter, KeyModifiers::NONE),
+                false,
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::SelectProvider)
         );
     }
 

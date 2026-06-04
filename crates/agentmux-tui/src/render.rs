@@ -118,6 +118,10 @@ impl TuiSessionRenderer {
             render_session_list(area, state, buffer);
         }
 
+        if state.provider_picker_visible() {
+            render_provider_picker(area, state, buffer);
+        }
+
         if state.message_bus_visible() {
             render_message_bus(area, state, buffer);
         }
@@ -135,8 +139,8 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "Ctrl-g x      Close focused pane",
     "Ctrl-g z      Toggle pane zoom",
     "Ctrl-g arrows Move focus",
-    "Ctrl-g %      Split vertical",
-    "Ctrl-g \"      Split horizontal",
+    "Ctrl-g %      Split vertical + choose agent",
+    "Ctrl-g \"      Split horizontal + choose agent",
     "Ctrl-g Space  Rotate split direction",
     "Ctrl-g :      Command palette",
 ];
@@ -185,6 +189,43 @@ fn render_session_list(area: Rect, state: &TuiSessionState, buffer: &mut Buffer)
             Block::default()
                 .borders(Borders::ALL)
                 .title("Running Sessions")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Left)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    paragraph.render(popup, buffer);
+}
+
+fn render_provider_picker(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut lines = vec![
+        "Use Up/Down or j/k, Enter to start, Esc to close".to_string(),
+        "".to_string(),
+    ];
+    for (index, option) in state.provider_options().iter().enumerate() {
+        let marker = if index == state.provider_picker_selected_index() {
+            ">"
+        } else {
+            " "
+        };
+        lines.push(format!(
+            "{marker} {}  {}",
+            option.provider.label(),
+            option.hint
+        ));
+    }
+
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX).min(12);
+    let popup = centered_rect(area, 72, height);
+    Clear.render(popup, buffer);
+    let paragraph = Paragraph::new(lines.join("\n"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("New Coding Agent")
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .alignment(Alignment::Left)
@@ -485,6 +526,27 @@ mod tests {
         assert!(rendered.contains("shell"));
         assert!(rendered.contains("1234"));
         assert!(!rendered.contains("agent_restored"));
+    }
+
+    #[test]
+    fn render_session_draws_provider_picker_overlay_when_visible() {
+        let mut state = TuiSessionState::default();
+        state.open_provider_picker();
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("New Coding Agent"));
+        assert!(rendered.contains("> Claude Code"));
+        assert!(rendered.contains("Codex"));
+        assert!(rendered.contains("Antigravity"));
     }
 
     #[test]

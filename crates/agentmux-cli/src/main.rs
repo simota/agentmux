@@ -22,7 +22,7 @@ use agentmux_tui::{
     input::{InputForwardError, dispatch_to_daemon_request},
     keymap::KeymapDispatcher,
     render::TuiSessionRenderer,
-    state::{CommandEffect, TuiSessionState},
+    state::{AgentProviderChoice, CommandEffect, TuiSessionState},
     terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
 };
 use clap::{Parser, Subcommand};
@@ -651,7 +651,7 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Attach(args) => {
-            run_tui_session(&socket_path, args.target).await?;
+            run_tui_session(&socket_path, Some(args.target)).await?;
         }
         Commands::Layout(args) => match args.action {
             LayoutAction::Save { name } => {
@@ -758,13 +758,17 @@ fn sessions_list_request() -> ClientRequest {
 }
 
 fn bare_session_spawn_request() -> ClientRequest {
+    agent_spawn_for_provider_request(AgentProviderChoice::Codex)
+}
+
+fn agent_spawn_for_provider_request(provider: AgentProviderChoice) -> ClientRequest {
     ClientRequest::new(
-        "req_bare_agent_spawn",
+        "req_agent_spawn_provider",
         IpcCommand::AgentSpawn,
         json!({
-            "provider": "shell",
-            "role": "shell",
-            "name": "shell",
+            "provider": provider.provider(),
+            "role": "implementer",
+            "name": provider.default_name(),
         }),
     )
 }
@@ -1465,7 +1469,7 @@ async fn run_bare_tui_session(socket_path: &Path) -> Result<()> {
     run_tui_session(socket_path, target).await
 }
 
-async fn resolve_bare_tui_target(socket_path: &Path) -> Result<String> {
+async fn resolve_bare_tui_target(socket_path: &Path) -> Result<Option<String>> {
     let status = send_daemon_request(socket_path, daemon_status_request()).await?;
     if !status.ok {
         return Err(response_error("agentmux", status));
@@ -1474,11 +1478,10 @@ async fn resolve_bare_tui_target(socket_path: &Path) -> Result<String> {
     if let Some(agent_id) =
         existing_agent_id_from_status(&status.payload.clone().unwrap_or_else(|| json!({})))
     {
-        return Ok(agent_id);
+        return Ok(Some(agent_id));
     }
 
-    let response = send_daemon_request(socket_path, bare_session_spawn_request()).await?;
-    agent_id_from_spawn_response(response)
+    Ok(None)
 }
 
 fn existing_agent_id_from_status(payload: &Value) -> Option<String> {
@@ -1515,7 +1518,7 @@ fn agent_id_from_spawn_response(response: DaemonResponse) -> Result<String> {
         .ok_or_else(|| AgentmuxError::IpcError("agent.spawn response missing agent_id".to_string()))
 }
 
-async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
+async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<()> {
     ensure_daemon(socket_path).await?;
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
         AgentmuxError::IpcError(format!(
@@ -1533,23 +1536,31 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
 
     let status_request = tui_daemon_status_request();
     let status_request_id = status_request.id.clone();
-    let snapshot_request = snapshot_request(target.clone());
-    let snapshot_request_id = snapshot_request.id.clone();
-    let attach_request = attach_request(target);
-    let attach_request_id = attach_request.id.clone();
     writer.write(&status_request).await?;
-    writer.write(&attach_request).await?;
-    writer.write(&snapshot_request).await?;
+    let attach_and_snapshot = target.map(|target| {
+        let snapshot_request = snapshot_request(target.clone());
+        let attach_request = attach_request(target);
+        (attach_request, snapshot_request)
+    });
+    if let Some((attach_request, snapshot_request)) = &attach_and_snapshot {
+        writer.write(attach_request).await?;
+        writer.write(snapshot_request).await?;
+    }
 
     let mut state = TuiSessionState::default();
-    wait_for_tui_bootstrap(
-        &mut reader,
-        &mut state,
-        &status_request_id,
-        &attach_request_id,
-        &snapshot_request_id,
-    )
-    .await?;
+    if let Some((attach_request, snapshot_request)) = &attach_and_snapshot {
+        wait_for_tui_bootstrap(
+            &mut reader,
+            &mut state,
+            &status_request_id,
+            Some(&attach_request.id),
+            Some(&snapshot_request.id),
+        )
+        .await?;
+    } else {
+        wait_for_tui_bootstrap(&mut reader, &mut state, &status_request_id, None, None).await?;
+        state.open_provider_picker();
+    }
 
     let terminal_io = CrosstermTerminalIo::new(io::stdout()).map_err(|error| {
         AgentmuxError::TerminalError(format!("failed to initialise terminal UI: {error}"))
@@ -1595,7 +1606,13 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
             // A per-request response error during the session — e.g. a keystroke
             // forwarded to an agent with no live PTY — must NOT tear down the
             // cockpit; surface it as a notice and keep running.
-            let _notice = apply_runtime_stream_frame(&mut state, frame?);
+            let frame = frame?;
+            let spawned_agent_id = spawned_agent_id_from_frame(&frame);
+            let _notice = apply_runtime_stream_frame(&mut state, frame);
+            if let Some(agent_id) = spawned_agent_id {
+                writer.write(&attach_request(agent_id.clone())).await?;
+                writer.write(&snapshot_request(agent_id)).await?;
+            }
             draw_tui_frame(&mut terminal, &renderer, &state)?;
         }
 
@@ -1606,7 +1623,7 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
                     break;
                 }
                 CommandEffect::Continue
-                | CommandEffect::SpawnShellPane
+                | CommandEffect::SpawnAgentPane(_)
                 | CommandEffect::StopPane(_)
                 | CommandEffect::RefreshMessages
                 | CommandEffect::Unhandled(_) => {}
@@ -1622,6 +1639,7 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
                 key,
                 state.session_list_visible(),
                 state.message_bus_visible(),
+                state.provider_picker_visible(),
             );
             if let Some(command) = match &dispatch {
                 agentmux_tui::keymap::KeyDispatch::Command(command) => Some(*command),
@@ -1631,8 +1649,10 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
                     CommandEffect::Continue => {
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
                     }
-                    CommandEffect::SpawnShellPane => {
-                        writer.write(&bare_session_spawn_request()).await?;
+                    CommandEffect::SpawnAgentPane(provider) => {
+                        writer
+                            .write(&agent_spawn_for_provider_request(provider))
+                            .await?;
                     }
                     CommandEffect::StopPane(agent_id) => {
                         writer.write(&agent_stop_request(agent_id)).await?;
@@ -1682,15 +1702,15 @@ async fn wait_for_tui_bootstrap<R>(
     reader: &mut JsonlReader<R>,
     state: &mut TuiSessionState,
     status_request_id: &str,
-    attach_request_id: &str,
-    snapshot_request_id: &str,
+    attach_request_id: Option<&str>,
+    snapshot_request_id: Option<&str>,
 ) -> Result<()>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     let mut status_received = false;
-    let mut attach_received = false;
-    let mut snapshot_received = false;
+    let mut attach_received = attach_request_id.is_none();
+    let mut snapshot_received = snapshot_request_id.is_none();
 
     while !(status_received && attach_received && snapshot_received) {
         let frame = reader.read::<DaemonStreamFrame>().await?.ok_or_else(|| {
@@ -1700,10 +1720,10 @@ where
             if response_id == status_request_id {
                 status_received = true;
             }
-            if response_id == attach_request_id {
+            if Some(response_id.as_str()) == attach_request_id {
                 attach_received = true;
             }
-            if response_id == snapshot_request_id {
+            if Some(response_id.as_str()) == snapshot_request_id {
                 snapshot_received = true;
             }
         }
@@ -1732,6 +1752,11 @@ fn apply_tui_stream_frame(
                     &response.payload.clone().unwrap_or_else(|| json!({})),
                 );
             }
+            if response.id == "req_agent_spawn_provider" || response.id == "req_bare_agent_spawn" {
+                if let Some(payload) = response.payload.as_ref() {
+                    state.apply_daemon_status(&json!({ "agents": [payload] }));
+                }
+            }
             Ok(Some(response.id))
         }
         DaemonStreamFrame::Event(event) => {
@@ -1739,6 +1764,21 @@ fn apply_tui_stream_frame(
             Ok(None)
         }
     }
+}
+
+fn spawned_agent_id_from_frame(frame: &DaemonStreamFrame) -> Option<String> {
+    let DaemonStreamFrame::Response(response) = frame else {
+        return None;
+    };
+    if !response.ok || response.id != "req_agent_spawn_provider" {
+        return None;
+    }
+    response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("agent_id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 /// Apply a stream frame during the interactive loop. Unlike bootstrap, a failed
@@ -2134,14 +2174,25 @@ mod tests {
     }
 
     #[test]
-    fn bare_session_spawn_request_registers_minimal_shell_pane() {
+    fn bare_session_spawn_request_registers_default_coding_agent() {
         let request = bare_session_spawn_request();
 
-        assert_eq!(request.id, "req_bare_agent_spawn");
+        assert_eq!(request.id, "req_agent_spawn_provider");
         assert_eq!(request.command, IpcCommand::AgentSpawn);
-        assert_eq!(request.payload["provider"], "shell");
-        assert_eq!(request.payload["role"], "shell");
-        assert_eq!(request.payload["name"], "shell");
+        assert_eq!(request.payload["provider"], "codex");
+        assert_eq!(request.payload["role"], "implementer");
+        assert_eq!(request.payload["name"], "codex");
+    }
+
+    #[test]
+    fn provider_spawn_request_registers_selected_coding_agent() {
+        let request = agent_spawn_for_provider_request(AgentProviderChoice::Agy);
+
+        assert_eq!(request.id, "req_agent_spawn_provider");
+        assert_eq!(request.command, IpcCommand::AgentSpawn);
+        assert_eq!(request.payload["provider"], "agy");
+        assert_eq!(request.payload["role"], "implementer");
+        assert_eq!(request.payload["name"], "agy");
     }
 
     #[test]
@@ -2259,6 +2310,40 @@ mod tests {
         assert_eq!(response_id.as_deref(), Some("req_message_list"));
         assert_eq!(state.messages().len(), 1);
         assert_eq!(state.messages()[0].message_id, "msg_1");
+    }
+
+    #[test]
+    fn tui_stream_frame_adds_spawned_provider_agent() {
+        let mut state = TuiSessionState::default();
+        let response = DaemonResponse::ok(
+            "req_agent_spawn_provider",
+            json!({
+                "agent_id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K",
+                "name": "codex",
+                "process_id": 42
+            }),
+        );
+
+        let frame = DaemonStreamFrame::Response(response);
+        assert_eq!(
+            spawned_agent_id_from_frame(&frame).as_deref(),
+            Some("agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K")
+        );
+
+        let response_id = apply_tui_stream_frame(&mut state, frame).unwrap();
+
+        assert_eq!(response_id.as_deref(), Some("req_agent_spawn_provider"));
+        assert_eq!(
+            state.layout().focused(),
+            Some("agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K")
+        );
+        assert_eq!(
+            state
+                .pane("agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K")
+                .expect("spawned pane")
+                .name(),
+            "codex"
+        );
     }
 
     #[test]

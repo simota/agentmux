@@ -64,6 +64,7 @@ agentmux task run "refresh token bugを修正し、テストも追加して" --t
 挙動:
 
 - daemon未起動なら起動する。
+- 既存のcoding agent sessionがなければprovider pickerを表示する。
 - taskを作成する。
 - TUIをattachする。
 - team templateに従ってpane/agent/worktreeを作成する。
@@ -169,12 +170,14 @@ Ctrl-g A        approval queue
 ### 6.2 Pane操作
 
 ```text
-Ctrl-g %        split vertical
-Ctrl-g "        split horizontal
+Ctrl-g %        split vertical and choose coding agent
+Ctrl-g "        split horizontal and choose coding agent
 Ctrl-g x        close/stop current pane
 Ctrl-g r        resize mode
 Ctrl-g Space    rotate layout
 ```
+
+`Ctrl-g %` / `Ctrl-g "` は空のshell paneを作らず、provider pickerを表示する。選択肢は `Claude Code`, `Codex`, `Antigravity`。Enterで選択したcoding agentを起動し、そのpaneへattachする。Esc/qで閉じる。
 
 ### 6.3 Agent操作
 

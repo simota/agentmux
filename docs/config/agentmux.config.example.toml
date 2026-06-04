@@ -67,6 +67,12 @@ command = "codex"
 supports_slash_commands = true
 startup_prompt = true
 
+[providers.agy]
+enabled = true
+command = "agy"
+supports_slash_commands = true
+startup_prompt = true
+
 [test]
 default_command = "cargo test"
 

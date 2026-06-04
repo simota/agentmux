@@ -2771,6 +2771,7 @@ fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<Pty
             Some("shell") => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
             Some("claude") => "claude".to_string(),
             Some("codex") => "codex".to_string(),
+            Some("agy") => "agy".to_string(),
             _ => return Ok(None),
         },
     };
@@ -2858,6 +2859,21 @@ mod tests {
             spec.env.contains_key("PATH"),
             "daemon environment is inherited so the shell is usable"
         );
+    }
+
+    #[test]
+    fn coding_agent_providers_map_to_live_pty_commands() {
+        for (provider, command) in [("claude", "claude"), ("codex", "codex"), ("agy", "agy")] {
+            let spec = pty_spawn_spec_from_payload(&json!({
+                "provider": provider,
+                "role": "implementer",
+                "name": provider,
+            }))
+            .expect("provider payload parses")
+            .expect("provider yields a live PTY spec");
+
+            assert_eq!(spec.command, command);
+        }
     }
 
     #[test]

@@ -90,6 +90,8 @@ pub struct TuiSessionState {
     session_list_selected: usize,
     message_bus_visible: bool,
     messages: Vec<MessageListItem>,
+    provider_picker_visible: bool,
+    provider_picker_selected: usize,
 }
 
 impl Default for TuiSessionState {
@@ -110,6 +112,8 @@ impl TuiSessionState {
             session_list_selected: 0,
             message_bus_visible: false,
             messages: Vec::new(),
+            provider_picker_visible: false,
+            provider_picker_selected: 0,
         }
     }
 
@@ -165,6 +169,18 @@ impl TuiSessionState {
         &self.messages
     }
 
+    pub fn provider_picker_visible(&self) -> bool {
+        self.provider_picker_visible
+    }
+
+    pub fn provider_picker_selected_index(&self) -> usize {
+        self.provider_picker_selected
+    }
+
+    pub fn provider_options(&self) -> &'static [ProviderOption] {
+        PROVIDER_OPTIONS
+    }
+
     pub fn focus_next(&mut self) {
         self.layout.focus_next();
     }
@@ -193,12 +209,29 @@ impl TuiSessionState {
             }
             TuiCommand::SplitVertical => {
                 self.layout.set_split_direction(SplitDirection::Vertical);
-                CommandEffect::SpawnShellPane
+                self.open_provider_picker();
+                CommandEffect::Continue
             }
             TuiCommand::SplitHorizontal => {
                 self.layout.set_split_direction(SplitDirection::Horizontal);
-                CommandEffect::SpawnShellPane
+                self.open_provider_picker();
+                CommandEffect::Continue
             }
+            TuiCommand::ProviderNext => {
+                self.move_provider_selection(1);
+                CommandEffect::Continue
+            }
+            TuiCommand::ProviderPrevious => {
+                self.move_provider_selection(-1);
+                CommandEffect::Continue
+            }
+            TuiCommand::SelectProvider => self
+                .selected_provider()
+                .map(|provider| {
+                    self.provider_picker_visible = false;
+                    CommandEffect::SpawnAgentPane(provider)
+                })
+                .unwrap_or(CommandEffect::Continue),
             TuiCommand::ClosePane => self
                 .focused_pane()
                 .map(|pane| CommandEffect::StopPane(pane.agent_id().to_string()))
@@ -212,6 +245,7 @@ impl TuiSessionState {
                 if self.keybinding_help_visible {
                     self.session_list_visible = false;
                     self.message_bus_visible = false;
+                    self.provider_picker_visible = false;
                 }
                 CommandEffect::Continue
             }
@@ -220,6 +254,7 @@ impl TuiSessionState {
                 if self.session_list_visible {
                     self.keybinding_help_visible = false;
                     self.message_bus_visible = false;
+                    self.provider_picker_visible = false;
                     self.select_focused_running_session();
                 }
                 CommandEffect::Continue
@@ -229,6 +264,7 @@ impl TuiSessionState {
                 if self.message_bus_visible {
                     self.keybinding_help_visible = false;
                     self.session_list_visible = false;
+                    self.provider_picker_visible = false;
                     CommandEffect::RefreshMessages
                 } else {
                     CommandEffect::Continue
@@ -250,12 +286,35 @@ impl TuiSessionState {
                 self.keybinding_help_visible = false;
                 self.session_list_visible = false;
                 self.message_bus_visible = false;
+                self.provider_picker_visible = false;
                 CommandEffect::Continue
             }
             TuiCommand::Detach => CommandEffect::Detach,
             TuiCommand::Quit => CommandEffect::Quit,
             _ => CommandEffect::Unhandled(command),
         }
+    }
+
+    pub fn open_provider_picker(&mut self) {
+        self.provider_picker_visible = true;
+        self.keybinding_help_visible = false;
+        self.session_list_visible = false;
+        self.message_bus_visible = false;
+        if self.provider_picker_selected >= PROVIDER_OPTIONS.len() {
+            self.provider_picker_selected = 0;
+        }
+    }
+
+    fn move_provider_selection(&mut self, delta: isize) {
+        let count = PROVIDER_OPTIONS.len() as isize;
+        let current = isize::try_from(self.provider_picker_selected).unwrap_or(0);
+        self.provider_picker_selected = (current + delta).rem_euclid(count) as usize;
+    }
+
+    fn selected_provider(&self) -> Option<AgentProviderChoice> {
+        PROVIDER_OPTIONS
+            .get(self.provider_picker_selected)
+            .map(|option| option.provider)
     }
 
     fn select_focused_running_session(&mut self) {
@@ -591,11 +650,65 @@ pub enum CommandEffect {
     Continue,
     Detach,
     Quit,
-    SpawnShellPane,
+    SpawnAgentPane(AgentProviderChoice),
     StopPane(String),
     RefreshMessages,
     Unhandled(TuiCommand),
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentProviderChoice {
+    Claude,
+    Codex,
+    Agy,
+}
+
+impl AgentProviderChoice {
+    pub fn provider(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+            Self::Agy => "agy",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+            Self::Agy => "Antigravity",
+        }
+    }
+
+    pub fn default_name(self) -> &'static str {
+        match self {
+            Self::Claude => "claude-code",
+            Self::Codex => "codex",
+            Self::Agy => "agy",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProviderOption {
+    pub provider: AgentProviderChoice,
+    pub hint: &'static str,
+}
+
+const PROVIDER_OPTIONS: &[ProviderOption] = &[
+    ProviderOption {
+        provider: AgentProviderChoice::Claude,
+        hint: "Claude Code",
+    },
+    ProviderOption {
+        provider: AgentProviderChoice::Codex,
+        hint: "OpenAI Codex",
+    },
+    ProviderOption {
+        provider: AgentProviderChoice::Agy,
+        hint: "Google Antigravity CLI",
+    },
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MessageListItem {
@@ -939,8 +1052,14 @@ mod tests {
         assert!(state.layout().is_zoomed());
         assert_eq!(
             state.apply_command(TuiCommand::SplitVertical),
-            CommandEffect::SpawnShellPane
+            CommandEffect::Continue
         );
+        assert!(state.provider_picker_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::SelectProvider),
+            CommandEffect::SpawnAgentPane(AgentProviderChoice::Claude)
+        );
+        assert!(!state.provider_picker_visible());
         assert_eq!(
             state.apply_command(TuiCommand::ClosePane),
             CommandEffect::StopPane("agent_a".to_string())
