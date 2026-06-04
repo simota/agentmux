@@ -9,6 +9,7 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use agentmux_agent::adapter::InputSafety;
 use agentmux_agent::{
@@ -550,6 +551,7 @@ impl DaemonRuntime {
     pub async fn inject_message(&self, id: &MessageId) -> Result<AgentMessage> {
         let now = DateTimeUtc::now_utc();
         let prepared = self.prepare_manual_message_injection(id, now).await?;
+        tokio::time::sleep(message_inject_send_delay()).await;
         let write_result = self.write_prepared_message_injection(&prepared).await;
         self.finish_and_emit_message_injection(&prepared.message_id, now, write_result)
             .await
@@ -564,6 +566,7 @@ impl DaemonRuntime {
         let prepared = self
             .prepare_manual_message_injection_for_agent(id, agent_id, now)
             .await?;
+        tokio::time::sleep(message_inject_send_delay()).await;
         let write_result = self.write_prepared_message_injection(&prepared).await;
         self.finish_and_emit_message_injection(&prepared.message_id, now, write_result)
             .await
@@ -2610,6 +2613,16 @@ fn message_input_script(prepared: &PreparedInjection) -> InputScript {
         safety: InputSafety::Safe,
         created_at: DateTimeUtc::now_utc(),
     }
+}
+
+#[cfg(not(test))]
+fn message_inject_send_delay() -> Duration {
+    Duration::from_secs(5)
+}
+
+#[cfg(test)]
+fn message_inject_send_delay() -> Duration {
+    Duration::ZERO
 }
 
 fn provider_for_agent_name(name: &str) -> AgentProvider {
