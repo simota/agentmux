@@ -124,6 +124,8 @@ pub struct ScreenGrid {
     cols: u16,
     cells: Vec<Cell>,
     cursor: CursorState,
+    scroll_top: u16,
+    scroll_bottom: u16,
     scrollback: VecDeque<Line>,
     max_scrollback_lines: usize,
     dirty_regions: Vec<DirtyRegion>,
@@ -141,6 +143,8 @@ impl ScreenGrid {
             cols,
             cells: vec![Cell::blank(); len],
             cursor: CursorState::default(),
+            scroll_top: 0,
+            scroll_bottom: rows.saturating_sub(1),
             scrollback: VecDeque::new(),
             max_scrollback_lines,
             dirty_regions: Vec::new(),
@@ -159,6 +163,10 @@ impl ScreenGrid {
 
     pub fn cursor(&self) -> CursorState {
         self.cursor
+    }
+
+    pub fn scroll_region(&self) -> Option<(u16, u16)> {
+        (self.rows > 0).then_some((self.scroll_top, self.scroll_bottom))
     }
 
     pub fn scrollback(&self) -> &VecDeque<Line> {
@@ -212,6 +220,27 @@ impl ScreenGrid {
 
     pub fn set_cursor_visible(&mut self, visible: bool) {
         self.cursor.visible = visible;
+    }
+
+    pub fn set_scroll_region(&mut self, top: u16, bottom: u16) {
+        if self.rows == 0 {
+            return;
+        }
+        let top = top.min(self.rows.saturating_sub(1));
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        if top >= bottom {
+            self.reset_scroll_region();
+            return;
+        }
+        self.scroll_top = top;
+        self.scroll_bottom = bottom;
+        self.set_cursor(0, 0);
+    }
+
+    pub fn reset_scroll_region(&mut self) {
+        self.scroll_top = 0;
+        self.scroll_bottom = self.rows.saturating_sub(1);
+        self.set_cursor(0, 0);
     }
 
     pub fn write_char(&mut self, ch: char, style: CellStyle) {
@@ -323,6 +352,78 @@ impl ScreenGrid {
         }
     }
 
+    pub fn erase_chars(&mut self, count: u16) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let row = self.cursor.row;
+        let start = self.cursor.col;
+        let end = start.saturating_add(count.max(1)).min(self.cols);
+        if let Some((start, end)) = self.clear_range(row, start, end) {
+            self.mark_dirty(row, start, 1, end.saturating_sub(start));
+        }
+    }
+
+    pub fn insert_blank_chars(&mut self, count: u16) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let row = self.cursor.row;
+        let col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let count = count.max(1).min(self.cols.saturating_sub(col));
+        if count == 0 {
+            return;
+        }
+
+        let row_start = usize::from(row) * usize::from(self.cols);
+        let col = usize::from(col);
+        let count = usize::from(count);
+        let cols = usize::from(self.cols);
+        for index in (col..cols - count).rev() {
+            self.cells[row_start + index + count] = self.cells[row_start + index].clone();
+        }
+        for index in col..col + count {
+            self.cells[row_start + index] = Cell::blank();
+        }
+        self.normalize_wide_cells(row);
+        self.mark_dirty(
+            row,
+            self.cursor.col,
+            1,
+            self.cols.saturating_sub(self.cursor.col),
+        );
+    }
+
+    pub fn delete_chars(&mut self, count: u16) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+        let row = self.cursor.row;
+        let col = self.cursor.col.min(self.cols.saturating_sub(1));
+        let count = count.max(1).min(self.cols.saturating_sub(col));
+        if count == 0 {
+            return;
+        }
+
+        let row_start = usize::from(row) * usize::from(self.cols);
+        let col = usize::from(col);
+        let count = usize::from(count);
+        let cols = usize::from(self.cols);
+        for index in col + count..cols {
+            self.cells[row_start + index - count] = self.cells[row_start + index].clone();
+        }
+        for index in cols - count..cols {
+            self.cells[row_start + index] = Cell::blank();
+        }
+        self.normalize_wide_cells(row);
+        self.mark_dirty(
+            row,
+            self.cursor.col,
+            1,
+            self.cols.saturating_sub(self.cursor.col),
+        );
+    }
+
     pub fn clear_screen(&mut self) {
         for cell in &mut self.cells {
             *cell = Cell::blank();
@@ -366,18 +467,88 @@ impl ScreenGrid {
     }
 
     pub fn scroll_up(&mut self, lines: u16) {
+        self.scroll_up_region(0, self.rows.saturating_sub(1), lines);
+    }
+
+    pub fn scroll_down(&mut self, lines: u16) {
+        self.scroll_down_region(0, self.rows.saturating_sub(1), lines);
+    }
+
+    pub fn scroll_up_region(&mut self, top: u16, bottom: u16, lines: u16) {
         if self.rows == 0 || self.cols == 0 {
             return;
         }
 
-        let lines = lines.min(self.rows);
+        let Some((top, bottom)) = self.normalized_region(top, bottom) else {
+            return;
+        };
+        let height = bottom - top + 1;
+        let lines = lines.min(height);
         for _ in 0..lines {
-            self.push_scrollback_line(0);
-            self.cells.drain(0..usize::from(self.cols));
-            self.cells
-                .extend(std::iter::repeat_with(Cell::blank).take(usize::from(self.cols)));
+            if top == 0 && bottom == self.rows.saturating_sub(1) {
+                self.push_scrollback_line(0);
+            }
+            let start = usize::from(top) * usize::from(self.cols);
+            let end = start + usize::from(self.cols);
+            self.cells.drain(start..end);
+            let insert_at = usize::from(bottom) * usize::from(self.cols);
+            self.cells.splice(
+                insert_at..insert_at,
+                std::iter::repeat_with(Cell::blank).take(usize::from(self.cols)),
+            );
         }
         self.mark_full_dirty();
+    }
+
+    pub fn scroll_down_region(&mut self, top: u16, bottom: u16, lines: u16) {
+        if self.rows == 0 || self.cols == 0 {
+            return;
+        }
+
+        let Some((top, bottom)) = self.normalized_region(top, bottom) else {
+            return;
+        };
+        let height = bottom - top + 1;
+        let lines = lines.min(height);
+        for _ in 0..lines {
+            let start = usize::from(bottom) * usize::from(self.cols);
+            let end = start + usize::from(self.cols);
+            self.cells.drain(start..end);
+            let insert_at = usize::from(top) * usize::from(self.cols);
+            self.cells.splice(
+                insert_at..insert_at,
+                std::iter::repeat_with(Cell::blank).take(usize::from(self.cols)),
+            );
+        }
+        self.mark_full_dirty();
+    }
+
+    pub fn insert_blank_lines(&mut self, lines: u16) {
+        if self.rows == 0 {
+            return;
+        }
+        let row = self.cursor.row;
+        let Some((top, bottom)) = self.scroll_region() else {
+            return;
+        };
+        if row < top || row > bottom {
+            return;
+        }
+        self.scroll_down_region(row, bottom, lines.max(1));
+    }
+
+    pub fn delete_lines(&mut self, lines: u16) {
+        if self.rows == 0 {
+            return;
+        }
+        let row = self.cursor.row;
+        let Some((top, bottom)) = self.scroll_region() else {
+            return;
+        };
+        if row < top || row > bottom {
+            return;
+        }
+        self.scroll_up_region(row, bottom, lines.max(1));
     }
 
     pub fn resize(&mut self, rows: u16, cols: u16) {
@@ -401,6 +572,11 @@ impl ScreenGrid {
 
         self.rows = rows;
         self.cols = cols;
+        self.scroll_top = self.scroll_top.min(rows.saturating_sub(1));
+        self.scroll_bottom = self
+            .scroll_bottom
+            .min(rows.saturating_sub(1))
+            .max(self.scroll_top);
         self.cells = resized;
         for row in 0..self.rows {
             self.normalize_wide_cells(row);
@@ -411,7 +587,9 @@ impl ScreenGrid {
 
     fn newline(&mut self) {
         self.cursor.col = 0;
-        if self.cursor.row + 1 >= self.rows {
+        if self.cursor.row == self.scroll_bottom {
+            self.scroll_up_region(self.scroll_top, self.scroll_bottom, 1);
+        } else if self.cursor.row + 1 >= self.rows {
             self.scroll_up(1);
         } else {
             self.cursor.row += 1;
@@ -515,6 +693,15 @@ impl ScreenGrid {
         } else {
             None
         }
+    }
+
+    fn normalized_region(&self, top: u16, bottom: u16) -> Option<(u16, u16)> {
+        if self.rows == 0 {
+            return None;
+        }
+        let top = top.min(self.rows.saturating_sub(1));
+        let bottom = bottom.min(self.rows.saturating_sub(1));
+        (top <= bottom).then_some((top, bottom))
     }
 
     fn mark_full_dirty(&mut self) {

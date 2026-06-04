@@ -1,4 +1,4 @@
-use crate::grid::{CellStyle, ScreenGrid, TerminalColor};
+use crate::grid::{CellStyle, CursorState, ScreenGrid, TerminalColor};
 
 /// Currently visible terminal screen.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -14,6 +14,8 @@ pub struct TerminalParser {
     alternate: ScreenGrid,
     active_screen: ActiveScreen,
     current_style: CellStyle,
+    saved_primary_cursor: CursorState,
+    saved_alternate_cursor: CursorState,
     title: Option<String>,
     bracketed_paste: bool,
 }
@@ -26,6 +28,8 @@ impl TerminalParser {
             alternate: ScreenGrid::new(rows, cols),
             active_screen: ActiveScreen::Primary,
             current_style: CellStyle::default(),
+            saved_primary_cursor: CursorState::default(),
+            saved_alternate_cursor: CursorState::default(),
             title: None,
             bracketed_paste: false,
         }
@@ -39,6 +43,8 @@ impl TerminalParser {
             alternate,
             active_screen,
             current_style,
+            saved_primary_cursor,
+            saved_alternate_cursor,
             title,
             bracketed_paste,
         } = self;
@@ -48,6 +54,8 @@ impl TerminalParser {
             alternate,
             active_screen,
             current_style,
+            saved_primary_cursor,
+            saved_alternate_cursor,
             title,
             bracketed_paste,
         };
@@ -100,6 +108,8 @@ struct GridPerformer<'a> {
     alternate: &'a mut ScreenGrid,
     active_screen: &'a mut ActiveScreen,
     current_style: &'a mut CellStyle,
+    saved_primary_cursor: &'a mut CursorState,
+    saved_alternate_cursor: &'a mut CursorState,
     title: &'a mut Option<String>,
     bracketed_paste: &'a mut bool,
 }
@@ -209,6 +219,44 @@ impl GridPerformer<'_> {
             index += 1;
         }
     }
+
+    fn saved_cursor(&mut self) -> &mut CursorState {
+        match self.active_screen {
+            ActiveScreen::Primary => self.saved_primary_cursor,
+            ActiveScreen::Alternate => self.saved_alternate_cursor,
+        }
+    }
+
+    fn save_cursor(&mut self) {
+        *self.saved_cursor() = self.grid().cursor();
+    }
+
+    fn restore_cursor(&mut self) {
+        let cursor = *self.saved_cursor();
+        self.grid().set_cursor(cursor.row, cursor.col);
+        self.grid().set_cursor_visible(cursor.visible);
+    }
+
+    fn reverse_index(&mut self) {
+        let cursor = self.grid().cursor();
+        let top = self.grid().scroll_region().map_or(0, |(top, _)| top);
+        if cursor.row == top {
+            let bottom = self.grid().scroll_region().map_or(0, |(_, bottom)| bottom);
+            self.grid().scroll_down_region(top, bottom, 1);
+        } else {
+            self.grid().move_cursor(-1, 0);
+        }
+    }
+
+    fn set_scroll_region(&mut self, params: &vte::Params) {
+        let top = Self::param(params, 0, 1).saturating_sub(1);
+        let bottom = if params.is_empty() || params.iter().nth(1).is_none() {
+            self.grid().rows().saturating_sub(1)
+        } else {
+            Self::param(params, 1, self.grid().rows()).saturating_sub(1)
+        };
+        self.grid().set_scroll_region(top, bottom);
+    }
 }
 
 impl vte::Perform for GridPerformer<'_> {
@@ -255,6 +303,7 @@ impl vte::Perform for GridPerformer<'_> {
         }
 
         match action {
+            '@' => self.grid().insert_blank_chars(Self::param(params, 0, 1)),
             'A' => self
                 .grid()
                 .move_cursor(-(Self::param(params, 0, 1) as i16), 0),
@@ -288,7 +337,15 @@ impl vte::Perform for GridPerformer<'_> {
                 }
                 _ => {}
             },
+            'L' => self.grid().insert_blank_lines(Self::param(params, 0, 1)),
+            'M' => self.grid().delete_lines(Self::param(params, 0, 1)),
+            'P' => self.grid().delete_chars(Self::param(params, 0, 1)),
             'S' => self.grid().scroll_up(Self::param(params, 0, 1)),
+            'T' => self.grid().scroll_down(Self::param(params, 0, 1)),
+            'X' => self.grid().erase_chars(Self::param(params, 0, 1)),
+            'r' => self.set_scroll_region(params),
+            's' => self.save_cursor(),
+            'u' => self.restore_cursor(),
             'm' => self.apply_sgr(params),
             'h' => self.set_mode(params, intermediates, true),
             'l' => self.set_mode(params, intermediates, false),
@@ -305,13 +362,23 @@ impl vte::Perform for GridPerformer<'_> {
             ([], b'c') => {
                 self.primary.clear_screen();
                 self.alternate.clear_screen();
+                self.primary.reset_scroll_region();
+                self.alternate.reset_scroll_region();
                 *self.active_screen = ActiveScreen::Primary;
                 *self.current_style = CellStyle::default();
+                *self.saved_primary_cursor = CursorState::default();
+                *self.saved_alternate_cursor = CursorState::default();
                 *self.title = None;
                 *self.bracketed_paste = false;
             }
             ([], b'D') => self.execute(b'\n'),
-            ([], b'M') => self.grid().move_cursor(-1, 0),
+            ([], b'E') => {
+                self.execute(b'\r');
+                self.execute(b'\n');
+            }
+            ([], b'M') => self.reverse_index(),
+            ([], b'7') => self.save_cursor(),
+            ([], b'8') => self.restore_cursor(),
             _ => {}
         }
     }
@@ -404,5 +471,88 @@ mod tests {
         parser.advance(b"\x1b[?2004l");
 
         assert!(!parser.bracketed_paste());
+    }
+
+    #[test]
+    fn decstbm_limits_linefeed_scrolling_to_scroll_region() {
+        let mut parser = TerminalParser::new(4, 4);
+
+        parser.advance(b"\x1b[1;1Haaaa\x1b[2;1Hbbbb\x1b[3;1Hcccc\x1b[4;1Hdddd");
+        parser.advance(b"\x1b[2;3r\x1b[3;1H\n");
+
+        assert_eq!(parser.grid().scroll_region(), Some((1, 2)));
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("aaaa"));
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("cccc"));
+        assert_eq!(parser.grid().line_text(2).as_deref(), Some("    "));
+        assert_eq!(parser.grid().line_text(3).as_deref(), Some("dddd"));
+    }
+
+    #[test]
+    fn reverse_index_scrolls_down_inside_scroll_region() {
+        let mut parser = TerminalParser::new(4, 4);
+
+        parser.advance(b"\x1b[1;1Haaaa\x1b[2;1Hbbbb\x1b[3;1Hcccc\x1b[4;1Hdddd");
+        parser.advance(b"\x1b[2;3r\x1b[2;1H\x1bM");
+
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("aaaa"));
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("    "));
+        assert_eq!(parser.grid().line_text(2).as_deref(), Some("bbbb"));
+        assert_eq!(parser.grid().line_text(3).as_deref(), Some("dddd"));
+    }
+
+    #[test]
+    fn csi_and_esc_cursor_save_restore_are_supported() {
+        let mut parser = TerminalParser::new(3, 5);
+
+        parser.advance(b"\x1b[2;3H\x1b[s\x1b[1;1H\x1b[uA");
+        parser.advance(b"\x1b[3;5H\x1b7\x1b[1;1H\x1b8B");
+
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("  A  "));
+        assert_eq!(parser.grid().line_text(2).as_deref(), Some("    B"));
+    }
+
+    #[test]
+    fn csi_scroll_down_inserts_blank_lines_at_top() {
+        let mut parser = TerminalParser::new(3, 3);
+
+        parser.advance(b"\x1b[1;1Haaa\x1b[2;1Hbbb\x1b[3;1Hccc\x1b[1T");
+
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("   "));
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("aaa"));
+        assert_eq!(parser.grid().line_text(2).as_deref(), Some("bbb"));
+    }
+
+    #[test]
+    fn csi_character_insert_delete_and_erase_update_line() {
+        let mut parser = TerminalParser::new(1, 6);
+
+        parser.advance(b"abcdef\x1b[3G\x1b[2X");
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("ab  ef"));
+
+        parser.advance(b"\rabcdef\x1b[3G\x1b[2P");
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("abef  "));
+
+        parser.advance(b"\rabcdef\x1b[3G\x1b[2@");
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("ab  cd"));
+    }
+
+    #[test]
+    fn csi_line_insert_delete_respects_scroll_region() {
+        let mut parser = TerminalParser::new(4, 4);
+
+        parser.advance(b"\x1b[1;1Haaaa\x1b[2;1Hbbbb\x1b[3;1Hcccc\x1b[4;1Hdddd");
+        parser.advance(b"\x1b[2;4r\x1b[3;1H\x1b[L");
+
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("aaaa"));
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("bbbb"));
+        assert_eq!(parser.grid().line_text(2).as_deref(), Some("    "));
+        assert_eq!(parser.grid().line_text(3).as_deref(), Some("cccc"));
+
+        parser.advance(b"\x1b[2;1H\x1b[M");
+
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("aaaa"));
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("    "));
+        assert_eq!(parser.grid().line_text(2).as_deref(), Some("cccc"));
+        assert_eq!(parser.grid().line_text(3).as_deref(), Some("    "));
     }
 }
