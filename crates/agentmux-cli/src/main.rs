@@ -72,7 +72,23 @@ Agent sessions register a stable role and a unique session name at startup. Use 
 
 Each live session receives its own identity through environment variables: `AGENTMUX_AGENT_NAME`, `AGENTMUX_AGENT_ROLE`, and `AGENTMUX_AGENT_ID`. Use `AGENTMUX_AGENT_NAME` when another session needs to reply to exactly this session.
 
+Common TUI workflows:
+
+- Start multiple panes with `agentmux start "agy,codex"` or include message history with `agentmux start "agy,messages,codex"`.
+- Inside the TUI, `Ctrl-g %` and `Ctrl-g "` open the new pane picker. Choose `Claude Code`, `Codex`, `Antigravity`, or `Conversation List`.
+- `Conversation List` opens the message history as a normal pane. `Ctrl-g m` opens the same history as a temporary overlay.
+- `Ctrl-g s` shows running sessions with their names, roles, and process IDs.
+- `Ctrl-g x` closes the focused local pane or stops the focused agent pane.
+
+Message inspection commands:
+
+- `agentmux message list` shows stored bus messages newest first.
+- `agentmux sessions` shows live agent sessions and their stable names/roles.
+- `agentmux start "messages"` opens only the message history pane.
+
 To inject an existing bus message into a live session, use `agentmux message inject <message_id>` only when the message target resolves to exactly one session. If the target can resolve to multiple sessions (for example `role:tester`) or you need a specific pane, use `agentmux agent inject <message_id> <agent_id>` after checking `agentmux sessions`; this explicitly selects the session that receives the PTY input.
+
+Injection is asynchronous: the daemon records the message first, then waits briefly before writing the rendered message into the target PTY. If the TUI list updates before the text appears in the agent pane, wait a few seconds before retrying.
 
 ```json
 {
@@ -199,8 +215,14 @@ enum Commands {
 
 #[derive(Parser)]
 struct StartArgs {
-    /// Comma-separated providers to spawn before opening the TUI, e.g. "agy,codex".
+    /// Comma-separated panes to open before the TUI, e.g. "agy,codex,messages".
     providers: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupPaneChoice {
+    Agent(AgentProviderChoice),
+    Messages,
 }
 
 #[derive(Parser)]
@@ -466,8 +488,8 @@ async fn main() -> Result<()> {
 
     match command {
         Commands::Start(args) => {
-            let providers = parse_start_providers(args.providers.as_deref())?;
-            run_tui_session_with_startup_providers(&socket_path, providers).await?;
+            let panes = parse_start_panes(args.providers.as_deref())?;
+            run_tui_session_with_startup_panes(&socket_path, panes).await?;
         }
         Commands::Doctor(_) => {
             let report = doctor_report(
@@ -997,15 +1019,23 @@ fn agent_send_request(agent_id: String, body: String) -> Result<ClientRequest> {
     ))
 }
 
-fn parse_start_providers(raw: Option<&str>) -> Result<Vec<AgentProviderChoice>> {
+fn parse_start_panes(raw: Option<&str>) -> Result<Vec<StartupPaneChoice>> {
     let Some(raw) = raw else {
         return Ok(Vec::new());
     };
     raw.split(',')
         .map(str::trim)
-        .filter(|provider| !provider.is_empty())
-        .map(parse_provider_choice)
+        .filter(|pane| !pane.is_empty())
+        .map(parse_start_pane_choice)
         .collect()
+}
+
+fn parse_start_pane_choice(raw: &str) -> Result<StartupPaneChoice> {
+    match raw.to_ascii_lowercase().as_str() {
+        "messages" | "message" | "message-bus" | "message_bus" | "conversation-list"
+        | "conversation_list" => Ok(StartupPaneChoice::Messages),
+        _ => parse_provider_choice(raw).map(StartupPaneChoice::Agent),
+    }
 }
 
 fn parse_provider_choice(raw: &str) -> Result<AgentProviderChoice> {
@@ -1014,7 +1044,7 @@ fn parse_provider_choice(raw: &str) -> Result<AgentProviderChoice> {
         "codex" => Ok(AgentProviderChoice::Codex),
         "agy" | "antigravity" => Ok(AgentProviderChoice::Agy),
         _ => Err(AgentmuxError::UserError(format!(
-            "unknown provider '{raw}' (expected claude, codex, or agy)"
+            "unknown start pane '{raw}' (expected claude, codex, agy, or messages)"
         ))),
     }
 }
@@ -1736,17 +1766,17 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
     run_tui_session_inner(socket_path, target, Vec::new()).await
 }
 
-async fn run_tui_session_with_startup_providers(
+async fn run_tui_session_with_startup_panes(
     socket_path: &Path,
-    providers: Vec<AgentProviderChoice>,
+    panes: Vec<StartupPaneChoice>,
 ) -> Result<()> {
-    run_tui_session_inner(socket_path, None, providers).await
+    run_tui_session_inner(socket_path, None, panes).await
 }
 
 async fn run_tui_session_inner(
     socket_path: &Path,
     target: Option<String>,
-    startup_providers: Vec<AgentProviderChoice>,
+    startup_panes: Vec<StartupPaneChoice>,
 ) -> Result<()> {
     ensure_daemon(socket_path).await?;
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
@@ -1766,8 +1796,15 @@ async fn run_tui_session_inner(
     let status_request = tui_daemon_status_request();
     let status_request_id = status_request.id.clone();
     writer.write(&status_request).await?;
-    let startup_spawn_requests = startup_providers
+    let open_startup_messages = startup_panes
+        .iter()
+        .any(|pane| matches!(pane, StartupPaneChoice::Messages));
+    let startup_spawn_requests = startup_panes
         .into_iter()
+        .filter_map(|pane| match pane {
+            StartupPaneChoice::Agent(provider) => Some(provider),
+            StartupPaneChoice::Messages => None,
+        })
         .enumerate()
         .map(|(index, provider)| {
             agent_spawn_for_provider_request_with_id(
@@ -1778,6 +1815,10 @@ async fn run_tui_session_inner(
         })
         .collect::<Vec<_>>();
     for request in &startup_spawn_requests {
+        writer.write(request).await?;
+    }
+    let startup_message_list_request = open_startup_messages.then(message_list_request);
+    if let Some(request) = &startup_message_list_request {
         writer.write(request).await?;
     }
     let startup_spawn_request_ids = startup_spawn_requests
@@ -1804,6 +1845,9 @@ async fn run_tui_session_inner(
             Some(&attach_request.id),
             Some(&snapshot_request.id),
             &startup_spawn_request_ids,
+            startup_message_list_request
+                .as_ref()
+                .map(|request| request.id.as_str()),
         )
         .await?;
     } else {
@@ -1814,9 +1858,15 @@ async fn run_tui_session_inner(
             None,
             None,
             &startup_spawn_request_ids,
+            startup_message_list_request
+                .as_ref()
+                .map(|request| request.id.as_str()),
         )
         .await?;
-        if startup_agent_ids.is_empty() {
+        if open_startup_messages {
+            state.open_conversation_list_pane();
+        }
+        if startup_agent_ids.is_empty() && !open_startup_messages {
             state.open_provider_picker();
         }
     }
@@ -2076,6 +2126,7 @@ async fn wait_for_tui_bootstrap<R>(
     attach_request_id: Option<&str>,
     snapshot_request_id: Option<&str>,
     startup_spawn_request_ids: &[String],
+    startup_message_list_request_id: Option<&str>,
 ) -> Result<Vec<String>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
@@ -2083,12 +2134,14 @@ where
     let mut status_received = false;
     let mut attach_received = attach_request_id.is_none();
     let mut snapshot_received = snapshot_request_id.is_none();
+    let mut startup_messages_received = startup_message_list_request_id.is_none();
     let mut startup_spawn_received = BTreeSet::new();
     let mut startup_agent_ids = Vec::new();
 
     while !(status_received
         && attach_received
         && snapshot_received
+        && startup_messages_received
         && startup_spawn_received.len() == startup_spawn_request_ids.len())
     {
         let frame = reader.read::<DaemonStreamFrame>().await?.ok_or_else(|| {
@@ -2104,6 +2157,9 @@ where
             }
             if Some(response_id.as_str()) == snapshot_request_id {
                 snapshot_received = true;
+            }
+            if Some(response_id.as_str()) == startup_message_list_request_id {
+                startup_messages_received = true;
             }
             if startup_spawn_request_ids.contains(&response_id) {
                 startup_spawn_received.insert(response_id);
@@ -2867,14 +2923,18 @@ mod tests {
 
     #[test]
     fn start_command_accepts_comma_separated_providers() {
-        let cli = Cli::try_parse_from(["agentmux", "start", "agy,codex"]).unwrap();
+        let cli = Cli::try_parse_from(["agentmux", "start", "agy,messages,codex"]).unwrap();
         let Some(Commands::Start(args)) = cli.command else {
             panic!("expected start command");
         };
 
         assert_eq!(
-            parse_start_providers(args.providers.as_deref()).unwrap(),
-            vec![AgentProviderChoice::Agy, AgentProviderChoice::Codex]
+            parse_start_panes(args.providers.as_deref()).unwrap(),
+            vec![
+                StartupPaneChoice::Agent(AgentProviderChoice::Agy),
+                StartupPaneChoice::Messages,
+                StartupPaneChoice::Agent(AgentProviderChoice::Codex)
+            ]
         );
     }
 
@@ -3759,6 +3819,9 @@ mod tests {
         assert!(contents.contains("AGENTMUX_AGENT_NAME"));
         assert!(contents.contains("agentmux message inject <message_id>"));
         assert!(contents.contains("agentmux agent inject <message_id> <agent_id>"));
+        assert!(contents.contains("agentmux start \"agy,messages,codex\""));
+        assert!(contents.contains("Conversation List"));
+        assert!(contents.contains("Injection is asynchronous"));
         assert!(contents.contains("Two-session exchange example"));
         assert!(contents.contains("agentmux message list"));
 
