@@ -113,6 +113,10 @@ impl TuiSessionRenderer {
         if state.keybinding_help_visible() {
             render_keybinding_help(area, buffer);
         }
+
+        if state.session_list_visible() {
+            render_session_list(area, state, buffer);
+        }
     }
 }
 
@@ -122,6 +126,7 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "Ctrl-g ?      Toggle this help",
     "Ctrl-g d      Detach session",
     "Ctrl-g q      Quit session",
+    "Ctrl-g s      List running sessions",
     "Ctrl-g x      Close focused pane",
     "Ctrl-g z      Toggle pane zoom",
     "Ctrl-g arrows Move focus",
@@ -130,6 +135,39 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "Ctrl-g Space  Rotate split direction",
     "Ctrl-g :      Command palette",
 ];
+
+fn render_session_list(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut lines = vec!["ID NAME PID".to_string()];
+    for pane in state.panes().filter(|pane| pane.process_id().is_some()) {
+        let pid = pane
+            .process_id()
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        lines.push(format!("{} {} {}", pane.agent_id(), pane.name(), pid));
+    }
+
+    if lines.len() == 1 {
+        lines.push("no running sessions".to_string());
+    }
+
+    let height = u16::try_from(lines.len() + 2).unwrap_or(u16::MAX).min(18);
+    let popup = centered_rect(area, 70, height);
+    Clear.render(popup, buffer);
+    let paragraph = Paragraph::new(lines.join("\n"))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Running Sessions")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Left)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    paragraph.render(popup, buffer);
+}
 
 fn render_keybinding_help(area: Rect, buffer: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
@@ -310,6 +348,42 @@ mod tests {
         assert!(rendered.contains("Key Bindings"));
         assert!(rendered.contains("Ctrl-g ?"));
         assert!(rendered.contains("Toggle this help"));
+    }
+
+    #[test]
+    fn render_session_draws_session_list_overlay_when_visible() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {
+                    "id": "agent_live",
+                    "name": "shell",
+                    "process_id": 1234
+                },
+                {
+                    "id": "agent_restored",
+                    "name": "restored",
+                    "process_id": null
+                }
+            ]
+        }));
+        state.apply_command(crate::keymap::TuiCommand::ShowSessionList);
+
+        let area = Rect::new(0, 0, 80, 20);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Running Sessions"));
+        assert!(rendered.contains("agent_live"));
+        assert!(rendered.contains("shell"));
+        assert!(rendered.contains("1234"));
+        assert!(!rendered.contains("agent_restored"));
     }
 
     #[test]
