@@ -13,6 +13,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::keymap::{FocusDirection, TuiCommand};
 use crate::layout::{PaneLayout, SplitDirection};
 
+pub const CONVERSATION_LIST_PANE_ID: &str = "__agentmux_conversation_list__";
+
 /// Stable pane state derived from daemon agent/session events.
 pub struct AgentPaneState {
     agent_id: String,
@@ -149,6 +151,15 @@ impl TuiSessionState {
 
     pub fn pane(&self, agent_id: &str) -> Option<&AgentPaneState> {
         self.panes.get(agent_id)
+    }
+
+    pub fn is_conversation_list_pane(&self, pane_id: &str) -> bool {
+        pane_id == CONVERSATION_LIST_PANE_ID
+            && self
+                .layout
+                .panes()
+                .iter()
+                .any(|existing| existing == pane_id)
     }
 
     pub fn panes(&self) -> impl Iterator<Item = &AgentPaneState> {
@@ -294,16 +305,31 @@ impl TuiSessionState {
                 CommandEffect::Continue
             }
             TuiCommand::SelectProvider => self
-                .selected_provider()
-                .map(|provider| {
+                .selected_new_pane_choice()
+                .map(|choice| {
                     self.provider_picker_visible = false;
-                    CommandEffect::SpawnAgentPane(provider)
+                    match choice {
+                        NewPaneChoice::Agent(provider) => CommandEffect::SpawnAgentPane(provider),
+                        NewPaneChoice::ConversationList => {
+                            self.open_conversation_list_pane();
+                            CommandEffect::OpenConversationListPane
+                        }
+                    }
                 })
                 .unwrap_or(CommandEffect::Continue),
-            TuiCommand::ClosePane => self
-                .focused_pane()
-                .map(|pane| CommandEffect::StopPane(pane.agent_id().to_string()))
-                .unwrap_or(CommandEffect::Continue),
+            TuiCommand::ClosePane => {
+                let Some(focused) = self.layout.focused().map(ToOwned::to_owned) else {
+                    return CommandEffect::Continue;
+                };
+                if focused == CONVERSATION_LIST_PANE_ID {
+                    self.layout.remove_pane(&focused);
+                    CommandEffect::Continue
+                } else {
+                    self.pane(&focused)
+                        .map(|pane| CommandEffect::StopPane(pane.agent_id().to_string()))
+                        .unwrap_or(CommandEffect::Continue)
+                }
+            }
             TuiCommand::RotateLayout => {
                 self.layout.toggle_split_direction();
                 CommandEffect::Continue
@@ -374,16 +400,26 @@ impl TuiSessionState {
         }
     }
 
+    pub fn open_conversation_list_pane(&mut self) {
+        self.layout.add_pane(CONVERSATION_LIST_PANE_ID.to_string());
+        self.layout.focus(CONVERSATION_LIST_PANE_ID);
+        self.keybinding_help_visible = false;
+        self.session_list_visible = false;
+        self.message_bus_visible = false;
+        self.provider_picker_visible = false;
+        self.clear_copy_selection();
+    }
+
     fn move_provider_selection(&mut self, delta: isize) {
         let count = PROVIDER_OPTIONS.len() as isize;
         let current = isize::try_from(self.provider_picker_selected).unwrap_or(0);
         self.provider_picker_selected = (current + delta).rem_euclid(count) as usize;
     }
 
-    fn selected_provider(&self) -> Option<AgentProviderChoice> {
+    fn selected_new_pane_choice(&self) -> Option<NewPaneChoice> {
         PROVIDER_OPTIONS
             .get(self.provider_picker_selected)
-            .map(|option| option.provider)
+            .map(|option| option.choice)
     }
 
     fn select_focused_running_session(&mut self) {
@@ -743,6 +779,7 @@ pub enum CommandEffect {
     Detach,
     Quit,
     SpawnAgentPane(AgentProviderChoice),
+    OpenConversationListPane,
     StopPane(String),
     RefreshMessages,
     Unhandled(TuiCommand),
@@ -782,8 +819,23 @@ impl AgentProviderChoice {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NewPaneChoice {
+    Agent(AgentProviderChoice),
+    ConversationList,
+}
+
+impl NewPaneChoice {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent(provider) => provider.label(),
+            Self::ConversationList => "Conversation List",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ProviderOption {
-    pub provider: AgentProviderChoice,
+    pub choice: NewPaneChoice,
     pub hint: &'static str,
 }
 
@@ -837,16 +889,20 @@ pub struct CopyPoint {
 
 const PROVIDER_OPTIONS: &[ProviderOption] = &[
     ProviderOption {
-        provider: AgentProviderChoice::Claude,
+        choice: NewPaneChoice::Agent(AgentProviderChoice::Claude),
         hint: "Claude Code",
     },
     ProviderOption {
-        provider: AgentProviderChoice::Codex,
+        choice: NewPaneChoice::Agent(AgentProviderChoice::Codex),
         hint: "OpenAI Codex",
     },
     ProviderOption {
-        provider: AgentProviderChoice::Agy,
+        choice: NewPaneChoice::Agent(AgentProviderChoice::Agy),
         hint: "Google Antigravity CLI",
+    },
+    ProviderOption {
+        choice: NewPaneChoice::ConversationList,
+        hint: "Message history panel",
     },
 ];
 
@@ -1320,6 +1376,10 @@ mod tests {
         );
         assert!(!state.provider_picker_visible());
         assert_eq!(
+            state.provider_options()[3].choice,
+            NewPaneChoice::ConversationList
+        );
+        assert_eq!(
             state.apply_command(TuiCommand::ClosePane),
             CommandEffect::StopPane("agent_a".to_string())
         );
@@ -1367,6 +1427,33 @@ mod tests {
             CommandEffect::Continue
         );
         assert!(!state.message_bus_visible());
+    }
+
+    #[test]
+    fn provider_picker_can_open_and_close_conversation_list_pane() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_a", "name": "a" }),
+        ));
+        state.layout_mut().focus("agent_a");
+        state.open_provider_picker();
+        state.apply_command(TuiCommand::ProviderPrevious);
+
+        assert_eq!(
+            state.apply_command(TuiCommand::SelectProvider),
+            CommandEffect::OpenConversationListPane
+        );
+        assert!(!state.provider_picker_visible());
+        assert!(state.is_conversation_list_pane(CONVERSATION_LIST_PANE_ID));
+        assert_eq!(state.layout().focused(), Some(CONVERSATION_LIST_PANE_ID));
+
+        assert_eq!(
+            state.apply_command(TuiCommand::ClosePane),
+            CommandEffect::Continue
+        );
+        assert!(!state.is_conversation_list_pane(CONVERSATION_LIST_PANE_ID));
+        assert_eq!(state.layout().focused(), Some("agent_a"));
     }
 
     #[test]

@@ -210,6 +210,12 @@ pub struct TuiSessionRenderer {
 impl TuiSessionRenderer {
     pub fn render(&self, area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
         for (pane_id, rect) in state.layout().pane_rects(area) {
+            if state.is_conversation_list_pane(&pane_id) {
+                let focused = state.layout().focused() == Some(pane_id.as_str());
+                render_message_list_panel(rect, state, "Conversation List", focused, buffer);
+                continue;
+            }
+
             let Some(pane) = state.pane(&pane_id) else {
                 continue;
             };
@@ -344,7 +350,7 @@ fn render_provider_picker(area: Rect, state: &TuiSessionState, buffer: &mut Buff
         };
         lines.push(format!(
             "{marker} {}  {}",
-            option.provider.label(),
+            option.choice.label(),
             option.hint
         ));
     }
@@ -369,14 +375,60 @@ fn render_message_bus(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) 
         return;
     }
 
-    let mut lines = vec![
-        "Esc/q to close".to_string(),
-        "".to_string(),
-        format!(
-            "{:<16} {:<12} {:<12} {:<16} {:<16} {:<16} {}",
-            "CREATED", "STATUS", "KIND", "FROM", "TO", "ID", "BODY"
-        ),
-    ];
+    let max_height = area.height.saturating_sub(2).max(8);
+    let height = u16::try_from(message_list_lines(state, true).len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(max_height);
+    let popup = centered_rect(area, area.width.saturating_sub(4).max(40), height);
+    render_message_list_panel(popup, state, "Message Bus", false, buffer);
+}
+
+fn render_message_list_panel(
+    area: Rect,
+    state: &TuiSessionState,
+    title: &'static str,
+    focused: bool,
+    buffer: &mut Buffer,
+) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let lines = message_list_lines(state, title == "Message Bus");
+    let visible_lines = area.height.saturating_sub(2) as usize;
+    let text = lines
+        .into_iter()
+        .take(visible_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Clear.render(area, buffer);
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(border_style),
+        )
+        .alignment(Alignment::Left)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    paragraph.render(area, buffer);
+}
+
+fn message_list_lines(state: &TuiSessionState, include_overlay_hint: bool) -> Vec<String> {
+    let mut lines = vec![format!(
+        "{:<16} {:<12} {:<12} {:<16} {:<16} {:<16} {}",
+        "CREATED", "STATUS", "KIND", "FROM", "TO", "ID", "BODY"
+    )];
+    if include_overlay_hint {
+        lines.insert(0, "Esc/q to close".to_string());
+        lines.insert(1, "".to_string());
+    }
 
     for message in state.messages().iter() {
         lines.push(format!(
@@ -395,29 +447,7 @@ fn render_message_bus(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) 
         lines.push("no messages".to_string());
     }
 
-    let max_height = area.height.saturating_sub(2).max(8);
-    let height = u16::try_from(lines.len() + 2)
-        .unwrap_or(u16::MAX)
-        .min(max_height);
-    let popup = centered_rect(area, area.width.saturating_sub(4).max(40), height);
-    let visible_lines = popup.height.saturating_sub(2) as usize;
-    let text = lines
-        .into_iter()
-        .take(visible_lines)
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    Clear.render(popup, buffer);
-    let paragraph = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title("Message Bus")
-                .border_style(Style::default().fg(Color::Cyan)),
-        )
-        .alignment(Alignment::Left)
-        .style(Style::default().fg(Color::White).bg(Color::Black));
-    paragraph.render(popup, buffer);
+    lines
 }
 
 fn render_keybinding_help(area: Rect, buffer: &mut Buffer) {
@@ -713,6 +743,7 @@ mod tests {
         assert!(rendered.contains("> Claude Code"));
         assert!(rendered.contains("Codex"));
         assert!(rendered.contains("Antigravity"));
+        assert!(rendered.contains("Conversation List"));
     }
 
     #[test]
@@ -751,6 +782,39 @@ mod tests {
         assert!(rendered.contains("msg_001"));
         assert!(rendered.contains("agent:planner"));
         assert!(rendered.contains("please continue"));
+    }
+
+    #[test]
+    fn render_session_draws_conversation_list_pane() {
+        let mut state = TuiSessionState::default();
+        state.open_conversation_list_pane();
+        state.apply_message_list_payload(&json!({
+            "messages": [
+                {
+                    "message_id": "msg_002",
+                    "created_at": "2026-06-04T02:00:00+00:00",
+                    "delivery_status": "pending",
+                    "kind": "handoff",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "agent", "id": "impl" },
+                    "body": "review this"
+                }
+            ]
+        }));
+
+        let area = Rect::new(0, 0, 160, 20);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Conversation List"));
+        assert!(rendered.contains("msg_002"));
+        assert!(rendered.contains("review this"));
     }
 
     #[test]

@@ -2005,6 +2005,16 @@ async fn run_tui_session_inner(
                             ))
                             .await?;
                     }
+                    CommandEffect::OpenConversationListPane => {
+                        writer.write(&message_list_request()).await?;
+                        sync_current_terminal_pane_sizes(
+                            &mut writer,
+                            &mut state,
+                            &mut resize_sequence,
+                        )
+                        .await?;
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
                     CommandEffect::StopPane(agent_id) => {
                         writer.write(&agent_stop_request(agent_id)).await?;
                     }
@@ -2445,6 +2455,7 @@ fn resize_pane_sizes(
         .pane_rects(area)
         .into_iter()
         .filter_map(|(agent_id, rect)| {
+            state.pane(&agent_id)?;
             let (rows, cols) = PaneLayout::pane_inner_size(rect);
             (rows > 0 && cols > 0).then_some((agent_id, TuiTerminalSize { rows, cols }))
         })
@@ -2972,6 +2983,27 @@ mod tests {
                     TuiTerminalSize { rows: 22, cols: 48 }
                 ),
             ]
+        );
+    }
+
+    #[test]
+    fn resize_pane_sizes_ignore_local_conversation_list_pane() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_a", "name": "a"}
+            ]
+        }));
+        state.open_conversation_list_pane();
+
+        let sizes = resize_pane_sizes(&state, 100, 24);
+
+        assert_eq!(
+            sizes,
+            vec![(
+                "agent_a".to_string(),
+                TuiTerminalSize { rows: 22, cols: 48 }
+            )]
         );
     }
 
