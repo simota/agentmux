@@ -27,9 +27,9 @@ use agentmux_tui::{
     terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
 };
 use clap::{Parser, Subcommand};
-use crossterm::event::Event;
+use crossterm::{event::Event, terminal as crossterm_terminal};
 use serde_json::{Value, json};
-use tokio::io::BufReader;
+use tokio::io::{AsyncWrite, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -770,16 +770,28 @@ fn bare_session_spawn_request() -> ClientRequest {
     agent_spawn_for_provider_request(AgentProviderChoice::Codex)
 }
 
+#[cfg(test)]
 fn agent_spawn_for_provider_request(provider: AgentProviderChoice) -> ClientRequest {
-    ClientRequest::new(
-        "req_agent_spawn_provider",
-        IpcCommand::AgentSpawn,
-        json!({
-            "provider": provider.provider(),
-            "role": "implementer",
-            "name": provider.default_name(),
-        }),
-    )
+    agent_spawn_for_provider_request_with_size(provider, None)
+}
+
+fn agent_spawn_for_provider_request_with_size(
+    provider: AgentProviderChoice,
+    size: Option<TuiTerminalSize>,
+) -> ClientRequest {
+    let mut payload = json!({
+        "provider": provider.provider(),
+        "role": "implementer",
+        "name": provider.default_name(),
+    });
+    if let Some(size) = size {
+        payload["size"] = json!({
+            "rows": size.rows,
+            "cols": size.cols,
+        });
+    }
+
+    ClientRequest::new("req_agent_spawn_provider", IpcCommand::AgentSpawn, payload)
 }
 
 fn agent_spawn_request(provider: String, role: String) -> Result<ClientRequest> {
@@ -1621,6 +1633,7 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
     let signal_task = spawn_tui_signal_forwarder(signal_tx);
 
+    sync_current_terminal_pane_sizes(&mut writer, &mut state, &mut resize_sequence).await?;
     draw_tui_frame(&mut terminal, &renderer, &state)?;
 
     loop {
@@ -1633,6 +1646,8 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
             let spawned_agent_id = spawned_agent_id_from_frame(&frame);
             let _notice = apply_runtime_stream_frame(&mut state, frame);
             if let Some(agent_id) = spawned_agent_id {
+                sync_current_terminal_pane_sizes(&mut writer, &mut state, &mut resize_sequence)
+                    .await?;
                 writer.write(&attach_request(agent_id.clone())).await?;
                 writer.write(&snapshot_request(agent_id)).await?;
             }
@@ -1653,16 +1668,10 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
         {
             let Event::Key(key) = event else {
                 if let Event::Resize(cols, rows) = event {
-                    for (agent_id, size) in resize_pane_sizes(&state, cols, rows) {
-                        resize_sequence = resize_sequence.saturating_add(1);
-                        state.resize_pane(&agent_id, size);
-                        writer
-                            .write(&agent_resize_request(
-                                format!("req_resize_{resize_sequence}"),
-                                agent_id,
-                                size,
-                            ))
-                            .await?;
+                    for request in
+                        resize_panes_for_terminal(&mut state, cols, rows, &mut resize_sequence)
+                    {
+                        writer.write(&request).await?;
                     }
                     draw_tui_frame(&mut terminal, &renderer, &state)?;
                 }
@@ -1680,11 +1689,22 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
             } {
                 match state.apply_command(command) {
                     CommandEffect::Continue => {
+                        sync_current_terminal_pane_sizes(
+                            &mut writer,
+                            &mut state,
+                            &mut resize_sequence,
+                        )
+                        .await?;
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
                     }
                     CommandEffect::SpawnAgentPane(provider) => {
+                        let spawn_size = current_terminal_size()
+                            .ok()
+                            .and_then(|(cols, rows)| pending_spawn_pane_size(&state, cols, rows));
                         writer
-                            .write(&agent_spawn_for_provider_request(provider))
+                            .write(&agent_spawn_for_provider_request_with_size(
+                                provider, spawn_size,
+                            ))
                             .await?;
                     }
                     CommandEffect::StopPane(agent_id) => {
@@ -1833,6 +1853,66 @@ fn draw_tui_frame<T: TerminalIo>(
         .io_mut()
         .draw(|frame| renderer.render(frame.area(), state, frame.buffer_mut()))
         .map_err(|error| AgentmuxError::TerminalError(format!("failed to draw TUI: {error}")))
+}
+
+async fn sync_current_terminal_pane_sizes<W>(
+    writer: &mut JsonlWriter<W>,
+    state: &mut TuiSessionState,
+    resize_sequence: &mut u64,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let (cols, rows) = current_terminal_size()?;
+    for request in resize_panes_for_terminal(state, cols, rows, resize_sequence) {
+        writer.write(&request).await?;
+    }
+    Ok(())
+}
+
+fn current_terminal_size() -> Result<(u16, u16)> {
+    crossterm_terminal::size().map_err(|error| {
+        AgentmuxError::TerminalError(format!("failed to read terminal size: {error}"))
+    })
+}
+
+fn pending_spawn_pane_size(
+    state: &TuiSessionState,
+    terminal_cols: u16,
+    terminal_rows: u16,
+) -> Option<TuiTerminalSize> {
+    let mut snapshot = state.layout().snapshot();
+    let pending_pane = "__agentmux_pending_spawn__".to_string();
+    snapshot.panes.push(pending_pane.clone());
+    snapshot.focused = Some(pending_pane.clone());
+
+    let area = Rect::new(0, 0, terminal_cols, terminal_rows);
+    PaneLayout::restore(snapshot)
+        .pane_rects(area)
+        .into_iter()
+        .find_map(|(agent_id, rect)| {
+            if agent_id != pending_pane {
+                return None;
+            }
+            let (rows, cols) = PaneLayout::pane_inner_size(rect);
+            (rows > 0 && cols > 0).then_some(TuiTerminalSize { rows, cols })
+        })
+}
+
+fn resize_panes_for_terminal(
+    state: &mut TuiSessionState,
+    terminal_cols: u16,
+    terminal_rows: u16,
+    resize_sequence: &mut u64,
+) -> Vec<ClientRequest> {
+    resize_pane_sizes(state, terminal_cols, terminal_rows)
+        .into_iter()
+        .map(|(agent_id, size)| {
+            *resize_sequence = resize_sequence.saturating_add(1);
+            state.resize_pane(&agent_id, size);
+            agent_resize_request(format!("req_resize_{resize_sequence}"), agent_id, size)
+        })
+        .collect()
 }
 
 fn resize_pane_sizes(
@@ -2243,6 +2323,19 @@ mod tests {
     }
 
     #[test]
+    fn provider_spawn_request_can_include_initial_pty_size() {
+        let request = agent_spawn_for_provider_request_with_size(
+            AgentProviderChoice::Codex,
+            Some(TuiTerminalSize { rows: 28, cols: 88 }),
+        );
+
+        assert_eq!(request.id, "req_agent_spawn_provider");
+        assert_eq!(request.command, IpcCommand::AgentSpawn);
+        assert_eq!(request.payload["provider"], "codex");
+        assert_eq!(request.payload["size"], json!({ "rows": 28, "cols": 88 }));
+    }
+
+    #[test]
     fn bare_spawn_response_yields_agent_id_for_tui_attach() {
         let agent_id = agent_id_from_spawn_response(DaemonResponse::ok(
             "req_bare_agent_spawn",
@@ -2325,6 +2418,53 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn pending_spawn_pane_size_matches_hypothetical_new_pane_inner_dimensions() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_a", "name": "a"}
+            ]
+        }));
+
+        let size = pending_spawn_pane_size(&state, 100, 24);
+
+        assert_eq!(size, Some(TuiTerminalSize { rows: 22, cols: 48 }));
+    }
+
+    #[test]
+    fn pending_spawn_pane_size_uses_full_inner_area_when_first_pane() {
+        let state = TuiSessionState::default();
+
+        let size = pending_spawn_pane_size(&state, 100, 24);
+
+        assert_eq!(size, Some(TuiTerminalSize { rows: 22, cols: 98 }));
+    }
+
+    #[test]
+    fn resize_panes_for_terminal_updates_state_and_returns_resize_requests() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_a", "name": "a"}
+            ]
+        }));
+        let mut sequence = 7;
+
+        let requests = resize_panes_for_terminal(&mut state, 90, 30, &mut sequence);
+
+        assert_eq!(sequence, 8);
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].id, "req_resize_8");
+        assert_eq!(
+            requests[0].payload,
+            json!({ "agent_id": "agent_a", "rows": 28, "cols": 88 })
+        );
+        let pane = state.pane("agent_a").expect("pane");
+        assert_eq!(pane.grid().rows(), 28);
+        assert_eq!(pane.grid().cols(), 88);
     }
 
     #[test]
