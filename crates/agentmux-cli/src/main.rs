@@ -742,6 +742,13 @@ fn tui_signal_effect(signal: TuiSignal) -> CommandEffect {
     }
 }
 
+fn tui_close_request(effect: CommandEffect) -> Option<ClientRequest> {
+    match effect {
+        CommandEffect::Detach | CommandEffect::Quit => Some(detach_request()),
+        _ => None,
+    }
+}
+
 fn spawn_tui_signal_forwarder(signal_tx: mpsc::UnboundedSender<TuiSignal>) -> JoinHandle<()> {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
@@ -1633,16 +1640,9 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
         }
 
         if let Ok(signal) = signal_rx.try_recv() {
-            match tui_signal_effect(signal) {
-                CommandEffect::Detach | CommandEffect::Quit => {
-                    writer.write(&detach_request()).await?;
-                    break;
-                }
-                CommandEffect::Continue
-                | CommandEffect::SpawnAgentPane(_)
-                | CommandEffect::StopPane(_)
-                | CommandEffect::RefreshMessages
-                | CommandEffect::Unhandled(_) => {}
+            if let Some(request) = tui_close_request(tui_signal_effect(signal)) {
+                writer.write(&request).await?;
+                break;
             }
         }
 
@@ -1699,9 +1699,6 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
                         break;
                     }
                     CommandEffect::Quit => {
-                        for agent_id in state.layout().panes().iter().cloned() {
-                            writer.write(&agent_stop_request(agent_id)).await?;
-                        }
                         writer.write(&detach_request()).await?;
                         break;
                     }
@@ -2277,6 +2274,14 @@ mod tests {
     #[test]
     fn sigint_requests_tui_detach_for_terminal_restoring_shutdown_path() {
         assert_eq!(tui_signal_effect(TuiSignal::Sigint), CommandEffect::Detach);
+    }
+
+    #[test]
+    fn quit_closes_tui_client_without_stopping_agent_sessions() {
+        let request = tui_close_request(CommandEffect::Quit).expect("close request");
+
+        assert_eq!(request.command, IpcCommand::ClientDetach);
+        assert_eq!(request.payload, json!({}));
     }
 
     #[test]

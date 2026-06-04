@@ -160,6 +160,7 @@ Ctrl-g d        detach
 Ctrl-g ?        help
 Ctrl-g z        zoom current pane
 Ctrl-g arrow    focus pane
+Ctrl-g q        close TUI client without stopping sessions
 Ctrl-g s        running session list
 Ctrl-g a        agent list
 Ctrl-g m        message bus
