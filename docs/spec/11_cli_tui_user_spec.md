@@ -192,7 +192,7 @@ Ctrl-g r        resize mode
 Ctrl-g Space    rotate layout
 ```
 
-`Ctrl-g %` / `Ctrl-g "` は空のshell paneを作らず、provider pickerを表示する。選択肢は `Claude Code`, `Codex`, `Antigravity`。Enterで選択したcoding agentを起動し、そのpaneへattachする。Esc/qで閉じる。
+`Ctrl-g %` / `Ctrl-g "` は空のshell paneを作らず、provider pickerを表示する。選択肢は `Claude Code`, `Codex`, `Antigravity`, `Conversation List`。coding agentをEnterで選択すると起動してそのpaneへattachする。`Conversation List` はmessage履歴を通常paneとして開く。Esc/qで閉じる。
 
 ### 6.3 Agent操作
 
