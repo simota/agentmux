@@ -21,7 +21,7 @@ pub enum TuiCommand {
     Help,
     ToggleZoom,
     Focus(FocusDirection),
-    ShowTaskTree,
+    ShowSessionList,
     ShowAgentList,
     ShowMessageBus,
     ShowContextBoard,
@@ -138,7 +138,7 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Right => Some(TuiCommand::Focus(FocusDirection::Right)),
         KeyCode::Up => Some(TuiCommand::Focus(FocusDirection::Up)),
         KeyCode::Down => Some(TuiCommand::Focus(FocusDirection::Down)),
-        KeyCode::Char('s') => Some(TuiCommand::ShowTaskTree),
+        KeyCode::Char('s') => Some(TuiCommand::ShowSessionList),
         KeyCode::Char('a') => Some(TuiCommand::ShowAgentList),
         KeyCode::Char('m') => Some(TuiCommand::ShowMessageBus),
         KeyCode::Char('c') => Some(TuiCommand::ShowContextBoard),
@@ -244,6 +244,16 @@ mod tests {
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('?'), KeyModifiers::NONE));
 
         assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Help));
+    }
+
+    #[test]
+    fn prefixed_s_maps_to_session_list_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('s'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ShowSessionList));
     }
 
     #[test]

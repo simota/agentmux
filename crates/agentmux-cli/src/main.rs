@@ -73,6 +73,9 @@ enum Commands {
     /// Manage agent sessions (ls / spawn / stop / send / inject / focus / interrupt).
     Agent(AgentArgs),
 
+    /// List running interactive sessions.
+    Sessions(SessionsArgs),
+
     /// Manage messages (list / show / send / inject).
     Message(MessageArgs),
 
@@ -167,6 +170,9 @@ struct AgentArgs {
     #[command(subcommand)]
     action: AgentAction,
 }
+
+#[derive(Parser)]
+struct SessionsArgs;
 
 #[derive(Subcommand)]
 enum AgentAction {
@@ -447,6 +453,10 @@ async fn main() -> Result<()> {
                 print_response("agent", response)?;
             }
         },
+        Commands::Sessions(_) => {
+            let response = send_daemon_request(&socket_path, sessions_list_request()).await?;
+            print_sessions_response(response)?;
+        }
         Commands::Message(args) => match args.action {
             MessageAction::List => {
                 let response = send_daemon_request(&socket_path, message_list_request()).await?;
@@ -660,6 +670,10 @@ fn spawn_tui_signal_forwarder(signal_tx: mpsc::UnboundedSender<TuiSignal>) -> Jo
 
 fn agent_ls_request() -> ClientRequest {
     ClientRequest::new("req_agent_ls", IpcCommand::DaemonStatus, json!({}))
+}
+
+fn sessions_list_request() -> ClientRequest {
+    ClientRequest::new("req_sessions_list", IpcCommand::DaemonStatus, json!({}))
 }
 
 fn bare_session_spawn_request() -> ClientRequest {
@@ -1600,6 +1614,56 @@ fn print_response(label: &str, response: DaemonResponse) -> Result<()> {
     Ok(())
 }
 
+fn print_sessions_response(response: DaemonResponse) -> Result<()> {
+    if !response.ok {
+        return Err(response_error("sessions", response));
+    }
+
+    let payload = response.payload.unwrap_or_else(|| json!({}));
+    print!("{}", format_sessions_payload(&payload));
+    Ok(())
+}
+
+fn format_sessions_payload(payload: &Value) -> String {
+    let sessions = payload
+        .get("agents")
+        .and_then(Value::as_array)
+        .map(|agents| {
+            agents
+                .iter()
+                .filter(|agent| {
+                    agent
+                        .get("has_process")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    if sessions.is_empty() {
+        return "no running sessions\n".to_string();
+    }
+
+    let mut output = String::from("ID NAME PID CLIENTS\n");
+    for session in sessions {
+        let id = session.get("id").and_then(Value::as_str).unwrap_or("-");
+        let name = session.get("name").and_then(Value::as_str).unwrap_or("-");
+        let pid = session
+            .get("process_id")
+            .and_then(Value::as_u64)
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let clients = session
+            .get("attached_clients")
+            .and_then(Value::as_array)
+            .map(|clients| clients.len().to_string())
+            .unwrap_or_else(|| "0".to_string());
+        output.push_str(&format!("{id} {name} {pid} {clients}\n"));
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2022,6 +2086,51 @@ mod tests {
         let interrupt = agent_interrupt_request("agent_01HX".to_string());
         assert_eq!(interrupt.command, IpcCommand::AgentInterrupt);
         assert_eq!(interrupt.payload["agent_id"], "agent_01HX");
+    }
+
+    #[test]
+    fn sessions_list_request_targets_daemon_status() {
+        let request = sessions_list_request();
+
+        assert_eq!(request.id, "req_sessions_list");
+        assert_eq!(request.command, IpcCommand::DaemonStatus);
+        assert_eq!(request.payload, json!({}));
+    }
+
+    #[test]
+    fn format_sessions_payload_lists_only_running_sessions() {
+        let payload = json!({
+            "agents": [
+                {
+                    "id": "agent_live",
+                    "name": "shell",
+                    "process_id": 1234,
+                    "has_process": true,
+                    "attached_clients": ["csess_1", "csess_2"]
+                },
+                {
+                    "id": "agent_restored",
+                    "name": "restored",
+                    "process_id": null,
+                    "has_process": false,
+                    "attached_clients": []
+                }
+            ]
+        });
+
+        assert_eq!(
+            format_sessions_payload(&payload),
+            "ID NAME PID CLIENTS\nagent_live shell 1234 2\n"
+        );
+    }
+
+    #[test]
+    fn format_sessions_payload_reports_empty_running_sessions() {
+        assert_eq!(
+            format_sessions_payload(&json!({ "agents": [] })),
+            "no running sessions\n"
+        );
+        assert_eq!(format_sessions_payload(&json!({})), "no running sessions\n");
     }
 
     #[test]

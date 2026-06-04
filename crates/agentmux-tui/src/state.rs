@@ -85,6 +85,7 @@ pub struct TuiSessionState {
     default_terminal_size: TerminalSize,
     last_event: Option<IpcEventKind>,
     keybinding_help_visible: bool,
+    session_list_visible: bool,
 }
 
 impl Default for TuiSessionState {
@@ -101,6 +102,7 @@ impl TuiSessionState {
             default_terminal_size: TerminalSize::default(),
             last_event: None,
             keybinding_help_visible: false,
+            session_list_visible: false,
         }
     }
 
@@ -138,6 +140,10 @@ impl TuiSessionState {
 
     pub fn keybinding_help_visible(&self) -> bool {
         self.keybinding_help_visible
+    }
+
+    pub fn session_list_visible(&self) -> bool {
+        self.session_list_visible
     }
 
     pub fn focus_next(&mut self) {
@@ -184,6 +190,16 @@ impl TuiSessionState {
             }
             TuiCommand::Help => {
                 self.keybinding_help_visible = !self.keybinding_help_visible;
+                if self.keybinding_help_visible {
+                    self.session_list_visible = false;
+                }
+                CommandEffect::Continue
+            }
+            TuiCommand::ShowSessionList => {
+                self.session_list_visible = !self.session_list_visible;
+                if self.session_list_visible {
+                    self.keybinding_help_visible = false;
+                }
                 CommandEffect::Continue
             }
             TuiCommand::Detach => CommandEffect::Detach,
@@ -757,6 +773,17 @@ mod tests {
             CommandEffect::Continue
         );
         assert!(!state.keybinding_help_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::ShowSessionList),
+            CommandEffect::Continue
+        );
+        assert!(state.session_list_visible());
+        assert!(!state.keybinding_help_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::ShowSessionList),
+            CommandEffect::Continue
+        );
+        assert!(!state.session_list_visible());
     }
 
     #[test]
