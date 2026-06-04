@@ -17,6 +17,8 @@ use agentmux_ipc::{
     ClientHello, ClientRequest, DaemonResponse, DaemonStreamFrame, IpcCommand, JsonlReader,
     JsonlWriter,
 };
+#[cfg(feature = "activity-feed")]
+use agentmux_ipc::{EVENT_SUBSCRIBE_PROTOCOL_VERSION, EventSubscribeFilter};
 use agentmux_pty::{PtyHandle, PtySpawnSpec, TerminalSize};
 use agentmux_store::Store;
 use agentmux_tui::{
@@ -866,6 +868,27 @@ fn snapshot_request(target: String) -> ClientRequest {
 
 fn detach_request() -> ClientRequest {
     ClientRequest::new("req_detach", IpcCommand::ClientDetach, json!({}))
+}
+
+#[cfg(feature = "activity-feed")]
+fn event_subscribe_request(filter: &agentmux_tui::state::EventFeedFilter) -> ClientRequest {
+    ClientRequest::new(
+        "req_event_subscribe",
+        IpcCommand::EventSubscribe,
+        serde_json::to_value(EventSubscribeFilter {
+            task_id: filter.task_id.clone(),
+            roles: filter.roles.clone(),
+            kinds: filter.kinds.clone(),
+        })
+        .unwrap_or_else(|_| json!({})),
+    )
+}
+
+#[cfg(feature = "activity-feed")]
+fn daemon_supports_event_subscribe(state: &TuiSessionState) -> bool {
+    state
+        .daemon_protocol_version()
+        .is_some_and(|version| version >= EVENT_SUBSCRIBE_PROTOCOL_VERSION)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2076,6 +2099,21 @@ async fn run_tui_session_inner(
                 .layout()
                 .focused()
                 .is_some_and(|pane_id| state.is_conversation_list_pane(pane_id));
+            #[cfg(feature = "activity-feed")]
+            let activity_feed_focused = state
+                .layout()
+                .focused()
+                .is_some_and(|pane_id| state.is_activity_feed_pane(pane_id));
+            #[cfg(feature = "activity-feed")]
+            let dispatch = keymap.dispatch_with_activity_feed_context(
+                key,
+                state.session_list_visible(),
+                state.message_bus_visible(),
+                state.provider_picker_visible(),
+                conversation_list_focused,
+                activity_feed_focused,
+            );
+            #[cfg(not(feature = "activity-feed"))]
             let dispatch = keymap.dispatch_with_context(
                 key,
                 state.session_list_visible(),
@@ -2115,6 +2153,31 @@ async fn run_tui_session_inner(
                             &mut resize_sequence,
                         )
                         .await?;
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                    #[cfg(feature = "activity-feed")]
+                    CommandEffect::ToggleActivityFeedPane { visible } => {
+                        if visible {
+                            if daemon_supports_event_subscribe(&state) {
+                                writer
+                                    .write(&event_subscribe_request(state.feed_filter()))
+                                    .await?;
+                            } else {
+                                state
+                                    .set_runtime_notice("Activity Feed unsupported by this daemon");
+                            }
+                        }
+                        sync_current_terminal_pane_sizes(
+                            &mut writer,
+                            &mut state,
+                            &mut resize_sequence,
+                        )
+                        .await?;
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                    #[cfg(feature = "activity-feed")]
+                    CommandEffect::FocusPaneById(agent_id) => {
+                        state.layout_mut().focus(&agent_id);
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
                     }
                     CommandEffect::StopPane(agent_id) => {
@@ -2289,7 +2352,11 @@ fn apply_runtime_stream_frame(
 ) -> Option<String> {
     match apply_tui_stream_frame(state, frame) {
         Ok(_) => None,
-        Err(error) => Some(error.to_string()),
+        Err(error) => {
+            let notice = error.to_string();
+            state.set_runtime_notice(notice.clone());
+            Some(notice)
+        }
     }
 }
 
@@ -2563,6 +2630,10 @@ fn resize_pane_sizes(
         .pane_rects(area)
         .into_iter()
         .filter_map(|(agent_id, rect)| {
+            #[cfg(feature = "activity-feed")]
+            if state.is_activity_feed_pane(&agent_id) {
+                return None;
+            }
             state.pane(&agent_id)?;
             let (rows, cols) = PaneLayout::pane_inner_size(rect);
             (rows > 0 && cols > 0).then_some((agent_id, TuiTerminalSize { rows, cols }))
@@ -3422,6 +3493,35 @@ mod tests {
 
         let notice = notice.expect("runtime failure is surfaced as a notice");
         assert!(notice.contains("no live PTY"));
+        assert!(
+            state
+                .runtime_notice()
+                .is_some_and(|notice| notice.contains("no live PTY"))
+        );
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn activity_feed_subscribe_is_gated_by_daemon_protocol_version() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "protocol_version": EVENT_SUBSCRIBE_PROTOCOL_VERSION - 1,
+            "agents": []
+        }));
+
+        assert!(!daemon_supports_event_subscribe(&state));
+
+        state.set_runtime_notice("Activity Feed unsupported by this daemon");
+        assert_eq!(
+            state.runtime_notice(),
+            Some("Activity Feed unsupported by this daemon")
+        );
+
+        state.apply_daemon_status(&json!({
+            "protocol_version": EVENT_SUBSCRIBE_PROTOCOL_VERSION,
+            "agents": []
+        }));
+        assert!(daemon_supports_event_subscribe(&state));
     }
 
     #[test]

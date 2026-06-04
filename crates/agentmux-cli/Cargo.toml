@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "agentmux CLI — user-facing command-line interface and TUI client entry point"
 
+[features]
+activity-feed = ["agentmux-tui/activity-feed"]
+
 [[bin]]
 name = "agentmux"
 path = "src/main.rs"
