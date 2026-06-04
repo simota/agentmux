@@ -4,7 +4,7 @@
 //! The CLI is a thin JSONL/Unix-socket client for the daemon. Interactive
 //! control remains in the TUI.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -71,6 +71,8 @@ Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `
 Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
 
 Each live session receives its own identity through environment variables: `AGENTMUX_AGENT_NAME`, `AGENTMUX_AGENT_ROLE`, and `AGENTMUX_AGENT_ID`. Use `AGENTMUX_AGENT_NAME` when another session needs to reply to exactly this session.
+
+To inject an existing bus message into a live session, use `agentmux message inject <message_id>` only when the message target resolves to exactly one session. If the target can resolve to multiple sessions (for example `role:tester`) or you need a specific pane, use `agentmux agent inject <message_id> <agent_id>` after checking `agentmux sessions`; this explicitly selects the session that receives the PTY input.
 
 ```json
 {
@@ -151,6 +153,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Start the TUI, optionally spawning provider sessions first (e.g. "agy,codex").
+    Start(StartArgs),
+
     /// Run environment diagnostics (socket / config / SQLite / claude / codex / PTY / worktree).
     Doctor(DoctorArgs),
 
@@ -191,6 +196,12 @@ enum Commands {
 // ---------------------------------------------------------------------------
 // Per-subcommand arg structs (stubs — args will grow with implementation)
 // ---------------------------------------------------------------------------
+
+#[derive(Parser)]
+struct StartArgs {
+    /// Comma-separated providers to spawn before opening the TUI, e.g. "agy,codex".
+    providers: Option<String>,
+}
 
 #[derive(Parser)]
 struct DoctorArgs;
@@ -454,6 +465,10 @@ async fn main() -> Result<()> {
     };
 
     match command {
+        Commands::Start(args) => {
+            let providers = parse_start_providers(args.providers.as_deref())?;
+            run_tui_session_with_startup_providers(&socket_path, providers).await?;
+        }
         Commands::Doctor(_) => {
             let report = doctor_report(
                 &socket_path,
@@ -861,6 +876,14 @@ fn agent_spawn_for_provider_request_with_size(
     provider: AgentProviderChoice,
     size: Option<TuiTerminalSize>,
 ) -> ClientRequest {
+    agent_spawn_for_provider_request_with_id("req_agent_spawn_provider", provider, size)
+}
+
+fn agent_spawn_for_provider_request_with_id(
+    request_id: impl Into<String>,
+    provider: AgentProviderChoice,
+    size: Option<TuiTerminalSize>,
+) -> ClientRequest {
     let mut payload = json!({
         "provider": provider.provider(),
         "role": "implementer",
@@ -873,7 +896,7 @@ fn agent_spawn_for_provider_request_with_size(
         });
     }
 
-    ClientRequest::new("req_agent_spawn_provider", IpcCommand::AgentSpawn, payload)
+    ClientRequest::new(request_id, IpcCommand::AgentSpawn, payload)
 }
 
 fn agent_spawn_request(provider: String, role: String) -> Result<ClientRequest> {
@@ -972,6 +995,28 @@ fn agent_send_request(agent_id: String, body: String) -> Result<ClientRequest> {
             "delivery_mode": "inject_when_idle",
         }),
     ))
+}
+
+fn parse_start_providers(raw: Option<&str>) -> Result<Vec<AgentProviderChoice>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|provider| !provider.is_empty())
+        .map(parse_provider_choice)
+        .collect()
+}
+
+fn parse_provider_choice(raw: &str) -> Result<AgentProviderChoice> {
+    match raw.to_ascii_lowercase().as_str() {
+        "claude" | "claude-code" | "claude_code" => Ok(AgentProviderChoice::Claude),
+        "codex" => Ok(AgentProviderChoice::Codex),
+        "agy" | "antigravity" => Ok(AgentProviderChoice::Agy),
+        _ => Err(AgentmuxError::UserError(format!(
+            "unknown provider '{raw}' (expected claude, codex, or agy)"
+        ))),
+    }
 }
 
 fn normalize_agent_target(raw: &str) -> String {
@@ -1688,6 +1733,21 @@ fn agent_id_from_spawn_response(response: DaemonResponse) -> Result<String> {
 }
 
 async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<()> {
+    run_tui_session_inner(socket_path, target, Vec::new()).await
+}
+
+async fn run_tui_session_with_startup_providers(
+    socket_path: &Path,
+    providers: Vec<AgentProviderChoice>,
+) -> Result<()> {
+    run_tui_session_inner(socket_path, None, providers).await
+}
+
+async fn run_tui_session_inner(
+    socket_path: &Path,
+    target: Option<String>,
+    startup_providers: Vec<AgentProviderChoice>,
+) -> Result<()> {
     ensure_daemon(socket_path).await?;
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
         AgentmuxError::IpcError(format!(
@@ -1706,6 +1766,24 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
     let status_request = tui_daemon_status_request();
     let status_request_id = status_request.id.clone();
     writer.write(&status_request).await?;
+    let startup_spawn_requests = startup_providers
+        .into_iter()
+        .enumerate()
+        .map(|(index, provider)| {
+            agent_spawn_for_provider_request_with_id(
+                format!("req_start_agent_spawn_{index}"),
+                provider,
+                None,
+            )
+        })
+        .collect::<Vec<_>>();
+    for request in &startup_spawn_requests {
+        writer.write(request).await?;
+    }
+    let startup_spawn_request_ids = startup_spawn_requests
+        .iter()
+        .map(|request| request.id.clone())
+        .collect::<Vec<_>>();
     let attach_and_snapshot = target.map(|target| {
         let snapshot_request = snapshot_request(target.clone());
         let attach_request = attach_request(target);
@@ -1717,18 +1795,30 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
     }
 
     let mut state = TuiSessionState::default();
+    let mut startup_agent_ids = Vec::new();
     if let Some((attach_request, snapshot_request)) = &attach_and_snapshot {
-        wait_for_tui_bootstrap(
+        let _startup_agent_ids = wait_for_tui_bootstrap(
             &mut reader,
             &mut state,
             &status_request_id,
             Some(&attach_request.id),
             Some(&snapshot_request.id),
+            &startup_spawn_request_ids,
         )
         .await?;
     } else {
-        wait_for_tui_bootstrap(&mut reader, &mut state, &status_request_id, None, None).await?;
-        state.open_provider_picker();
+        startup_agent_ids = wait_for_tui_bootstrap(
+            &mut reader,
+            &mut state,
+            &status_request_id,
+            None,
+            None,
+            &startup_spawn_request_ids,
+        )
+        .await?;
+        if startup_agent_ids.is_empty() {
+            state.open_provider_picker();
+        }
     }
 
     let terminal_io = CrosstermTerminalIo::new(io::stdout()).map_err(|error| {
@@ -1771,6 +1861,14 @@ async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<(
     let signal_task = spawn_tui_signal_forwarder(signal_tx);
 
     sync_current_terminal_pane_sizes(&mut writer, &mut state, &mut resize_sequence).await?;
+    if let Some(first_agent_id) = startup_agent_ids.first() {
+        writer
+            .write(&attach_request(first_agent_id.clone()))
+            .await?;
+    }
+    for agent_id in &startup_agent_ids {
+        writer.write(&snapshot_request(agent_id.clone())).await?;
+    }
     draw_tui_frame(&mut terminal, &renderer, &state)?;
 
     loop {
@@ -1967,18 +2065,26 @@ async fn wait_for_tui_bootstrap<R>(
     status_request_id: &str,
     attach_request_id: Option<&str>,
     snapshot_request_id: Option<&str>,
-) -> Result<()>
+    startup_spawn_request_ids: &[String],
+) -> Result<Vec<String>>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
     let mut status_received = false;
     let mut attach_received = attach_request_id.is_none();
     let mut snapshot_received = snapshot_request_id.is_none();
+    let mut startup_spawn_received = BTreeSet::new();
+    let mut startup_agent_ids = Vec::new();
 
-    while !(status_received && attach_received && snapshot_received) {
+    while !(status_received
+        && attach_received
+        && snapshot_received
+        && startup_spawn_received.len() == startup_spawn_request_ids.len())
+    {
         let frame = reader.read::<DaemonStreamFrame>().await?.ok_or_else(|| {
             AgentmuxError::IpcError("daemon closed before TUI attach completed".to_string())
         })?;
+        let spawned_agent_id = spawned_agent_id_from_frame(&frame);
         if let Some(response_id) = apply_tui_stream_frame(state, frame)? {
             if response_id == status_request_id {
                 status_received = true;
@@ -1989,10 +2095,16 @@ where
             if Some(response_id.as_str()) == snapshot_request_id {
                 snapshot_received = true;
             }
+            if startup_spawn_request_ids.contains(&response_id) {
+                startup_spawn_received.insert(response_id);
+                if let Some(agent_id) = spawned_agent_id {
+                    startup_agent_ids.push(agent_id);
+                }
+            }
         }
     }
 
-    Ok(())
+    Ok(startup_agent_ids)
 }
 
 fn apply_tui_stream_frame(
@@ -2015,7 +2127,7 @@ fn apply_tui_stream_frame(
                     &response.payload.clone().unwrap_or_else(|| json!({})),
                 );
             }
-            if response.id == "req_agent_spawn_provider" || response.id == "req_bare_agent_spawn" {
+            if is_agent_spawn_response_id(&response.id) {
                 if let Some(payload) = response.payload.as_ref() {
                     state.apply_daemon_status(&json!({ "agents": [payload] }));
                 }
@@ -2033,7 +2145,7 @@ fn spawned_agent_id_from_frame(frame: &DaemonStreamFrame) -> Option<String> {
     let DaemonStreamFrame::Response(response) = frame else {
         return None;
     };
-    if !response.ok || response.id != "req_agent_spawn_provider" {
+    if !response.ok || !is_agent_spawn_response_id(&response.id) {
         return None;
     }
     response
@@ -2042,6 +2154,12 @@ fn spawned_agent_id_from_frame(frame: &DaemonStreamFrame) -> Option<String> {
         .and_then(|payload| payload.get("agent_id"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn is_agent_spawn_response_id(response_id: &str) -> bool {
+    response_id == "req_agent_spawn_provider"
+        || response_id == "req_bare_agent_spawn"
+        || response_id.starts_with("req_start_agent_spawn_")
 }
 
 /// Apply a stream frame during the interactive loop. Unlike bootstrap, a failed
@@ -2734,6 +2852,42 @@ mod tests {
         assert_eq!(request.command, IpcCommand::AgentSpawn);
         assert_eq!(request.payload["provider"], "codex");
         assert_eq!(request.payload["size"], json!({ "rows": 28, "cols": 88 }));
+    }
+
+    #[test]
+    fn start_command_accepts_comma_separated_providers() {
+        let cli = Cli::try_parse_from(["agentmux", "start", "agy,codex"]).unwrap();
+        let Some(Commands::Start(args)) = cli.command else {
+            panic!("expected start command");
+        };
+
+        assert_eq!(
+            parse_start_providers(args.providers.as_deref()).unwrap(),
+            vec![AgentProviderChoice::Agy, AgentProviderChoice::Codex]
+        );
+    }
+
+    #[test]
+    fn startup_spawn_request_uses_trackable_response_id() {
+        let request = agent_spawn_for_provider_request_with_id(
+            "req_start_agent_spawn_0",
+            AgentProviderChoice::Agy,
+            None,
+        );
+
+        assert_eq!(request.id, "req_start_agent_spawn_0");
+        assert!(is_agent_spawn_response_id(&request.id));
+        assert_eq!(request.command, IpcCommand::AgentSpawn);
+        assert_eq!(request.payload["provider"], "agy");
+
+        let frame = DaemonStreamFrame::Response(DaemonResponse::ok(
+            "req_start_agent_spawn_0",
+            json!({ "agent_id": "agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K" }),
+        ));
+        assert_eq!(
+            spawned_agent_id_from_frame(&frame).as_deref(),
+            Some("agent_01KBQ4Y8T3BHQP4FPY6Y1VPD2K")
+        );
     }
 
     #[test]
@@ -3571,6 +3725,8 @@ mod tests {
         assert!(contents.contains("messages[]"));
         assert!(contents.contains("Allowed `messages[].kind` values"));
         assert!(contents.contains("AGENTMUX_AGENT_NAME"));
+        assert!(contents.contains("agentmux message inject <message_id>"));
+        assert!(contents.contains("agentmux agent inject <message_id> <agent_id>"));
         assert!(contents.contains("Two-session exchange example"));
         assert!(contents.contains("agentmux message list"));
 

@@ -8,6 +8,7 @@ CLIはnon-interactive操作、daemon操作、task起動、message/context操作�
 
 ```bash
 agentmux --help
+agentmux start ["agy,codex"]
 agentmux doctor
 agentmux sessions
 agentmux attach [task|session]
@@ -23,6 +24,14 @@ agentmux layout save|load|list
 ```
 
 ## 3. 代表コマンド
+
+### 3.0 start
+
+```bash
+agentmux start "agy,codex"
+```
+
+daemon未起動なら起動し、指定されたprovider sessionを左から順に作成してからTUIを開く。providerはcomma-separatedで指定し、`claude`, `codex`, `agy` を受け付ける。provider指定なしの `agentmux start` は通常のTUI起動と同じく、既存sessionがなければprovider pickerを表示する。
 
 ### 3.1 project init
 
@@ -104,10 +113,11 @@ agentmux message send --to role:reviewer --kind ReviewComment --context ctx_123 
 ### 3.6 inject
 
 ```bash
-agentmux message inject msg_123 --to impl-codex
+agentmux message inject msg_123
+agentmux agent inject msg_123 agent_01HX...
 ```
 
-delivery modeを無視して明示注入する場合はapprovalが必要になることがある。
+`message inject` は、message target がちょうど1つのsessionに解決できる場合に既存messageをそのsessionへ即時注入する。`role:tester` のように複数sessionへ解決される可能性がある場合や、明示的にpaneを選びたい場合は、`agentmux sessions` で対象を確認してから `agent inject <message_id> <agent_id>` を使う。
 
 ### 3.7 message history
 
@@ -339,7 +349,8 @@ error: agent 'impl-codex' is not awaiting input
 
 hint:
   agentmux agent status impl-codex
-  agentmux message inject msg_123 --manual
+  agentmux sessions
+  agentmux agent inject msg_123 agent_01HX...
 ```
 
 ```text
