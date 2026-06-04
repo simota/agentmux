@@ -236,6 +236,8 @@ loop {
 }
 ```
 
+`messages[]` はcoding agent同士のmessage bus送信として扱う。daemonは各messageを保存し、delivery mode `InjectWhenIdle` で宛先agentへ配送する。発信元はorchestratorではなく、`AGENTMUX_RESULT` を出したcoding agent名として記録するため、CLI/TUIの履歴では `team_agent:impl-codex -> role:tester` のようにagent間のやり取りとして確認できる。
+
 ### 11.2 status別処理
 
 | status | 処理 |

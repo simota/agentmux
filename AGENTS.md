@@ -30,3 +30,34 @@ Recent history uses concise Conventional Commit-style subjects, for example `fix
 ## Security & Configuration Tips
 
 Use `docs/config/agentmux.config.example.toml` as the configuration reference. Do not commit local runtime state, credentials, private keys, or generated build artifacts. Avoid logging secrets, agent prompts containing sensitive data, or raw IPC payloads unless they are sanitized.
+
+<!-- agentmux-result-protocol:start -->
+## agentmux result protocol
+
+When working inside an agentmux-managed session, end each completed turn with:
+
+```text
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "<short summary>",
+  "changed_files": [],
+  "messages": [],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+```
+
+Use `messages[]` to send work to another coding agent through the agentmux message bus.
+
+```json
+{
+  "to": "role:tester",
+  "kind": "TestResult",
+  "body": "Run the focused regression tests.",
+  "priority": "normal"
+}
+```
+<!-- agentmux-result-protocol:end -->
+

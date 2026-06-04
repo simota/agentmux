@@ -390,6 +390,7 @@ fn source_label(source: &MessageSource) -> String {
     match source {
         MessageSource::User(id) => format!("user:{id}"),
         MessageSource::Agent(id) => format!("agent:{id}"),
+        MessageSource::TeamAgent(name) => format!("team_agent:{name}"),
         MessageSource::Role(role) => format!("role:{role:?}"),
         MessageSource::System => "system".to_string(),
         MessageSource::Orchestrator => "orchestrator".to_string(),

@@ -91,6 +91,7 @@ pub struct NewAgentMessage {
 pub enum MessageSource {
     User(ClientId),
     Agent(AgentSessionId),
+    TeamAgent(String),
     Role(AgentRole),
     System,
     Orchestrator,

@@ -2981,6 +2981,10 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].task_id, Some(task_id));
+        assert_eq!(
+            messages[0].from,
+            MessageSource::TeamAgent("planner".to_string())
+        );
         assert_eq!(messages[0].kind, MessageKind::TestResult);
         assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Tester));
         assert_eq!(messages[0].delivery_mode, DeliveryMode::InjectWhenIdle);
@@ -3022,6 +3026,10 @@ mod tests {
 
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].task_id, Some(task_id));
+        assert_eq!(
+            messages[0].from,
+            MessageSource::TeamAgent("planner".to_string())
+        );
         assert_eq!(messages[0].kind, MessageKind::Handoff);
         assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Implementer));
         assert!(messages[0].body.contains("Implement the selected fix."));

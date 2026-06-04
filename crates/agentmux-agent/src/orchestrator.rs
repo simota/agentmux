@@ -229,7 +229,12 @@ pub fn route_agent_result(
     let mut outgoing = Vec::new();
 
     for message in &result.messages {
-        outgoing.push(convert_outgoing_message(task_id.clone(), team, message)?);
+        outgoing.push(convert_outgoing_message(
+            agent,
+            task_id.clone(),
+            team,
+            message,
+        )?);
     }
 
     if outgoing.is_empty() {
@@ -237,6 +242,7 @@ pub fn route_agent_result(
             if !next.eq_ignore_ascii_case("none") {
                 outgoing.push(summary_handoff(
                     task_id.clone(),
+                    MessageSource::TeamAgent(agent.name.clone()),
                     resolve_result_target(team, next)?,
                     &agent.name,
                     &result,
@@ -254,13 +260,14 @@ pub fn route_agent_result(
 }
 
 fn convert_outgoing_message(
+    agent: &AgentRouteIdentity,
     task_id: TaskId,
     team: &TeamTemplate,
     message: &OutgoingMessage,
 ) -> Result<OrchestratorMessage> {
     Ok(OrchestratorMessage {
         task_id: Some(task_id),
-        from: MessageSource::Orchestrator,
+        from: MessageSource::TeamAgent(agent.name.clone()),
         to: resolve_result_target(team, &message.to)?,
         kind: map_message_kind(message.kind),
         priority: map_priority(message.priority),
@@ -274,13 +281,14 @@ fn convert_outgoing_message(
 
 fn summary_handoff(
     task_id: TaskId,
+    from: MessageSource,
     to: MessageTarget,
     from_agent_name: &str,
     result: &AgentResult,
 ) -> OrchestratorMessage {
     OrchestratorMessage {
         task_id: Some(task_id),
-        from: MessageSource::Orchestrator,
+        from,
         to,
         kind: MessageKind::Handoff,
         priority: Priority::Normal,
@@ -1069,6 +1077,10 @@ mod tests {
         assert!(!routed.needs_human);
         assert_eq!(routed.outgoing.len(), 1);
         assert_eq!(
+            routed.outgoing[0].from,
+            MessageSource::TeamAgent("planner".to_string())
+        );
+        assert_eq!(
             routed.outgoing[0].to,
             MessageTarget::Role(AgentRole::Tester)
         );
@@ -1098,6 +1110,10 @@ mod tests {
         )
         .expect("route next");
 
+        assert_eq!(
+            routed.outgoing[0].from,
+            MessageSource::TeamAgent("planner".to_string())
+        );
         assert_eq!(
             routed.outgoing[0].to,
             MessageTarget::Role(AgentRole::Implementer)

@@ -12,7 +12,7 @@ agentmux doctor
 agentmux sessions
 agentmux attach [task|session]
 agentmux daemon start|stop|status
-agentmux project init|open|status
+agentmux project init|open|status|install-result-protocol
 agentmux task run|status|pause|resume|cancel|summary
 agentmux agent ls|spawn|stop|send|inject|focus|interrupt
 agentmux message list|history|show|send|inject
@@ -36,6 +36,23 @@ agentmux project init .
 .agentmux/
   config.toml
   .gitignore entry recommendation
+```
+
+### 3.1.1 project install-result-protocol
+
+```bash
+agentmux project install-result-protocol .
+agentmux project install-result-protocol --global
+```
+
+ローカル実行では、指定ディレクトリに既存の `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` がある場合だけ `agentmux result protocol` を追記する。既に同じmarkerがある場合は追記しない。
+
+`--global` は以下のグローバル指示ファイルへ設定する。
+
+```text
+~/.codex/AGENTS.md
+~/.claude/CLAUDE.md
+~/.gemini/GEMINI.md
 ```
 
 ### 3.2 task run

@@ -35,6 +35,37 @@ use tokio::task::JoinHandle;
 
 const DEFAULT_PROJECT_CONFIG: &str =
     include_str!("../../../docs/config/agentmux.config.example.toml");
+const RESULT_PROTOCOL_MARKER_START: &str = "<!-- agentmux-result-protocol:start -->";
+const RESULT_PROTOCOL_BLOCK: &str = r#"<!-- agentmux-result-protocol:start -->
+## agentmux result protocol
+
+When working inside an agentmux-managed session, end each completed turn with:
+
+```text
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "<short summary>",
+  "changed_files": [],
+  "messages": [],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+```
+
+Use `messages[]` to send work to another coding agent through the agentmux message bus.
+
+```json
+{
+  "to": "role:tester",
+  "kind": "TestResult",
+  "body": "Run the focused regression tests.",
+  "priority": "normal"
+}
+```
+<!-- agentmux-result-protocol:end -->
+"#;
 
 // ---------------------------------------------------------------------------
 // Top-level CLI
@@ -135,6 +166,15 @@ enum ProjectAction {
     Open { path: String },
     /// Show current project status.
     Status,
+    /// Add the AGENTMUX_RESULT protocol to local or global agent instruction files.
+    InstallResultProtocol {
+        /// Directory containing AGENTS.md / CLAUDE.md / GEMINI.md.
+        #[arg(default_value = ".")]
+        path: String,
+        /// Install to global tool instruction files instead of a project directory.
+        #[arg(long)]
+        global: bool,
+    },
 }
 
 #[derive(Parser)]
@@ -409,6 +449,10 @@ async fn main() -> Result<()> {
                     );
                     println!("  run: agentmux project init .");
                 }
+            }
+            ProjectAction::InstallResultProtocol { path, global } => {
+                let report = install_result_protocol(Path::new(&path), global)?;
+                print_result_protocol_report(&report);
             }
         },
         Commands::Task(args) => match args.action {
@@ -1015,6 +1059,126 @@ fn init_project(path: &Path) -> Result<PathBuf> {
     }
 
     Ok(project_dir)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResultProtocolInstallReport {
+    path: PathBuf,
+    status: ResultProtocolInstallStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultProtocolInstallStatus {
+    Added,
+    AlreadyPresent,
+    Missing,
+}
+
+fn install_result_protocol(path: &Path, global: bool) -> Result<Vec<ResultProtocolInstallReport>> {
+    let targets = if global {
+        global_result_protocol_targets()?
+    } else {
+        local_result_protocol_targets(path)?
+    };
+
+    targets
+        .into_iter()
+        .map(|target| install_result_protocol_to_file(&target, global))
+        .collect()
+}
+
+fn local_result_protocol_targets(path: &Path) -> Result<Vec<PathBuf>> {
+    let dir = path.canonicalize().map_err(|error| {
+        AgentmuxError::UserError(format!(
+            "failed to resolve instruction directory '{}': {error}",
+            path.display()
+        ))
+    })?;
+
+    Ok(["AGENTS.md", "CLAUDE.md", "GEMINI.md"]
+        .into_iter()
+        .map(|name| dir.join(name))
+        .collect())
+}
+
+fn global_result_protocol_targets() -> Result<Vec<PathBuf>> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Err(AgentmuxError::UserError(
+            "HOME is not set; cannot install global result protocol".to_string(),
+        ));
+    };
+    let home = PathBuf::from(home);
+    Ok(vec![
+        home.join(".codex/AGENTS.md"),
+        home.join(".claude/CLAUDE.md"),
+        home.join(".gemini/GEMINI.md"),
+    ])
+}
+
+fn install_result_protocol_to_file(
+    path: &Path,
+    create_missing: bool,
+) -> Result<ResultProtocolInstallReport> {
+    if !path.exists() {
+        if !create_missing {
+            return Ok(ResultProtocolInstallReport {
+                path: path.to_path_buf(),
+                status: ResultProtocolInstallStatus::Missing,
+            });
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|error| {
+                AgentmuxError::StoreError(format!(
+                    "failed to create '{}': {error}",
+                    parent.display()
+                ))
+            })?;
+        }
+        std::fs::write(path, format!("{RESULT_PROTOCOL_BLOCK}\n")).map_err(|error| {
+            AgentmuxError::StoreError(format!("failed to write '{}': {error}", path.display()))
+        })?;
+        return Ok(ResultProtocolInstallReport {
+            path: path.to_path_buf(),
+            status: ResultProtocolInstallStatus::Added,
+        });
+    }
+
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        AgentmuxError::StoreError(format!("failed to read '{}': {error}", path.display()))
+    })?;
+    if contents.contains(RESULT_PROTOCOL_MARKER_START) {
+        return Ok(ResultProtocolInstallReport {
+            path: path.to_path_buf(),
+            status: ResultProtocolInstallStatus::AlreadyPresent,
+        });
+    }
+
+    let mut next = contents;
+    if !next.ends_with('\n') {
+        next.push('\n');
+    }
+    next.push('\n');
+    next.push_str(RESULT_PROTOCOL_BLOCK);
+    next.push('\n');
+    std::fs::write(path, next).map_err(|error| {
+        AgentmuxError::StoreError(format!("failed to write '{}': {error}", path.display()))
+    })?;
+
+    Ok(ResultProtocolInstallReport {
+        path: path.to_path_buf(),
+        status: ResultProtocolInstallStatus::Added,
+    })
+}
+
+fn print_result_protocol_report(report: &[ResultProtocolInstallReport]) {
+    for entry in report {
+        let status = match entry.status {
+            ResultProtocolInstallStatus::Added => "added",
+            ResultProtocolInstallStatus::AlreadyPresent => "already-present",
+            ResultProtocolInstallStatus::Missing => "missing",
+        };
+        println!("{status}: {}", entry.path.display());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2510,6 +2674,67 @@ mod tests {
                 .unwrap()
                 .contains("custom")
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn result_protocol_install_updates_existing_local_instruction_files_once() {
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-result-protocol-local-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let agents_path = root.join("AGENTS.md");
+        let claude_path = root.join("CLAUDE.md");
+        let gemini_path = root.join("GEMINI.md");
+        std::fs::write(&agents_path, "# Agents\n").unwrap();
+        std::fs::write(&claude_path, "# Claude\n").unwrap();
+
+        let first = install_result_protocol(&root, false).unwrap();
+        assert_eq!(first.len(), 3);
+        assert_eq!(first[0].status, ResultProtocolInstallStatus::Added);
+        assert_eq!(first[1].status, ResultProtocolInstallStatus::Added);
+        assert_eq!(first[2].status, ResultProtocolInstallStatus::Missing);
+        assert!(!gemini_path.exists());
+
+        let second = install_result_protocol(&root, false).unwrap();
+        assert_eq!(
+            second[0].status,
+            ResultProtocolInstallStatus::AlreadyPresent
+        );
+        assert_eq!(
+            second[1].status,
+            ResultProtocolInstallStatus::AlreadyPresent
+        );
+        assert_eq!(second[2].status, ResultProtocolInstallStatus::Missing);
+
+        let contents = std::fs::read_to_string(&agents_path).unwrap();
+        assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
+        assert!(contents.contains("AGENTMUX_RESULT:"));
+        assert!(contents.contains("messages[]"));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn result_protocol_install_can_create_global_style_instruction_file() {
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-result-protocol-global-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let target = root.join(".codex/AGENTS.md");
+
+        let first = install_result_protocol_to_file(&target, true).unwrap();
+        assert_eq!(first.status, ResultProtocolInstallStatus::Added);
+        assert!(target.exists());
+
+        let second = install_result_protocol_to_file(&target, true).unwrap();
+        assert_eq!(second.status, ResultProtocolInstallStatus::AlreadyPresent);
+        let contents = std::fs::read_to_string(&target).unwrap();
+        assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
 
         std::fs::remove_dir_all(&root).unwrap();
     }

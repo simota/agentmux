@@ -228,12 +228,21 @@ AGENTMUX_RESULT:
   "status": "completed",
   "summary": "...",
   "changed_files": [],
-  "messages": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "auth refreshの回帰テストを実行してください",
+      "priority": "normal"
+    }
+  ],
   "context_updates": [],
   "needs": [],
   "next": "tester"
 }
 ```
+
+`messages[]` はcoding agent同士のmessage bus送信に使う。`to` は `role:<role>`、team内のagent名、`broadcast` を指定できる。daemonは発信元を `team_agent:<name>` として保存し、TUI/CLI履歴に表示する。
 
 ### 9.2 JSON Schema
 

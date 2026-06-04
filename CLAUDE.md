@@ -127,3 +127,34 @@ team template は `config.toml` の `[team.<name>]` で定義し、各 agent の
 - 仕様の変更・追加を行ったら、本文（`docs/spec/`）・ADR・該当する schema/diagram/config を整合させる。図は `docs/diagrams/*.mmd`(Mermaid)、データ契約は `docs/schemas/*.schema.json` と `docs/sql/schema.sql`。
 - 設計上の未決事項は `docs/spec/15_open_questions.md` にある。新たな未決事項はここに追記する。
 - ドキュメントは日本語で統一されている。新規ドキュメントも日本語で書く。
+
+<!-- agentmux-result-protocol:start -->
+## agentmux result protocol
+
+When working inside an agentmux-managed session, end each completed turn with:
+
+```text
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "<short summary>",
+  "changed_files": [],
+  "messages": [],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+```
+
+Use `messages[]` to send work to another coding agent through the agentmux message bus.
+
+```json
+{
+  "to": "role:tester",
+  "kind": "TestResult",
+  "body": "Run the focused regression tests.",
+  "priority": "normal"
+}
+```
+<!-- agentmux-result-protocol:end -->
+
