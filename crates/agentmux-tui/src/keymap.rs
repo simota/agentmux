@@ -24,6 +24,8 @@ pub enum TuiCommand {
     ShowSessionList,
     ShowAgentList,
     ShowMessageBus,
+    #[cfg(feature = "activity-feed")]
+    ShowActivityFeed,
     ToggleMessageDetails,
     ShowContextBoard,
     ShowApprovalQueue,
@@ -46,6 +48,12 @@ pub enum TuiCommand {
     SessionListNext,
     SessionListPrevious,
     FocusSelectedSession,
+    #[cfg(feature = "activity-feed")]
+    ActivityFeedNext,
+    #[cfg(feature = "activity-feed")]
+    ActivityFeedPrevious,
+    #[cfg(feature = "activity-feed")]
+    FocusFeedEntry,
     CloseOverlay,
 }
 
@@ -123,6 +131,26 @@ impl KeymapDispatcher {
         provider_picker_visible: bool,
         conversation_list_focused: bool,
     ) -> KeyDispatch {
+        self.dispatch_with_activity_feed_context(
+            key,
+            session_list_visible,
+            message_bus_visible,
+            provider_picker_visible,
+            conversation_list_focused,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_with_activity_feed_context(
+        &mut self,
+        key: KeyEvent,
+        session_list_visible: bool,
+        message_bus_visible: bool,
+        provider_picker_visible: bool,
+        conversation_list_focused: bool,
+        _activity_feed_focused: bool,
+    ) -> KeyDispatch {
         if matches!(key.kind, KeyEventKind::Release) {
             return KeyDispatch::Consumed;
         }
@@ -159,6 +187,13 @@ impl KeymapDispatcher {
 
         if conversation_list_focused {
             return message_list_command(key, false)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        #[cfg(feature = "activity-feed")]
+        if _activity_feed_focused {
+            return activity_feed_command(key)
                 .map(KeyDispatch::Command)
                 .unwrap_or(KeyDispatch::Consumed);
         }
@@ -243,6 +278,24 @@ fn message_list_command(key: KeyEvent, close_enabled: bool) -> Option<TuiCommand
     }
 }
 
+#[cfg(feature = "activity-feed")]
+fn activity_feed_command(key: KeyEvent) -> Option<TuiCommand> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some(TuiCommand::ActivityFeedNext),
+        KeyCode::Up | KeyCode::Char('k') => Some(TuiCommand::ActivityFeedPrevious),
+        KeyCode::Enter => Some(TuiCommand::FocusFeedEntry),
+        KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::ClosePane),
+        _ => None,
+    }
+}
+
 fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
     if key
         .modifiers
@@ -262,6 +315,8 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Char('s') => Some(TuiCommand::ShowSessionList),
         KeyCode::Char('a') => Some(TuiCommand::ShowAgentList),
         KeyCode::Char('m') => Some(TuiCommand::ShowMessageBus),
+        #[cfg(feature = "activity-feed")]
+        KeyCode::Char('f') => Some(TuiCommand::ShowActivityFeed),
         KeyCode::Char('c') => Some(TuiCommand::ShowContextBoard),
         KeyCode::Char('A') => Some(TuiCommand::ShowApprovalQueue),
         KeyCode::Char('%') => Some(TuiCommand::SplitVertical),
@@ -376,6 +431,57 @@ mod tests {
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('s'), KeyModifiers::NONE));
 
         assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ShowSessionList));
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn prefixed_f_maps_to_activity_feed_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('f'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ShowActivityFeed));
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn activity_feed_focus_maps_navigation_and_enter() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch_with_activity_feed_context(
+                key(KeyCode::Down, KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::ActivityFeedNext)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_activity_feed_context(
+                key(KeyCode::Up, KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::ActivityFeedPrevious)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_activity_feed_context(
+                key(KeyCode::Enter, KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::FocusFeedEntry)
+        );
     }
 
     #[test]
