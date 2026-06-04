@@ -253,7 +253,6 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
 
     match key.code {
         KeyCode::Char('d') => Some(TuiCommand::Detach),
-        KeyCode::Char('q') => Some(TuiCommand::Quit),
         KeyCode::Char('?') => Some(TuiCommand::Help),
         KeyCode::Char('z') => Some(TuiCommand::ToggleZoom),
         KeyCode::Left => Some(TuiCommand::Focus(FocusDirection::Left)),
@@ -350,13 +349,13 @@ mod tests {
     }
 
     #[test]
-    fn prefixed_q_maps_to_quit_command() {
+    fn prefixed_q_is_consumed_without_quitting() {
         let mut dispatcher = KeymapDispatcher::default();
         dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
 
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
 
-        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::Quit));
+        assert_eq!(dispatch, KeyDispatch::Consumed);
     }
 
     #[test]

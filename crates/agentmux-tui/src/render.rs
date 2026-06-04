@@ -267,7 +267,6 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "",
     "Ctrl-g ?      Toggle this help",
     "Ctrl-g d      Detach session",
-    "Ctrl-g q      Quit session",
     "Ctrl-g s      List running sessions",
     "Ctrl-g m      Message bus",
     "Ctrl-g x      Close focused pane",

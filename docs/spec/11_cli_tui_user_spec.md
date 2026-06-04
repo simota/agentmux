@@ -56,7 +56,7 @@ agentmux project install-result-protocol .
 agentmux project install-result-protocol --global
 ```
 
-ローカル実行では、指定ディレクトリに既存の `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` がある場合だけ `agentmux result protocol` を追記する。既に同じ managed marker がある場合は、その marker 範囲を最新の `agentmux result protocol` に置換する。これにより、再実行で `messages[]` の使い方、2セッション間の対話例、確認手順が最新化される。
+ローカル実行では、指定ディレクトリに既存の `AGENTS.md`, `CLAUDE.md`, `GEMINI.md` がある場合だけ `agentmux result protocol` を追記する。既に同じ managed marker がある場合は、その marker 範囲を最新の `agentmux result protocol` に置換する。これにより、再実行で `messages[]` の使い方、message受信時の返信必須ルール、3往復以上続くagent間対話で人間確認を求めるルール、2セッション間の対話例、確認手順が最新化される。
 
 `--global` は以下のグローバル指示ファイルへ設定する。
 
@@ -176,7 +176,6 @@ Ctrl-g d        detach
 Ctrl-g ?        help
 Ctrl-g z        zoom current pane
 Ctrl-g arrow    focus pane
-Ctrl-g q        close TUI client without stopping sessions
 Ctrl-g s        running session list
 Ctrl-g a        agent list
 Ctrl-g m        message bus
