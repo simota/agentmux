@@ -15,3 +15,7 @@
 *.swp
 .idea/
 .vscode/
+
+# Claude Code personal settings
+.claude/settings.local.json
+.claude/scheduled_tasks.lock
