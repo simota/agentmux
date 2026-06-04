@@ -189,10 +189,8 @@ impl DaemonRuntime {
                     )
                 })?
                 .to_string();
-            recovered_message_agents.push(AgentDescriptor::new(
-                id.clone(),
-                AgentRole::Custom(name.clone()),
-            ));
+            recovered_message_agents
+                .push(AgentDescriptor::new(id.clone(), inferred_agent_role(&name)));
             recovered.insert(
                 id.clone(),
                 LiveAgentSession::metadata(RegisteredAgentSession::restored(id, name)),
@@ -223,7 +221,7 @@ impl DaemonRuntime {
             .insert(agent.id.clone(), LiveAgentSession::metadata(agent.clone()));
         state.messages.register_agent(AgentDescriptor::new(
             agent.id.clone(),
-            AgentRole::Custom(name.clone()),
+            inferred_agent_role(&name),
         ));
         drop(state);
         self.publish(DaemonEvent::new(
@@ -249,7 +247,12 @@ impl DaemonRuntime {
         let pty = PtyHandle::spawn(spec)?;
         let read_loop = pty.spawn_read_loop(16)?;
         let agent = RegisteredAgentSession::new(name.clone(), pty.process_id());
-        self.spawn_pty_output_forwarder(agent.id.clone(), terminal.clone(), read_loop);
+        self.spawn_pty_output_forwarder(
+            agent.id.clone(),
+            name.clone(),
+            terminal.clone(),
+            read_loop,
+        );
         let mut state = self.state.write().await;
         state.agents.insert(
             agent.id.clone(),
@@ -261,7 +264,7 @@ impl DaemonRuntime {
         );
         state.messages.register_agent(AgentDescriptor::new(
             agent.id.clone(),
-            AgentRole::Custom(name.clone()),
+            inferred_agent_role(&name),
         ));
         drop(state);
         self.publish(DaemonEvent::new(
@@ -278,11 +281,15 @@ impl DaemonRuntime {
     fn spawn_pty_output_forwarder(
         &self,
         agent_id: AgentSessionId,
+        agent_name: String,
         terminal: Arc<Mutex<TerminalParser>>,
         mut read_loop: agentmux_pty::PtyReadLoop,
     ) {
+        let runtime = self.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
+            let mut output_tail = String::new();
+            let mut result_persisted = false;
             while let Some(event) = read_loop.recv().await {
                 match event {
                     PtyReadEvent::Output(bytes) => {
@@ -290,6 +297,8 @@ impl DaemonRuntime {
                             terminal.advance(&bytes);
                         }
                         let text = String::from_utf8_lossy(&bytes).into_owned();
+                        output_tail.push_str(&text);
+                        trim_result_detection_tail(&mut output_tail);
                         let _ = events.send(DaemonEvent::new(
                             IpcEventKind::PtyOutputChunk,
                             json!({
@@ -297,6 +306,26 @@ impl DaemonRuntime {
                                 "text": text,
                             }),
                         ));
+                        if !result_persisted {
+                            match runtime
+                                .persist_live_agent_result(&agent_name, &output_tail)
+                                .await
+                            {
+                                Ok(true) => result_persisted = true,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    let _ = events.send(DaemonEvent::new(
+                                        IpcEventKind::Error,
+                                        json!({
+                                            "agent_id": agent_id.to_string(),
+                                            "signal": "agent_result_persist_failed",
+                                            "error": error.to_string(),
+                                        }),
+                                    ));
+                                    result_persisted = true;
+                                }
+                            }
+                        }
                     }
                     PtyReadEvent::Eof => break,
                     PtyReadEvent::Error(error) => {
@@ -1211,6 +1240,24 @@ impl DaemonRuntime {
             messages.push(self.persist_orchestrator_message(outgoing).await?);
         }
         Ok(messages)
+    }
+
+    async fn persist_live_agent_result(&self, agent_name: &str, output_tail: &str) -> Result<bool> {
+        let result = match parse_agent_result_marker(output_tail) {
+            AgentResultParse::Found(parsed) => parsed.result,
+            AgentResultParse::NotFound | AgentResultParse::NeedsStatusProbe(_) => {
+                return Ok(false);
+            }
+        };
+        let task_id = TaskId::new();
+        let team = default_claude_codex_team();
+        let agent = AgentRouteIdentity {
+            name: agent_name.to_string(),
+            role: inferred_agent_role(agent_name),
+        };
+        self.persist_agent_result_messages(&agent, task_id, &team, result)
+            .await?;
+        Ok(true)
     }
 
     pub async fn send_input_script(&self, script: &InputScript) -> Result<()> {
@@ -2443,6 +2490,47 @@ fn provider_for_agent_name(name: &str) -> AgentProvider {
     }
 }
 
+fn inferred_agent_role(name: &str) -> AgentRole {
+    let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+    if normalized.contains("planner") {
+        AgentRole::Planner
+    } else if normalized.contains("tester") || normalized.contains("qa") {
+        AgentRole::Tester
+    } else if normalized.contains("reviewer") {
+        AgentRole::Reviewer
+    } else if normalized.contains("debugger") {
+        AgentRole::Debugger
+    } else if normalized.contains("refactorer") {
+        AgentRole::Refactorer
+    } else if normalized.contains("security") {
+        AgentRole::SecurityReviewer
+    } else if normalized.contains("docs") {
+        AgentRole::DocsWriter
+    } else if normalized.contains("integrator") {
+        AgentRole::Integrator
+    } else if normalized.starts_with("impl") || normalized.contains("implementer") {
+        AgentRole::Implementer
+    } else {
+        AgentRole::Custom(name.to_string())
+    }
+}
+
+fn trim_result_detection_tail(output_tail: &mut String) {
+    const MAX_RESULT_DETECTION_TAIL: usize = 64 * 1024;
+    if output_tail.len() <= MAX_RESULT_DETECTION_TAIL {
+        return;
+    }
+
+    let keep_from = output_tail
+        .char_indices()
+        .rev()
+        .find_map(|(index, _)| {
+            (output_tail.len() - index <= MAX_RESULT_DETECTION_TAIL).then_some(index)
+        })
+        .unwrap_or(0);
+    output_tail.drain(..keep_from);
+}
+
 fn protocol_error(compatibility: ProtocolCompatibility) -> Option<ErrorBody> {
     match compatibility {
         ProtocolCompatibility::Compatible => None,
@@ -3114,6 +3202,47 @@ mod tests {
         assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Tester));
         assert_eq!(messages[0].delivery_mode, DeliveryMode::InjectWhenIdle);
         assert_eq!(runtime.list_messages().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn live_agent_result_output_is_persisted_to_message_bus() {
+        let runtime = DaemonRuntime::new(8);
+        runtime.register_agent("tester".to_string()).await;
+        let output = r#"
+some terminal output
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Implementation is ready for test.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "Run the focused daemon message tests.",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+
+        let persisted = runtime
+            .persist_live_agent_result("impl-codex", output)
+            .await
+            .expect("live result persists");
+
+        assert!(persisted);
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].from,
+            MessageSource::TeamAgent("impl-codex".to_string())
+        );
+        assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Tester));
+        assert_eq!(messages[0].body, "Run the focused daemon message tests.");
     }
 
     #[tokio::test]
