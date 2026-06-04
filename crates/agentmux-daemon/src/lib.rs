@@ -28,8 +28,8 @@ use agentmux_core::{
     Visibility, WorktreeId, WorktreeStatus, error::Result,
 };
 use agentmux_ipc::{
-    ClientHello, ClientRequest, DaemonEvent, DaemonResponse, ErrorBody, IpcCommand, IpcEventKind,
-    JsonlReader, JsonlWriter, ProtocolCompatibility,
+    ClientHello, ClientRequest, DaemonEvent, DaemonResponse, ErrorBody, EventSubscribeFilter,
+    IpcCommand, IpcEventKind, JsonlReader, JsonlWriter, ProtocolCompatibility,
 };
 use agentmux_message::{
     AgentDescriptor, AgentMessage, IdleDelivery, MessageBus, MessageKind, MessageSource,
@@ -1672,6 +1672,7 @@ pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result
     let mut events = runtime.subscribe();
     let (frames, mut frame_receiver) = mpsc::channel::<ServerFrame>(32);
     let (attached, mut attached_events) = watch::channel(false);
+    let event_filter = Arc::new(Mutex::new(None::<EventSubscribeFilter>));
 
     let writer_task = tokio::spawn(async move {
         let mut writer = JsonlWriter::new(writer);
@@ -1685,11 +1686,22 @@ pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result
     });
 
     let event_frames = frames.clone();
+    let event_task_filter = Arc::clone(&event_filter);
+    let event_task_runtime = runtime.clone();
     let event_task = tokio::spawn(async move {
         loop {
             match events.recv().await {
                 Ok(event) => {
                     if !*attached_events.borrow_and_update() {
+                        continue;
+                    }
+                    let filter = event_task_filter
+                        .lock()
+                        .map(|filter| filter.clone())
+                        .unwrap_or(None);
+                    let should_forward =
+                        should_forward_event(&event_task_runtime, filter.as_ref(), &event).await;
+                    if !should_forward {
                         continue;
                     }
                     if event_frames.send(ServerFrame::Event(event)).await.is_err() {
@@ -1739,7 +1751,7 @@ pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result
         } else if command == IpcCommand::ClientDetach {
             let _ = attached.send(false);
         }
-        let response = handle_request(&runtime, &client_id, request).await;
+        let response = handle_request(&runtime, &client_id, &event_filter, request).await;
         let attach_failed =
             matches!(command, IpcCommand::ClientAttach | IpcCommand::AgentFocus) && !response.ok;
         send_frame(&frames, ServerFrame::Response(response)).await?;
@@ -1763,9 +1775,96 @@ async fn send_frame(frames: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> R
         .map_err(|_| AgentmuxError::IpcError("client writer task stopped".to_string()))
 }
 
+async fn should_forward_event(
+    runtime: &DaemonRuntime,
+    filter: Option<&EventSubscribeFilter>,
+    event: &DaemonEvent,
+) -> bool {
+    let Some(filter) = filter else {
+        return true;
+    };
+    if !filter.kinds.is_empty()
+        && !filter
+            .kinds
+            .iter()
+            .any(|kind| kind == event_kind_label(&event.kind))
+    {
+        return false;
+    }
+    if let Some(task_id) = filter.task_id.as_deref()
+        && payload_string_field(&event.payload, "task_id").as_deref() != Some(task_id)
+    {
+        return false;
+    }
+    if !filter.roles.is_empty()
+        && event_role(runtime, event)
+            .await
+            .as_deref()
+            .is_none_or(|role| !filter.roles.iter().any(|expected| expected == role))
+    {
+        return false;
+    }
+    true
+}
+
+async fn event_role(runtime: &DaemonRuntime, event: &DaemonEvent) -> Option<String> {
+    if let Some(role) = payload_string_field(&event.payload, "role") {
+        return Some(role);
+    }
+    let agent_id = payload_string_field(&event.payload, "agent_id")?
+        .parse::<AgentSessionId>()
+        .ok()?;
+    let state = runtime.state.read().await;
+    state
+        .agents
+        .get(&agent_id)
+        .map(|agent| agent_role_label(&agent.metadata.role))
+}
+
+fn payload_string_field(payload: &serde_json::Value, field: &str) -> Option<String> {
+    payload
+        .get(field)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn event_kind_label(kind: &IpcEventKind) -> &'static str {
+    match kind {
+        IpcEventKind::DaemonStarted => "daemon.started",
+        IpcEventKind::DaemonStopped => "daemon.stopped",
+        IpcEventKind::ClientAttached => "client.attached",
+        IpcEventKind::ClientDetached => "client.detached",
+        IpcEventKind::TaskCreated => "task.created",
+        IpcEventKind::TaskStatusChanged => "task.status_changed",
+        IpcEventKind::AgentSpawned => "agent.spawned",
+        IpcEventKind::AgentStatusSignal => "agent.status_signal",
+        IpcEventKind::AgentStatusChanged => "agent.status_changed",
+        IpcEventKind::AgentExited => "agent.exited",
+        IpcEventKind::PtyOutputChunk => "pty.output_chunk",
+        IpcEventKind::ScreenDiff => "screen.diff",
+        IpcEventKind::TerminalSnapshotSaved => "terminal.snapshot_saved",
+        IpcEventKind::InputScriptCreated => "input_script.created",
+        IpcEventKind::InputScriptInjected => "input_script.injected",
+        IpcEventKind::InputInjected => "input.injected",
+        IpcEventKind::MessageCreated => "message.created",
+        IpcEventKind::MessageDelivered => "message.delivered",
+        IpcEventKind::ContextCreated => "context.created",
+        IpcEventKind::ContextInjected => "context.injected",
+        IpcEventKind::MailboxWritten => "mailbox.written",
+        IpcEventKind::ArtifactCreated => "artifact.created",
+        IpcEventKind::ApprovalCreated => "approval.created",
+        IpcEventKind::ApprovalDecided => "approval.decided",
+        IpcEventKind::WorktreeCreated => "worktree.created",
+        IpcEventKind::WorktreeDiffCaptured => "worktree.diff_captured",
+        IpcEventKind::PolicyDenied => "policy.denied",
+        IpcEventKind::Error => "error",
+    }
+}
+
 async fn handle_request(
     runtime: &DaemonRuntime,
     client_id: &ClientSessionId,
+    event_filter: &Arc<Mutex<Option<EventSubscribeFilter>>>,
     request: ClientRequest,
 ) -> DaemonResponse {
     if let Some(error) = protocol_error(request.protocol_compatibility()) {
@@ -1774,6 +1873,34 @@ async fn handle_request(
 
     match request.command {
         IpcCommand::DaemonStatus => DaemonResponse::ok(request.id, runtime.status_payload().await),
+        IpcCommand::EventSubscribe => {
+            let filter =
+                match serde_json::from_value::<EventSubscribeFilter>(request.payload.clone()) {
+                    Ok(filter) => filter,
+                    Err(error) => {
+                        return DaemonResponse::error(
+                            request.id,
+                            ErrorBody::new(
+                                "INVALID_EVENT_SUBSCRIBE_FILTER",
+                                format!("event.subscribe filter is invalid: {error}"),
+                            ),
+                        );
+                    }
+                };
+            match event_filter.lock() {
+                Ok(mut current) => {
+                    *current = Some(filter);
+                    DaemonResponse::ok(request.id, json!({ "subscribed": true }))
+                }
+                Err(_) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new(
+                        "EVENT_SUBSCRIBE_FAILED",
+                        "event.subscribe filter lock is poisoned",
+                    ),
+                ),
+            }
+        }
         IpcCommand::TaskRun => {
             let (body, team, project_path, runner) = match task_run_payload(&request.payload) {
                 Ok(payload) => payload,
@@ -3331,6 +3458,75 @@ mod tests {
 
         assert_eq!(spec.command, "agy");
         assert_eq!(spec.args, vec!["--sandbox"]);
+    }
+
+    #[tokio::test]
+    async fn event_subscribe_empty_filter_forwards_every_event() {
+        let runtime = DaemonRuntime::new(8);
+        let event = DaemonEvent::new(
+            IpcEventKind::MessageCreated,
+            json!({ "task_id": "task_001", "role": "implementer" }),
+        );
+        let filter = EventSubscribeFilter {
+            task_id: None,
+            roles: Vec::new(),
+            kinds: Vec::new(),
+        };
+
+        assert!(should_forward_event(&runtime, Some(&filter), &event).await);
+    }
+
+    #[tokio::test]
+    async fn event_subscribe_filter_ands_fields_and_ors_values() {
+        let runtime = DaemonRuntime::new(8);
+        let event = DaemonEvent::new(
+            IpcEventKind::MessageCreated,
+            json!({ "task_id": "task_001", "role": "implementer" }),
+        );
+        let matching = EventSubscribeFilter {
+            task_id: Some("task_001".to_string()),
+            roles: vec!["tester".to_string(), "implementer".to_string()],
+            kinds: vec![
+                "agent.status_changed".to_string(),
+                "message.created".to_string(),
+            ],
+        };
+        let wrong_task = EventSubscribeFilter {
+            task_id: Some("task_other".to_string()),
+            ..matching.clone()
+        };
+        let wrong_role = EventSubscribeFilter {
+            roles: vec!["tester".to_string(), "reviewer".to_string()],
+            ..matching.clone()
+        };
+        let wrong_kind = EventSubscribeFilter {
+            kinds: vec!["agent.status_changed".to_string()],
+            ..matching.clone()
+        };
+
+        assert!(should_forward_event(&runtime, Some(&matching), &event).await);
+        assert!(!should_forward_event(&runtime, Some(&wrong_task), &event).await);
+        assert!(!should_forward_event(&runtime, Some(&wrong_role), &event).await);
+        assert!(!should_forward_event(&runtime, Some(&wrong_kind), &event).await);
+    }
+
+    #[tokio::test]
+    async fn event_subscribe_role_filter_uses_agent_role_when_payload_role_is_missing() {
+        let runtime = DaemonRuntime::new(8);
+        let agent = runtime
+            .register_agent_with_role("tester-a1b2c3".to_string(), AgentRole::Tester)
+            .await;
+        let event = DaemonEvent::new(
+            IpcEventKind::AgentStatusChanged,
+            json!({ "agent_id": agent.id.to_string(), "status": "awaiting_input" }),
+        );
+        let filter = EventSubscribeFilter {
+            task_id: None,
+            roles: vec!["tester".to_string()],
+            kinds: vec!["agent.status_changed".to_string()],
+        };
+
+        assert!(should_forward_event(&runtime, Some(&filter), &event).await);
     }
 
     #[tokio::test]
