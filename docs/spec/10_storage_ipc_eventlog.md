@@ -155,8 +155,35 @@ v0.1はJSON Lines over Unix domain socket。
 - daemon.status
 - client.attach
 - client.detach
+- event.subscribe
 - layout.get
 - layout.set
+
+#### event.subscribe
+
+client→daemonのread-onlyコマンド。送信後、daemonはfilter条件に一致するeventだけをそのclientへ配信する。
+
+```json
+{
+  "id": "req_event_subscribe",
+  "type": "event.subscribe",
+  "payload": {
+    "task_id": "task_001",
+    "roles": ["implementer"],
+    "kinds": ["agent.status_changed"]
+  }
+}
+```
+
+`EventSubscribeFilter`の各フィールドは省略可能（デフォルト: 空）。複数フィールドはAND、同一フィールド内の複数値はORで評価する。
+
+- `task_id`: 特定taskのeventだけを受け取る。
+- `roles`: 指定したroleを持つagentのeventだけを受け取る。eventのpayloadにroleがない場合はagent registryから解決する。
+- `kinds`: 特定のevent typeだけを受け取る。
+
+`event.subscribe`を送っていないclientへは従来どおり全eventを配信する（挙動不変）。
+
+本コマンドはprotocol version 2以上でのみ有効（`EVENT_SUBSCRIBE_PROTOCOL_VERSION`参照）。
 
 ### 7.2 Task
 
@@ -234,6 +261,15 @@ SQLite writeは専用taskでserializeする。
 ```json
 {"type":"hello","payload":{"client_version":"0.1.0","protocol":"1"}}
 ```
+
+handshakeのprotocol番号は**厳密等価**で判定し、mismatch時はgraceful closeする。
+
+### 11.1 protocol version定数
+
+| 定数 | 値 | 意味 |
+|---|---|---|
+| `PROTOCOL_VERSION` | 2 | 現在のprotocol番号。protocol shapeに変更があるたびにbumpする。 |
+| `EVENT_SUBSCRIBE_PROTOCOL_VERSION` | 2 | `event.subscribe`コマンドをサポートする最初のprotocol version。clientはdaemonの`protocol_version`がこの値以上のときだけ`event.subscribe`を送る。 |
 
 ## 12. Error response
 

@@ -212,6 +212,18 @@ v0.1では「Claude/Codex TUIが実用的に操作できる」ことを合格基
 - Internal pane: Ratatui widgetで描画。
 - Shell pane: terminal gridを描画。
 
+Internal pane種別（Ratatui widgetで描画するpane）の一覧:
+
+| Internal pane | 説明 |
+|---|---|
+| MessageBus | message一覧 |
+| ContextBoard | context item一覧 |
+| ApprovalQueue | 承認待ち一覧 |
+| AgentList | agent状態一覧 |
+| ActivityFeed | sitrep header + event tail（feature: `activity-feed`） |
+
+ActivityFeed paneはPTY terminal gridを持たないためresize時のPTY ioctl対象から除外する。
+
 ### 7.2 Overlay
 
 Agent paneには次のoverlay/statusを出す。
