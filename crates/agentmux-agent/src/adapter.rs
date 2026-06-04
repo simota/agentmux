@@ -359,7 +359,7 @@ pub trait InteractiveAgentAdapter: Send + Sync {
     /// Inline if `context_pack` is small; path-based if large (ADR-0005).
     async fn render_handoff_prompt(
         &self,
-        message: &agentmux_core::AgentSessionId, // placeholder — will be AgentMessage
+        message: &agentmux_core::AgentSessionId, // temporary adapter boundary; MessageBus renders AgentMessage
         context_pack: &ContextPack,
     ) -> Result<String>;
 }

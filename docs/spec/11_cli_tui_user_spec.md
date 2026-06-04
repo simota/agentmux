@@ -15,7 +15,7 @@ agentmux daemon start|stop|status
 agentmux project init|open|status
 agentmux task run|status|pause|resume|cancel|summary
 agentmux agent ls|spawn|stop|send|inject|focus|interrupt
-agentmux message list|show|send|inject
+agentmux message list|history|show|send|inject
 agentmux context add|list|show|search|attach|inject|export
 agentmux worktree list|diff|test|promote|archive
 agentmux approval list|approve|reject
@@ -86,6 +86,20 @@ agentmux message inject msg_123 --to impl-codex
 ```
 
 delivery modeを無視して明示注入する場合はapprovalが必要になることがある。
+
+### 3.7 message history
+
+```bash
+agentmux message history
+agentmux message history --limit 20
+agentmux message history --agent impl-codex
+agentmux message history --task task_123 --status delivered
+agentmux message history --kind handoff
+```
+
+`message list` はdaemon payloadをJSONで表示する。`message history` は履歴確認用に
+`created_at`, `delivery_status`, `kind`, `from`, `to`, `message_id`, `body`
+を人間向けの表で表示する。
 
 ## 4. TUI画面構成
 

@@ -10,24 +10,29 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
+use agentmux_agent::adapter::InputSafety;
 use agentmux_agent::{
-    AgentResult, AgentResultParse, AgentRouteIdentity, EncodedInputStep, InputScript,
+    AgentResult, AgentResultParse, AgentRouteIdentity, EncodedInputStep, InputAction, InputScript,
     StandardWorkflowState, WorkflowHandoffContext, advance_standard_workflow,
     default_claude_codex_team, encode_input_action, parse_agent_result_marker, plan_task_run,
+    route_agent_result,
 };
-use agentmux_context::{ContextBroker, ContextItem, NewContextItem};
+use agentmux_context::{
+    ContextBroker, ContextItem, ContextPackRequest, MailboxConfig, NewContextItem,
+};
 use agentmux_core::{
-    AgentRole, AgentSessionId, AgentmuxError, ApprovalId, ClientId, ClientSessionId, ContextItemId,
-    ContextKind, ContextScope, ContextSource, DateTimeUtc, DeliveryMode, MessageId, Priority,
-    ProjectId, TaskId, Visibility, WorktreeId, WorktreeStatus, error::Result,
+    AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ApprovalId, ClientId,
+    ClientSessionId, ContextItemId, ContextKind, ContextScope, ContextSource, DateTimeUtc,
+    DeliveryMode, DeliveryStatus, InputScriptId, MessageId, Priority, ProjectId, TaskId,
+    Visibility, WorktreeId, WorktreeStatus, error::Result,
 };
 use agentmux_ipc::{
     ClientHello, ClientRequest, DaemonEvent, DaemonResponse, ErrorBody, IpcCommand, IpcEventKind,
     JsonlReader, JsonlWriter, ProtocolCompatibility,
 };
 use agentmux_message::{
-    AgentDescriptor, AgentMessage, MessageBus, MessageKind, MessageSource, MessageTarget,
-    NewAgentMessage,
+    AgentDescriptor, AgentMessage, IdleDelivery, MessageBus, MessageKind, MessageSource,
+    MessageTarget, NewAgentMessage, PreparedInjection, PromptContext, PromptContextItem,
 };
 use agentmux_policy::{ApprovalEvent, ApprovalQueue, ApprovalQueueError, ApprovalRequest};
 use agentmux_pty::{CTRL_C, PtyHandle, PtyReadEvent, PtySpawnSpec};
@@ -429,21 +434,206 @@ impl DaemonRuntime {
 
     pub async fn inject_message(&self, id: &MessageId) -> Result<AgentMessage> {
         let now = DateTimeUtc::now_utc();
+        let prepared = self.prepare_manual_message_injection(id, now).await?;
+        let write_result = self.write_prepared_message_injection(&prepared).await;
+        self.finish_and_emit_message_injection(&prepared.message_id, now, write_result)
+            .await
+    }
+
+    async fn finish_and_emit_message_injection(
+        &self,
+        id: &MessageId,
+        now: DateTimeUtc,
+        write_result: Result<()>,
+    ) -> Result<AgentMessage> {
+        let finished = self.finish_message_injection(id, now, write_result).await;
+        match finished {
+            Ok(message) => {
+                self.append_message_event(agentmux_store::EVENT_MESSAGE_INJECTED, &message)?;
+                self.publish(DaemonEvent::new(
+                    IpcEventKind::MessageDelivered,
+                    message_payload(&message),
+                ));
+                Ok(message)
+            }
+            Err(error) => {
+                if let Some(message) = self.get_message(id).await {
+                    let _ =
+                        self.append_message_event(agentmux_store::EVENT_MESSAGE_INJECTED, &message);
+                    self.publish(DaemonEvent::new(
+                        IpcEventKind::Error,
+                        json!({
+                            "message_id": id.to_string(),
+                            "delivery_status": message.delivery_status,
+                            "error": error.to_string(),
+                        }),
+                    ));
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub async fn deliver_idle_messages_for_agent(
+        &self,
+        agent_id: &AgentSessionId,
+        status: AgentStatus,
+    ) -> Result<Option<AgentMessage>> {
+        let now = DateTimeUtc::now_utc();
+        let delivery = {
+            let state = self.state.read().await;
+            let Some(message) = state.messages.next_inject_when_idle_message(agent_id)? else {
+                return Ok(None);
+            };
+            let (provider, context) = delivery_render_inputs(&state, agent_id, message)?;
+            drop(state);
+            let mut state = self.state.write().await;
+            state
+                .messages
+                .prepare_next_inject_when_idle(agent_id, &status, provider, &context, now)?
+        };
+
+        let IdleDelivery::Ready(prepared) = delivery else {
+            return Ok(None);
+        };
+
+        let write_result = self.write_prepared_message_injection(&prepared).await;
+        let message = self
+            .finish_and_emit_message_injection(&prepared.message_id, now, write_result)
+            .await?;
+        Ok(Some(message))
+    }
+
+    pub async fn apply_agent_status_signal(
+        &self,
+        agent_id: &AgentSessionId,
+        status: AgentStatus,
+        evidence: impl Into<String>,
+    ) -> Result<Option<AgentMessage>> {
+        {
+            let state = self.state.read().await;
+            if !state.agents.contains_key(agent_id) {
+                return Err(AgentmuxError::UserError(format!(
+                    "unknown agent session '{agent_id}'"
+                )));
+            }
+        }
+
+        let evidence = evidence.into();
+        self.publish(DaemonEvent::new(
+            IpcEventKind::AgentStatusSignal,
+            json!({
+                "agent_id": agent_id.to_string(),
+                "status": status.clone(),
+                "evidence": evidence,
+            }),
+        ));
+        self.publish(DaemonEvent::new(
+            IpcEventKind::AgentStatusChanged,
+            json!({
+                "agent_id": agent_id.to_string(),
+                "status": status.clone(),
+            }),
+        ));
+
+        self.deliver_idle_messages_for_agent(agent_id, status).await
+    }
+
+    async fn prepare_manual_message_injection(
+        &self,
+        id: &MessageId,
+        now: DateTimeUtc,
+    ) -> Result<PreparedInjection> {
         let mut state = self.state.write().await;
-        state.messages.mark_message_injected(id, now)?;
         let message = state
             .messages
             .get_message(id)
             .cloned()
             .ok_or_else(|| AgentmuxError::UserError(format!("unknown message '{id}'")))?;
-        drop(state);
+        let recipients = state.messages.resolve_target(&message.to)?;
+        let [agent_id] = recipients.as_slice() else {
+            return Err(AgentmuxError::UserError(format!(
+                "message target resolved to {} agents; manual injection requires exactly one",
+                recipients.len()
+            )));
+        };
+        let (provider, context) = delivery_render_inputs(&state, agent_id, &message)?;
+        let prompt = agentmux_message::render_prompt(&message, provider, &context);
+        state
+            .messages
+            .update_delivery_status(id, DeliveryStatus::Injecting, now)?;
 
-        self.append_message_event(agentmux_store::EVENT_MESSAGE_INJECTED, &message)?;
+        Ok(PreparedInjection {
+            message_id: id.clone(),
+            agent_id: agent_id.clone(),
+            prompt,
+        })
+    }
+
+    async fn write_prepared_message_injection(&self, prepared: &PreparedInjection) -> Result<()> {
+        let script = message_input_script(prepared);
+        self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_CREATED, &script)?;
+
+        {
+            let state = self.state.read().await;
+            let Some(agent) = state.agents.get(&prepared.agent_id) else {
+                return Err(AgentmuxError::UserError(format!(
+                    "unknown agent session '{}'",
+                    prepared.agent_id
+                )));
+            };
+            let Some(pty) = &agent.pty else {
+                return Err(AgentmuxError::UserError(format!(
+                    "agent session '{}' has no live PTY",
+                    prepared.agent_id
+                )));
+            };
+            let mut pty = pty.lock().map_err(|_| {
+                AgentmuxError::Internal(format!(
+                    "PTY lock for agent '{}' is poisoned",
+                    prepared.agent_id
+                ))
+            })?;
+            for action in &script.actions {
+                match encode_input_action(action)? {
+                    EncodedInputStep::Bytes(bytes) => pty.write_bytes(&bytes)?,
+                    EncodedInputStep::Wait(duration) => std::thread::sleep(duration),
+                }
+            }
+        }
+
+        self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_INJECTED, &script)?;
         self.publish(DaemonEvent::new(
-            IpcEventKind::MessageDelivered,
-            message_payload(&message),
+            IpcEventKind::InputInjected,
+            json!({
+                "input_script_id": script.id.to_string(),
+                "agent_id": script.target_agent_id.to_string(),
+                "message_id": prepared.message_id.to_string(),
+                "action_count": script.actions.len(),
+            }),
         ));
-        Ok(message)
+        Ok(())
+    }
+
+    async fn finish_message_injection(
+        &self,
+        id: &MessageId,
+        now: DateTimeUtc,
+        write_result: Result<()>,
+    ) -> Result<AgentMessage> {
+        let mut state = self.state.write().await;
+        match write_result {
+            Ok(()) => state.messages.mark_message_injected(id, now)?,
+            Err(error) => {
+                state.messages.mark_message_injection_failed(id, now)?;
+                return Err(error);
+            }
+        }
+        state
+            .messages
+            .get_message(id)
+            .cloned()
+            .ok_or_else(|| AgentmuxError::UserError(format!("unknown message '{id}'")))
     }
 
     pub async fn create_context(&self, input: NewContextItem) -> Result<ContextItem> {
@@ -847,6 +1037,9 @@ impl DaemonRuntime {
         let task_id = TaskId::new();
         let team = default_claude_codex_team();
         let plan = plan_task_run(task_id.clone(), &body, team.clone())?;
+        self.register_task_team_message_agents(&task_id, &team)
+            .await;
+        let bootstrap_message = self.persist_orchestrator_message(&plan.bootstrap).await?;
         let context = WorkflowHandoffContext {
             task_title: body.trim().to_string(),
             worktree_path: project_path.display().to_string(),
@@ -872,7 +1065,7 @@ impl DaemonRuntime {
             candidate_worktrees: vec![project_path.display().to_string()],
         };
         let mut state = StandardWorkflowState::new(task_id.clone());
-        let mut handoffs = vec![orchestrator_message_payload(&plan.bootstrap)];
+        let mut handoffs = vec![message_payload(&bootstrap_message)];
         let mut shell_processes = Vec::new();
 
         for (name, role) in [
@@ -899,7 +1092,10 @@ impl DaemonRuntime {
                 &context,
             )?;
             state = advanced.state;
-            handoffs.extend(advanced.outgoing.iter().map(orchestrator_message_payload));
+            for outgoing in &advanced.outgoing {
+                let message = self.persist_orchestrator_message(outgoing).await?;
+                handoffs.push(message_payload(&message));
+            }
             if let Some(summary) = advanced.final_summary {
                 let payload = json!({
                     "task_id": task_id.to_string(),
@@ -921,6 +1117,59 @@ impl DaemonRuntime {
         Err(AgentmuxError::OrchestratorError(
             "shell stub task workflow ended without final summary".to_string(),
         ))
+    }
+
+    async fn register_task_team_message_agents(
+        &self,
+        task_id: &TaskId,
+        team: &agentmux_agent::TeamTemplate,
+    ) {
+        let mut state = self.state.write().await;
+        for agent in &team.agents {
+            if agent.name == "impl-claude" {
+                continue;
+            }
+            let agent_id = AgentSessionId::new();
+            state.messages.register_agent(
+                AgentDescriptor::new(agent_id, agent.role.clone())
+                    .with_task_id(task_id.clone())
+                    .with_team(team.name.clone()),
+            );
+        }
+    }
+
+    async fn persist_orchestrator_message(
+        &self,
+        message: &agentmux_agent::OrchestratorMessage,
+    ) -> Result<AgentMessage> {
+        self.create_message(NewAgentMessage {
+            task_id: message.task_id.clone(),
+            from: message.from.clone(),
+            to: message.to.clone(),
+            kind: message.kind.clone(),
+            priority: message.priority.clone(),
+            body: message.body.clone(),
+            context_refs: message.context_refs.clone(),
+            artifact_refs: message.artifact_refs.clone(),
+            delivery_mode: message.delivery_mode.clone(),
+            requires_response: message.requires_response,
+        })
+        .await
+    }
+
+    pub async fn persist_agent_result_messages(
+        &self,
+        agent: &AgentRouteIdentity,
+        task_id: TaskId,
+        team: &agentmux_agent::TeamTemplate,
+        result: AgentResult,
+    ) -> Result<Vec<AgentMessage>> {
+        let routed = route_agent_result(agent, task_id, team, result)?;
+        let mut messages = Vec::with_capacity(routed.outgoing.len());
+        for outgoing in &routed.outgoing {
+            messages.push(self.persist_orchestrator_message(outgoing).await?);
+        }
+        Ok(messages)
     }
 
     pub async fn send_input_script(&self, script: &InputScript) -> Result<()> {
@@ -2046,21 +2295,76 @@ fn parse_shell_stub_result(agent_name: &str, stdout: &str) -> Result<AgentResult
     }
 }
 
-fn orchestrator_message_payload(
-    message: &agentmux_agent::OrchestratorMessage,
-) -> serde_json::Value {
-    json!({
-        "task_id": message.task_id.as_ref().map(ToString::to_string),
-        "from": message.from,
-        "to": message.to,
-        "kind": message.kind,
-        "priority": message.priority,
-        "body": message.body,
-        "delivery_mode": message.delivery_mode,
-        "requires_response": message.requires_response,
-        "context_refs": message.context_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "artifact_refs": message.artifact_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
-    })
+fn delivery_render_inputs(
+    state: &DaemonState,
+    agent_id: &AgentSessionId,
+    message: &AgentMessage,
+) -> Result<(AgentProvider, PromptContext)> {
+    let Some(agent) = state.agents.get(agent_id) else {
+        return Err(AgentmuxError::UserError(format!(
+            "unknown agent session '{agent_id}'"
+        )));
+    };
+    let provider = provider_for_agent_name(&agent.metadata.name);
+    let project_root = std::env::current_dir().map_err(|error| {
+        AgentmuxError::Internal(format!("failed to resolve current directory: {error}"))
+    })?;
+    let pack = state.contexts.select_pack_with_mailbox(
+        ContextPackRequest {
+            project_id: state.default_project_id.clone(),
+            task_id: message.task_id.clone(),
+            attached_context_ids: message.context_refs.clone(),
+            max_inline_chars: 2048,
+        },
+        MailboxConfig {
+            project_root,
+            agent_name: agent.metadata.name.clone(),
+        },
+    )?;
+    let context = message_prompt_context_from_pack(pack);
+    Ok((provider, context))
+}
+
+fn message_prompt_context_from_pack(pack: agentmux_context::ContextPack) -> PromptContext {
+    PromptContext {
+        inline_items: pack
+            .inline_items
+            .into_iter()
+            .map(|item| PromptContextItem {
+                title: item.title,
+                body: item.body,
+            })
+            .collect(),
+        mailbox_paths: pack.mailbox_files,
+    }
+}
+
+fn message_input_script(prepared: &PreparedInjection) -> InputScript {
+    InputScript {
+        id: InputScriptId::new(),
+        target_agent_id: prepared.agent_id.clone(),
+        reason: format!("message.inject {}", prepared.message_id),
+        preconditions: Vec::new(),
+        actions: vec![
+            InputAction::PasteText(prepared.prompt.clone()),
+            InputAction::PressEnter,
+        ],
+        safety: InputSafety::Safe,
+        created_at: DateTimeUtc::now_utc(),
+    }
+}
+
+fn provider_for_agent_name(name: &str) -> AgentProvider {
+    let lower = name.to_ascii_lowercase();
+    if lower.contains("codex") {
+        AgentProvider::Codex
+    } else if lower.contains("claude") {
+        AgentProvider::ClaudeCode
+    } else if lower.contains("shell") || lower.contains("tester") {
+        AgentProvider::Shell
+    } else {
+        AgentProvider::Custom(name.to_string())
+    }
 }
 
 fn protocol_error(compatibility: ProtocolCompatibility) -> Option<ErrorBody> {
@@ -2527,8 +2831,11 @@ mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
-    use agentmux_agent::InputAction;
     use agentmux_agent::adapter::{InputPrecondition, InputSafety};
+    use agentmux_agent::{
+        AgentResultStatus, InputAction, OutgoingMessage, OutgoingMessageKind, OutgoingPriority,
+        ResultRecommendation, ResultRisk,
+    };
     use agentmux_core::InputScriptId;
     use agentmux_ipc::{IpcCommand, JsonlReader, JsonlWriter};
     use agentmux_store::EventLog;
@@ -2613,6 +2920,15 @@ mod tests {
         let handoffs = payload["handoffs"].as_array().unwrap();
         assert_eq!(handoffs.len(), 4);
         assert!(handoffs[1]["body"].as_str().unwrap().contains("impl"));
+        let persisted_messages = runtime.list_messages().await;
+        assert_eq!(persisted_messages.len(), 4);
+        assert!(
+            persisted_messages.iter().all(|message| message
+                .task_id
+                .as_ref()
+                .map(ToString::to_string)
+                == Some(payload["task_id"].as_str().unwrap().to_string()))
+        );
         assert!(
             payload["final_summary"]
                 .as_str()
@@ -2621,6 +2937,95 @@ mod tests {
         );
 
         std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[tokio::test]
+    async fn agent_result_messages_are_persisted_to_message_bus() {
+        let runtime = DaemonRuntime::new(8);
+        let task_id = TaskId::new();
+        let team = default_claude_codex_team();
+        runtime
+            .register_task_team_message_agents(&task_id, &team)
+            .await;
+        let result = AgentResult {
+            status: AgentResultStatus::Completed,
+            summary: "Planner found test work.".to_string(),
+            changed_files: Vec::new(),
+            messages: vec![OutgoingMessage {
+                to: "role:tester".to_string(),
+                kind: OutgoingMessageKind::TestResult,
+                body: "Run focused daemon message tests.".to_string(),
+                priority: OutgoingPriority::High,
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+            }],
+            context_updates: Vec::new(),
+            needs: Vec::new(),
+            next: Some("impl-codex".to_string()),
+            recommendation: Some(ResultRecommendation::Continue),
+            risk: Some(ResultRisk::Low),
+        };
+
+        let messages = runtime
+            .persist_agent_result_messages(
+                &AgentRouteIdentity {
+                    name: "planner".to_string(),
+                    role: AgentRole::Planner,
+                },
+                task_id.clone(),
+                &team,
+                result,
+            )
+            .await
+            .expect("result messages persist");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].task_id, Some(task_id));
+        assert_eq!(messages[0].kind, MessageKind::TestResult);
+        assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Tester));
+        assert_eq!(messages[0].delivery_mode, DeliveryMode::InjectWhenIdle);
+        assert_eq!(runtime.list_messages().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_result_next_is_persisted_as_summary_handoff() {
+        let runtime = DaemonRuntime::new(8);
+        let task_id = TaskId::new();
+        let team = default_claude_codex_team();
+        runtime
+            .register_task_team_message_agents(&task_id, &team)
+            .await;
+        let result = AgentResult {
+            status: AgentResultStatus::Completed,
+            summary: "Implement the selected fix.".to_string(),
+            changed_files: Vec::new(),
+            messages: Vec::new(),
+            context_updates: Vec::new(),
+            needs: Vec::new(),
+            next: Some("impl-codex".to_string()),
+            recommendation: Some(ResultRecommendation::Continue),
+            risk: Some(ResultRisk::Low),
+        };
+
+        let messages = runtime
+            .persist_agent_result_messages(
+                &AgentRouteIdentity {
+                    name: "planner".to_string(),
+                    role: AgentRole::Planner,
+                },
+                task_id.clone(),
+                &team,
+                result,
+            )
+            .await
+            .expect("next handoff persists");
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].task_id, Some(task_id));
+        assert_eq!(messages[0].kind, MessageKind::Handoff);
+        assert_eq!(messages[0].to, MessageTarget::Role(AgentRole::Implementer));
+        assert!(messages[0].body.contains("Implement the selected fix."));
+        assert_eq!(runtime.list_messages().await.len(), 1);
     }
 
     #[tokio::test]
@@ -2860,6 +3265,9 @@ mod tests {
     #[tokio::test]
     async fn ipc_message_commands_create_list_show_and_inject() {
         let runtime = DaemonRuntime::new(16);
+        let root = std::env::temp_dir().join(format!("agentmux-message-ipc-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("message.txt");
         let (client_stream, server_stream) = UnixStream::pair().unwrap();
         let server_runtime = runtime.clone();
         let server =
@@ -2874,7 +3282,13 @@ mod tests {
             .write(&ClientRequest::new(
                 "req_spawn",
                 IpcCommand::AgentSpawn,
-                json!({ "name": "implementer" }),
+                json!({
+                    "name": "impl-codex",
+                    "command": "/usr/bin/perl",
+                    "args": ["-e", pty_capture_script(), output_path],
+                    "cwd": root,
+                    "env": { "TERM": "xterm-256color" },
+                }),
             ))
             .await
             .unwrap();
@@ -2952,15 +3366,250 @@ mod tests {
             ))
             .await
             .unwrap();
-        let (inject_response, delivered_event) = read_response_and_event(&mut reader).await;
+        let inject_response = read_response(&mut reader).await;
         assert!(inject_response.ok);
-        assert_eq!(delivered_event.kind, IpcEventKind::MessageDelivered);
         assert_eq!(
-            inject_response.payload.unwrap()["delivery_status"],
+            inject_response.payload.as_ref().unwrap()["delivery_status"],
             "delivered"
         );
+        let first_event: DaemonEvent = reader.read().await.unwrap().unwrap();
+        let second_event: DaemonEvent = reader.read().await.unwrap().unwrap();
+        assert_eq!(first_event.kind, IpcEventKind::InputInjected);
+        assert_eq!(second_event.kind, IpcEventKind::MessageDelivered);
 
+        std::thread::sleep(Duration::from_millis(1200));
+        let delivered = std::fs::read_to_string(&output_path).expect("message reached PTY");
+        assert!(delivered.contains("[agentmux handoff]"));
+        assert!(delivered.contains("message:\nplease review the diff"));
+
+        terminate_agent_process(&runtime, &agent_id).await;
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn manual_message_inject_fails_without_live_pty() {
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime.register_agent("metadata-only".to_string()).await;
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "deliver me".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectImmediately,
+                requires_response: false,
+            })
+            .await
+            .expect("message is created");
+
+        let error = runtime
+            .inject_message(&message.id)
+            .await
+            .expect_err("metadata-only agent cannot receive PTY input");
+
+        assert!(error.to_string().contains("has no live PTY"));
+        assert_eq!(
+            runtime
+                .get_message(&message.id)
+                .await
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_delivery_injects_rendered_prompt_with_context_and_mailbox_path() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-idle-message-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("idle-message.txt");
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime
+            .spawn_agent(
+                "idle-codex".to_string(),
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("agent is spawned");
+        let project_id = runtime.state.read().await.default_project_id.clone();
+        let short = runtime
+            .create_context(NewContextItem {
+                project_id: project_id.clone(),
+                task_id: None,
+                scope: ContextScope::Project,
+                kind: ContextKind::Decision,
+                title: "routing rule".to_string(),
+                body: "Use MessageBus before PTY injection.".to_string(),
+                source: ContextSource::System,
+                visibility: Visibility::Internal,
+                confidence: 1.0,
+                tags: Vec::new(),
+                related_files: Vec::new(),
+                artifact_refs: Vec::new(),
+            })
+            .await
+            .expect("short context is created");
+        let long = runtime
+            .create_context(NewContextItem {
+                project_id,
+                task_id: None,
+                scope: ContextScope::Project,
+                kind: ContextKind::ErrorLog,
+                title: "large log".to_string(),
+                body: "x".repeat(3000),
+                source: ContextSource::System,
+                visibility: Visibility::Internal,
+                confidence: 1.0,
+                tags: Vec::new(),
+                related_files: Vec::new(),
+                artifact_refs: Vec::new(),
+            })
+            .await
+            .expect("long context is created");
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::High,
+                body: "handle queued idle work".to_string(),
+                context_refs: vec![short.id.clone(), long.id.clone()],
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: true,
+            })
+            .await
+            .expect("message is created");
+
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput),
+        )
+        .await
+        .expect("idle delivery should not hang")
+        .expect("idle delivery succeeds")
+        .expect("message is delivered");
+
+        assert_eq!(delivered.id, message.id);
+        assert_eq!(delivered.delivery_status, DeliveryStatus::Delivered);
+        let output = wait_for_file_contains(&output_path, "message:\nhandle queued idle work")
+            .await
+            .expect("message reached PTY");
+        assert!(output.contains("message:\nhandle queued idle work"));
+        assert!(output.contains("- routing rule: Use MessageBus before PTY injection."));
+        assert!(output.contains(".agentmux/inbox/idle-codex/ctx-"));
+
+        let mailbox_dir = std::env::current_dir()
+            .unwrap()
+            .join(".agentmux/inbox/idle-codex");
+        assert!(
+            std::fs::read_dir(&mailbox_dir)
+                .expect("mailbox directory exists")
+                .any(|entry| entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("ctx-"))
+        );
+        terminate_agent_process(&runtime, &agent.id.to_string()).await;
+        std::fs::remove_dir_all(&mailbox_dir).expect("mailbox directory is cleaned");
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    #[tokio::test]
+    async fn ready_status_signal_delivers_next_idle_message_to_live_pty() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-ready-message-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("ready-message.txt");
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime
+            .spawn_agent(
+                "ready-codex".to_string(),
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("agent is spawned");
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "status driven work".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: true,
+            })
+            .await
+            .expect("message is created");
+        let mut events = runtime.subscribe();
+
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.apply_agent_status_signal(
+                &agent.id,
+                AgentStatus::AwaitingInput,
+                "prompt is ready",
+            ),
+        )
+        .await
+        .expect("ready status delivery should not hang")
+        .expect("ready status triggers idle delivery")
+        .expect("idle message is delivered");
+
+        assert_eq!(delivered.id, message.id);
+        assert_eq!(delivered.delivery_status, DeliveryStatus::Delivered);
+        let mut seen = Vec::new();
+        for _ in 0..4 {
+            seen.push(
+                events
+                    .recv()
+                    .await
+                    .expect("delivery event is published")
+                    .kind,
+            );
+        }
+        assert!(seen.contains(&IpcEventKind::AgentStatusSignal));
+        assert!(seen.contains(&IpcEventKind::AgentStatusChanged));
+        assert!(seen.contains(&IpcEventKind::InputInjected));
+        assert!(seen.contains(&IpcEventKind::MessageDelivered));
+
+        let output = wait_for_file_contains(&output_path, "message:\nstatus driven work")
+            .await
+            .expect("message reached PTY");
+        assert!(output.contains("message:\nstatus driven work"));
+
+        terminate_agent_process(&runtime, &agent.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
     }
 
     #[tokio::test]
@@ -3785,8 +4434,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("agentmux-daemon-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("temporary root is created");
         let socket_path = root.join("agentmux.sock");
-        std::fs::write(&socket_path, b"stale socket placeholder")
-            .expect("socket placeholder is written");
+        std::fs::write(&socket_path, b"stale socket marker").expect("socket marker is written");
         let event_log_path = root.join(".agentmux").join("events.jsonl");
         let runtime = DaemonRuntime::new(16).with_event_log(EventLog::new(&event_log_path));
         let agent = runtime.register_agent("planner".to_string()).await;
@@ -3929,6 +4577,22 @@ mod tests {
         )
         .await;
         assert!(frame.is_err(), "unexpected daemon frame: {frame:?}");
+    }
+
+    fn pty_capture_script() -> &'static str {
+        r#"my $out = shift; open my $fh, ">", $out or die $!; select((select($fh), $| = 1)[0]); while (defined(my $line = <STDIN>)) { print {$fh} $line; last if $line =~ /AGENTMUX_RESULT JSON/; }"#
+    }
+
+    async fn wait_for_file_contains(path: &Path, needle: &str) -> Option<String> {
+        for _ in 0..100 {
+            if let Ok(output) = std::fs::read_to_string(path)
+                && output.contains(needle)
+            {
+                return Some(output);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        None
     }
 
     async fn terminate_agent_process(runtime: &DaemonRuntime, agent_id: &str) {

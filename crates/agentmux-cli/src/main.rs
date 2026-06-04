@@ -210,6 +210,24 @@ struct MessageArgs {
 enum MessageAction {
     /// List messages.
     List,
+    /// Show message history as a human-readable table.
+    History {
+        /// Maximum number of messages to print.
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        /// Filter by task ID.
+        #[arg(long)]
+        task: Option<String>,
+        /// Filter by source or target agent/session/role label.
+        #[arg(long)]
+        agent: Option<String>,
+        /// Filter by message kind, e.g. handoff or test_result.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Filter by delivery status, e.g. queued or delivered.
+        #[arg(long)]
+        status: Option<String>,
+    },
     /// Show a message by ID.
     Show { message_id: String },
     /// Send a new message.
@@ -461,6 +479,25 @@ async fn main() -> Result<()> {
             MessageAction::List => {
                 let response = send_daemon_request(&socket_path, message_list_request()).await?;
                 print_response("message", response)?;
+            }
+            MessageAction::History {
+                limit,
+                task,
+                agent,
+                kind,
+                status,
+            } => {
+                let response = send_daemon_request(&socket_path, message_list_request()).await?;
+                print_message_history_response(
+                    response,
+                    &MessageHistoryFilter {
+                        limit,
+                        task,
+                        agent,
+                        kind,
+                        status,
+                    },
+                )?;
             }
             MessageAction::Show { message_id } => {
                 let response =
@@ -1624,6 +1661,28 @@ fn print_sessions_response(response: DaemonResponse) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Default)]
+struct MessageHistoryFilter {
+    limit: usize,
+    task: Option<String>,
+    agent: Option<String>,
+    kind: Option<String>,
+    status: Option<String>,
+}
+
+fn print_message_history_response(
+    response: DaemonResponse,
+    filter: &MessageHistoryFilter,
+) -> Result<()> {
+    if !response.ok {
+        return Err(response_error("message history", response));
+    }
+
+    let payload = response.payload.unwrap_or_else(|| json!({}));
+    print!("{}", format_message_history_payload(&payload, filter));
+    Ok(())
+}
+
 fn format_sessions_payload(payload: &Value) -> String {
     let sessions = payload
         .get("agents")
@@ -1662,6 +1721,127 @@ fn format_sessions_payload(payload: &Value) -> String {
         output.push_str(&format!("{id} {name} {pid} {clients}\n"));
     }
     output
+}
+
+fn format_message_history_payload(payload: &Value, filter: &MessageHistoryFilter) -> String {
+    let mut messages = payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| message_matches_history_filter(message, filter))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    messages.sort_by(|left, right| {
+        message_string_field(right, "created_at").cmp(&message_string_field(left, "created_at"))
+    });
+
+    let limit = filter.limit.max(1);
+    if messages.is_empty() {
+        return "no messages\n".to_string();
+    }
+
+    let mut output = String::from(
+        "CREATED              STATUS               KIND                 FROM                 TO                   ID                   BODY\n",
+    );
+    for message in messages.into_iter().take(limit) {
+        let created = compact_timestamp(&message_string_field(message, "created_at"));
+        let status = message_string_field(message, "delivery_status");
+        let kind = message_string_field(message, "kind");
+        let from = message_endpoint_label(message.get("from"));
+        let to = message_endpoint_label(message.get("to"));
+        let id = message_string_field(message, "message_id");
+        let body = truncate_for_table(&message_string_field(message, "body"), 72);
+        output.push_str(&format!(
+            "{:<20} {:<20} {:<20} {:<20} {:<20} {:<20} {}\n",
+            truncate_for_table(&created, 20),
+            truncate_for_table(&status, 20),
+            truncate_for_table(&kind, 20),
+            truncate_for_table(&from, 20),
+            truncate_for_table(&to, 20),
+            truncate_for_table(&id, 20),
+            body,
+        ));
+    }
+    output
+}
+
+fn message_matches_history_filter(message: &Value, filter: &MessageHistoryFilter) -> bool {
+    if let Some(task) = filter.task.as_deref() {
+        if message_string_field(message, "task_id") != task {
+            return false;
+        }
+    }
+
+    if let Some(kind) = filter.kind.as_deref() {
+        if !message_string_field(message, "kind").eq_ignore_ascii_case(kind) {
+            return false;
+        }
+    }
+
+    if let Some(status) = filter.status.as_deref() {
+        if !message_string_field(message, "delivery_status").eq_ignore_ascii_case(status) {
+            return false;
+        }
+    }
+
+    if let Some(agent) = filter.agent.as_deref() {
+        let from = message_endpoint_label(message.get("from"));
+        let to = message_endpoint_label(message.get("to"));
+        if from != agent && to != agent && !from.ends_with(agent) && !to.ends_with(agent) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn message_string_field(message: &Value, field: &str) -> String {
+    message
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn message_endpoint_label(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "-".to_string();
+    };
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let id = value.get("id").and_then(Value::as_str).unwrap_or("-");
+    if id == "-" {
+        kind.to_string()
+    } else {
+        format!("{kind}:{id}")
+    }
+}
+
+fn compact_timestamp(value: &str) -> String {
+    value
+        .strip_suffix("+00:00")
+        .unwrap_or(value)
+        .replace('T', " ")
+}
+
+fn truncate_for_table(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 #[cfg(test)]
@@ -1955,6 +2135,103 @@ mod tests {
         let inject = message_inject_request("msg_01HX".to_string());
         assert_eq!(inject.command, IpcCommand::MessageInject);
         assert_eq!(inject.payload["message_id"], "msg_01HX");
+    }
+
+    #[test]
+    fn format_message_history_payload_lists_messages_newest_first() {
+        let payload = json!({
+            "messages": [
+                {
+                    "message_id": "msg_old",
+                    "task_id": "task_a",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "role", "id": "tester" },
+                    "kind": "handoff",
+                    "body": "older handoff",
+                    "delivery_status": "queued",
+                    "created_at": "2026-06-04T01:00:00+00:00"
+                },
+                {
+                    "message_id": "msg_new",
+                    "task_id": "task_a",
+                    "from": { "kind": "orchestrator" },
+                    "to": { "kind": "agent", "id": "impl-codex" },
+                    "kind": "test_result",
+                    "body": "newer test result",
+                    "delivery_status": "delivered",
+                    "created_at": "2026-06-04T02:00:00+00:00"
+                }
+            ]
+        });
+
+        let output = format_message_history_payload(
+            &payload,
+            &MessageHistoryFilter {
+                limit: 50,
+                ..MessageHistoryFilter::default()
+            },
+        );
+
+        assert!(output.starts_with("CREATED"));
+        assert!(output.contains("msg_new"));
+        assert!(output.contains("agent:impl-codex"));
+        assert!(output.find("msg_new").unwrap() < output.find("msg_old").unwrap());
+    }
+
+    #[test]
+    fn format_message_history_payload_filters_and_limits_messages() {
+        let payload = json!({
+            "messages": [
+                {
+                    "message_id": "msg_a",
+                    "task_id": "task_a",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "agent", "id": "impl-codex" },
+                    "kind": "handoff",
+                    "body": "first",
+                    "delivery_status": "queued",
+                    "created_at": "2026-06-04T01:00:00+00:00"
+                },
+                {
+                    "message_id": "msg_b",
+                    "task_id": "task_b",
+                    "from": { "kind": "agent", "id": "tester" },
+                    "to": { "kind": "agent", "id": "reviewer" },
+                    "kind": "test_result",
+                    "body": "second",
+                    "delivery_status": "delivered",
+                    "created_at": "2026-06-04T02:00:00+00:00"
+                }
+            ]
+        });
+
+        let output = format_message_history_payload(
+            &payload,
+            &MessageHistoryFilter {
+                limit: 1,
+                task: None,
+                agent: Some("impl-codex".to_string()),
+                kind: Some("handoff".to_string()),
+                status: Some("queued".to_string()),
+            },
+        );
+
+        assert!(output.contains("msg_a"));
+        assert!(!output.contains("msg_b"));
+    }
+
+    #[test]
+    fn format_message_history_payload_reports_empty_history() {
+        assert_eq!(
+            format_message_history_payload(
+                &json!({ "messages": [] }),
+                &MessageHistoryFilter {
+                    limit: 50,
+                    ..MessageHistoryFilter::default()
+                },
+            ),
+            "no messages\n"
+        );
     }
 
     #[test]

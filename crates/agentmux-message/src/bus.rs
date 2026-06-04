@@ -240,6 +240,16 @@ impl MessageBus {
         }))
     }
 
+    pub fn next_inject_when_idle_message(
+        &self,
+        agent_id: &AgentSessionId,
+    ) -> Result<Option<&AgentMessage>> {
+        let Some(message_id) = self.next_inject_when_idle_message_id(agent_id)? else {
+            return Ok(None);
+        };
+        Ok(self.messages.get(&message_id))
+    }
+
     pub fn mark_message_injected(&mut self, id: &MessageId, now: DateTimeUtc) -> Result<()> {
         self.update_delivery_status(id, DeliveryStatus::Delivered, now)
     }

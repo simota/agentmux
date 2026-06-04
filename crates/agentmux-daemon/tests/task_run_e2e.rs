@@ -88,9 +88,22 @@ async fn task_run_shell_stub_handoffs_planner_to_implementer_tester_and_reviewer
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["type"], "task.completed");
-    assert_eq!(events[0]["payload"]["status"], "completed");
+    assert_eq!(events.len(), 5);
+    let message_events = events
+        .iter()
+        .filter(|event| event["type"] == "message.created")
+        .collect::<Vec<_>>();
+    assert_eq!(message_events.len(), 4);
+    assert!(
+        message_events
+            .iter()
+            .all(|event| event["payload"]["delivery_mode"] == "\"inject_when_idle\"")
+    );
+    let task_completed = events
+        .iter()
+        .find(|event| event["type"] == "task.completed")
+        .expect("task completion event is written");
+    assert_eq!(task_completed["payload"]["status"], "completed");
 
     server.abort();
     std::fs::remove_dir_all(root).expect("temporary project root is removed");
