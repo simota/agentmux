@@ -66,6 +66,10 @@ AGENTMUX_RESULT:
 
 Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
 
+When an agentmux bus message is injected into your session, always reply through `messages[]` in the next `AGENTMUX_RESULT`. Reply to the sender with `agent:<sender-session-name>` when available, or use the requested `reply_to` / target context if the injected prompt provides one. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
+
+Avoid unbounded agent-to-agent loops. If the same pair of agents has exchanged messages for 3 or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user.
+
 Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind prevents the result messages from being stored.
 
 Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
@@ -3820,6 +3824,8 @@ mod tests {
         assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
         assert!(contents.contains("AGENTMUX_RESULT:"));
         assert!(contents.contains("messages[]"));
+        assert!(contents.contains("always reply through `messages[]`"));
+        assert!(contents.contains("3 or more back-and-forth turns"));
         assert!(contents.contains("Allowed `messages[].kind` values"));
         assert!(contents.contains("AGENTMUX_AGENT_NAME"));
         assert!(contents.contains("agentmux message inject <message_id>"));
