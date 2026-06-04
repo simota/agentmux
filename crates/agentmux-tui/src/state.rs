@@ -86,6 +86,7 @@ pub struct TuiSessionState {
     last_event: Option<IpcEventKind>,
     keybinding_help_visible: bool,
     session_list_visible: bool,
+    session_list_selected: usize,
 }
 
 impl Default for TuiSessionState {
@@ -103,6 +104,7 @@ impl TuiSessionState {
             last_event: None,
             keybinding_help_visible: false,
             session_list_visible: false,
+            session_list_selected: 0,
         }
     }
 
@@ -144,6 +146,10 @@ impl TuiSessionState {
 
     pub fn session_list_visible(&self) -> bool {
         self.session_list_visible
+    }
+
+    pub fn session_list_selected_index(&self) -> usize {
+        self.session_list_selected
     }
 
     pub fn focus_next(&mut self) {
@@ -199,12 +205,84 @@ impl TuiSessionState {
                 self.session_list_visible = !self.session_list_visible;
                 if self.session_list_visible {
                     self.keybinding_help_visible = false;
+                    self.select_focused_running_session();
                 }
+                CommandEffect::Continue
+            }
+            TuiCommand::SessionListNext => {
+                self.move_session_list_selection(1);
+                CommandEffect::Continue
+            }
+            TuiCommand::SessionListPrevious => {
+                self.move_session_list_selection(-1);
+                CommandEffect::Continue
+            }
+            TuiCommand::FocusSelectedSession => {
+                self.focus_selected_session();
+                CommandEffect::Continue
+            }
+            TuiCommand::CloseOverlay => {
+                self.keybinding_help_visible = false;
+                self.session_list_visible = false;
                 CommandEffect::Continue
             }
             TuiCommand::Detach => CommandEffect::Detach,
             TuiCommand::Quit => CommandEffect::Quit,
             _ => CommandEffect::Unhandled(command),
+        }
+    }
+
+    fn select_focused_running_session(&mut self) {
+        let Some(focused) = self.layout.focused() else {
+            self.session_list_selected = 0;
+            return;
+        };
+        self.session_list_selected = self
+            .running_session_ids()
+            .iter()
+            .position(|agent_id| agent_id == focused)
+            .unwrap_or(0);
+        self.clamp_session_list_selection();
+    }
+
+    fn move_session_list_selection(&mut self, delta: isize) {
+        let count = self.running_session_ids().len();
+        if count == 0 {
+            self.session_list_selected = 0;
+            return;
+        }
+
+        let count = isize::try_from(count).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.session_list_selected).unwrap_or(0);
+        self.session_list_selected = (current + delta).rem_euclid(count) as usize;
+    }
+
+    fn focus_selected_session(&mut self) {
+        let Some(agent_id) = self
+            .running_session_ids()
+            .get(self.session_list_selected)
+            .cloned()
+        else {
+            self.session_list_visible = false;
+            return;
+        };
+        self.layout.focus(&agent_id);
+        self.session_list_visible = false;
+    }
+
+    fn running_session_ids(&self) -> Vec<String> {
+        self.panes()
+            .filter(|pane| pane.process_id().is_some())
+            .map(|pane| pane.agent_id().to_string())
+            .collect()
+    }
+
+    fn clamp_session_list_selection(&mut self) {
+        let count = self.running_session_ids().len();
+        if count == 0 {
+            self.session_list_selected = 0;
+        } else if self.session_list_selected >= count {
+            self.session_list_selected = count - 1;
         }
     }
 
@@ -251,6 +329,7 @@ impl TuiSessionState {
             applied += 1;
         }
 
+        self.clamp_session_list_selection();
         applied
     }
 
@@ -422,6 +501,7 @@ impl TuiSessionState {
             return StateChange::Ignored;
         }
         self.layout.remove_pane(&agent_id);
+        self.clamp_session_list_selection();
         StateChange::RemovedPane(agent_id)
     }
 }
@@ -783,6 +863,77 @@ mod tests {
             state.apply_command(TuiCommand::ShowSessionList),
             CommandEffect::Continue
         );
+        assert!(!state.session_list_visible());
+    }
+
+    #[test]
+    fn session_list_selection_focuses_selected_running_session() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {
+                    "id": "agent_a",
+                    "name": "a",
+                    "process_id": 100
+                },
+                {
+                    "id": "agent_b",
+                    "name": "b",
+                    "process_id": 200
+                },
+                {
+                    "id": "agent_restored",
+                    "name": "restored",
+                    "process_id": null
+                }
+            ]
+        }));
+        state.layout_mut().focus("agent_a");
+
+        assert_eq!(
+            state.apply_command(TuiCommand::ShowSessionList),
+            CommandEffect::Continue
+        );
+        assert!(state.session_list_visible());
+        assert_eq!(state.session_list_selected_index(), 0);
+
+        assert_eq!(
+            state.apply_command(TuiCommand::SessionListNext),
+            CommandEffect::Continue
+        );
+        assert_eq!(state.session_list_selected_index(), 1);
+        assert_eq!(
+            state.apply_command(TuiCommand::FocusSelectedSession),
+            CommandEffect::Continue
+        );
+
+        assert_eq!(state.layout().focused(), Some("agent_b"));
+        assert!(!state.session_list_visible());
+    }
+
+    #[test]
+    fn session_list_selection_wraps_and_closes() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {
+                    "id": "agent_a",
+                    "name": "a",
+                    "process_id": 100
+                },
+                {
+                    "id": "agent_b",
+                    "name": "b",
+                    "process_id": 200
+                }
+            ]
+        }));
+
+        state.apply_command(TuiCommand::ShowSessionList);
+        state.apply_command(TuiCommand::SessionListPrevious);
+        assert_eq!(state.session_list_selected_index(), 1);
+
+        state.apply_command(TuiCommand::CloseOverlay);
         assert!(!state.session_list_visible());
     }
 

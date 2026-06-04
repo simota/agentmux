@@ -141,16 +141,34 @@ fn render_session_list(area: Rect, state: &TuiSessionState, buffer: &mut Buffer)
         return;
     }
 
-    let mut lines = vec!["ID NAME PID".to_string()];
-    for pane in state.panes().filter(|pane| pane.process_id().is_some()) {
+    let mut lines = vec![
+        "Use Up/Down or j/k, Enter to focus, Esc to close".to_string(),
+        "".to_string(),
+        "  ID NAME PID".to_string(),
+    ];
+    for (index, pane) in state
+        .panes()
+        .filter(|pane| pane.process_id().is_some())
+        .enumerate()
+    {
         let pid = pane
             .process_id()
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "-".to_string());
-        lines.push(format!("{} {} {}", pane.agent_id(), pane.name(), pid));
+        let marker = if index == state.session_list_selected_index() {
+            ">"
+        } else {
+            " "
+        };
+        lines.push(format!(
+            "{marker} {} {} {}",
+            pane.agent_id(),
+            pane.name(),
+            pid
+        ));
     }
 
-    if lines.len() == 1 {
+    if lines.len() == 3 {
         lines.push("no running sessions".to_string());
     }
 
@@ -380,6 +398,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Running Sessions"));
+        assert!(rendered.contains("Enter to focus"));
+        assert!(rendered.contains("> agent_live"));
         assert!(rendered.contains("agent_live"));
         assert!(rendered.contains("shell"));
         assert!(rendered.contains("1234"));

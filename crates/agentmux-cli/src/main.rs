@@ -1416,7 +1416,7 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
             .poll_event(Duration::from_millis(16))
             .map_err(|error| AgentmuxError::TerminalError(format!("failed to read key: {error}")))?
         {
-            let dispatch = keymap.dispatch(key);
+            let dispatch = keymap.dispatch_with_session_list(key, state.session_list_visible());
             if let Some(command) = match &dispatch {
                 agentmux_tui::keymap::KeyDispatch::Command(command) => Some(*command),
                 _ => None,

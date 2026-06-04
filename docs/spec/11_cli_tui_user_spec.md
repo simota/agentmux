@@ -156,6 +156,14 @@ Ctrl-g T        run tests for current worktree
 Ctrl-g I        interrupt current agent
 ```
 
+Running session list操作:
+
+```text
+Up/Down, j/k    move selection
+Enter           focus selected session
+Esc, q          close list
+```
+
 ## 7. Command palette
 
 ```text

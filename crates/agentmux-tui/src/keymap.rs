@@ -38,6 +38,10 @@ pub enum TuiCommand {
     RunTests,
     InterruptAgent,
     CommandPalette,
+    SessionListNext,
+    SessionListPrevious,
+    FocusSelectedSession,
+    CloseOverlay,
 }
 
 /// Result of routing one terminal key event.
@@ -79,6 +83,14 @@ impl KeymapDispatcher {
     }
 
     pub fn dispatch(&mut self, key: KeyEvent) -> KeyDispatch {
+        self.dispatch_with_session_list(key, false)
+    }
+
+    pub fn dispatch_with_session_list(
+        &mut self,
+        key: KeyEvent,
+        session_list_visible: bool,
+    ) -> KeyDispatch {
         if matches!(key.kind, KeyEventKind::Release) {
             return KeyDispatch::Consumed;
         }
@@ -91,6 +103,12 @@ impl KeymapDispatcher {
         if self.awaiting_prefix_command {
             self.awaiting_prefix_command = false;
             return prefix_command(key)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        if session_list_visible {
+            return session_list_command(key)
                 .map(KeyDispatch::Command)
                 .unwrap_or(KeyDispatch::Consumed);
         }
@@ -118,6 +136,23 @@ impl KeyBinding {
 
     fn matches(self, key: KeyEvent) -> bool {
         key.code == self.code && key.modifiers == self.modifiers
+    }
+}
+
+fn session_list_command(key: KeyEvent) -> Option<TuiCommand> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some(TuiCommand::SessionListNext),
+        KeyCode::Up | KeyCode::Char('k') => Some(TuiCommand::SessionListPrevious),
+        KeyCode::Enter => Some(TuiCommand::FocusSelectedSession),
+        KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
+        _ => None,
     }
 }
 
@@ -263,6 +298,38 @@ mod tests {
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('q'), KeyModifiers::NONE));
 
         assert_eq!(dispatch, KeyDispatch::ForwardToFocusedPane(b"q".to_vec()));
+    }
+
+    #[test]
+    fn session_list_keys_map_to_selection_commands_when_visible() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Down, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::SessionListNext)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Up, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::SessionListPrevious)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Enter, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::FocusSelectedSession)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_session_list(key(KeyCode::Esc, KeyModifiers::NONE), true),
+            KeyDispatch::Command(TuiCommand::CloseOverlay)
+        );
+    }
+
+    #[test]
+    fn session_list_consumes_regular_keys_when_visible() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        let dispatch = dispatcher
+            .dispatch_with_session_list(key(KeyCode::Char('a'), KeyModifiers::NONE), true);
+
+        assert_eq!(dispatch, KeyDispatch::Consumed);
     }
 
     #[test]
