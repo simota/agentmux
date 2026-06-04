@@ -14,23 +14,26 @@ async fn main() -> Result<()> {
     println!("agentmux-daemon v{} starting", env!("CARGO_PKG_VERSION"));
     println!("Socket path: {}", socket_path.display());
 
-    // Write a pidfile next to the socket so `agentmux daemon stop` can find us.
-    if let Some(parent) = socket_path.parent() {
+    let pid_path = write_pidfile(&socket_path);
+    let result = serve(DaemonConfig::new(socket_path), DaemonRuntime::new(1024)).await;
+    remove_pidfile(&pid_path);
+
+    result
+}
+
+fn write_pidfile(socket_path: &std::path::Path) -> Option<PathBuf> {
+    let pid_path = socket_path.parent()?.join("agentmux.pid");
+    if let Some(parent) = pid_path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    let pid_path = socket_path
-        .parent()
-        .map(|parent| parent.join("agentmux.pid"));
-    if let Some(pid_path) = &pid_path {
-        let _ = std::fs::write(pid_path, std::process::id().to_string());
-    }
+    let _ = std::fs::write(&pid_path, std::process::id().to_string());
+    Some(pid_path)
+}
 
-    let result = serve(DaemonConfig::new(socket_path), DaemonRuntime::new(1024)).await;
-
-    if let Some(pid_path) = &pid_path {
+fn remove_pidfile(pid_path: &Option<PathBuf>) {
+    if let Some(pid_path) = pid_path {
         let _ = std::fs::remove_file(pid_path);
     }
-    result
 }
 
 fn default_socket_path() -> PathBuf {
