@@ -8,6 +8,8 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
+#[cfg(feature = "activity-feed")]
+use crate::state::ACTIVITY_FEED_PANE_ID;
 use crate::state::{CopySelection, MessageListItem, TuiSessionState};
 
 /// Border/status metadata for an agent pane.
@@ -216,6 +218,12 @@ impl TuiSessionRenderer {
                 continue;
             }
 
+            #[cfg(feature = "activity-feed")]
+            if state.is_activity_feed_pane(&pane_id) {
+                render_activity_feed(rect, state, buffer);
+                continue;
+            }
+
             let Some(pane) = state.pane(&pane_id) else {
                 continue;
             };
@@ -249,7 +257,25 @@ impl TuiSessionRenderer {
         if state.message_bus_visible() {
             render_message_bus(area, state, buffer);
         }
+
+        if let Some(notice) = state.runtime_notice() {
+            render_runtime_notice(area, notice, buffer);
+        }
     }
+}
+
+fn render_runtime_notice(area: Rect, notice: &str, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    write_line(
+        buffer,
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        area.width,
+        &truncate_to_width(notice, area.width),
+        Style::default().fg(Color::Yellow).bg(Color::Black),
+    );
 }
 
 fn history_cell(grid: &ScreenGrid, history_row: usize, col: u16) -> Option<&Cell> {
@@ -383,6 +409,109 @@ fn render_message_bus(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) 
     render_message_list_panel(popup, state, "Message Bus", false, buffer);
 }
 
+#[cfg(feature = "activity-feed")]
+pub fn render_activity_feed(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let focused = state.layout().focused() == Some(ACTIVITY_FEED_PANE_ID);
+    let border_style = if focused {
+        Style::default().fg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::Cyan)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Activity Feed")
+        .border_style(border_style);
+    let inner = block.inner(area);
+    Clear.render(area, buffer);
+    block.render(area, buffer);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let sitrep_rows = state
+        .sitrep()
+        .len()
+        .min(usize::from(inner.height.saturating_sub(1)));
+    for (index, entry) in state.sitrep().iter().take(sitrep_rows).enumerate() {
+        let Ok(row) = u16::try_from(index) else {
+            break;
+        };
+        let marker = if entry.needs_attention { "!" } else { " " };
+        let line = truncate_to_width(
+            &format!(
+                "{marker} {} {} {}",
+                entry.agent_id, entry.name, entry.status
+            ),
+            inner.width,
+        );
+        write_line(
+            buffer,
+            inner.x,
+            inner.y + row,
+            inner.width,
+            &line,
+            if entry.needs_attention {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        );
+    }
+
+    let feed_start_row = u16::try_from(sitrep_rows)
+        .unwrap_or(u16::MAX)
+        .saturating_add(if sitrep_rows > 0 { 1 } else { 0 });
+    if feed_start_row >= inner.height {
+        return;
+    }
+
+    let visible_rows = usize::from(inner.height - feed_start_row);
+    let start = state.activity_feed_window_start(visible_rows);
+    for (row, (index, entry)) in state
+        .feed_entries()
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible_rows)
+        .enumerate()
+    {
+        let Ok(row) = u16::try_from(row) else {
+            break;
+        };
+        let marker = if index == state.activity_feed_selected_index() {
+            ">"
+        } else {
+            " "
+        };
+        let line = truncate_to_width(
+            &format!(
+                "{marker} [{}] {}  {}  {}",
+                feed_time(&entry.ts),
+                entry.actor,
+                entry.action,
+                entry.target
+            ),
+            inner.width,
+        );
+        write_line(
+            buffer,
+            inner.x,
+            inner.y + feed_start_row + row,
+            inner.width,
+            &line,
+            if index == state.activity_feed_selected_index() {
+                Style::default().fg(Color::Black).bg(Color::White)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        );
+    }
+}
+
 fn render_message_list_panel(
     area: Rect,
     state: &TuiSessionState,
@@ -419,6 +548,36 @@ fn render_message_list_panel(
         .alignment(Alignment::Left)
         .style(Style::default().fg(Color::White).bg(Color::Black));
     paragraph.render(area, buffer);
+}
+
+#[cfg(feature = "activity-feed")]
+fn feed_time(ts: &str) -> String {
+    if ts.len() >= 19 && ts.as_bytes().get(10) == Some(&b'T') {
+        return ts[11..19].to_string();
+    }
+    ts.to_string()
+}
+
+fn truncate_to_width(line: &str, width: u16) -> String {
+    line.chars().take(usize::from(width)).collect()
+}
+
+fn write_line(buffer: &mut Buffer, x: u16, y: u16, width: u16, line: &str, style: Style) {
+    for col in 0..width {
+        if let Some(cell) = buffer.cell_mut((x + col, y)) {
+            cell.set_char(' ');
+            cell.set_style(style);
+        }
+    }
+    for (col, ch) in line.chars().take(usize::from(width)).enumerate() {
+        let Ok(col) = u16::try_from(col) else {
+            break;
+        };
+        if let Some(cell) = buffer.cell_mut((x + col, y)) {
+            cell.set_char(ch);
+            cell.set_style(style);
+        }
+    }
 }
 
 fn message_list_title(title: &'static str, details_visible: bool) -> String {
@@ -866,6 +1025,75 @@ mod tests {
         assert!(rendered.contains("compact"));
         assert!(rendered.contains("msg_002"));
         assert!(rendered.contains("review this"));
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn render_activity_feed_with_empty_state_does_not_panic() {
+        let state = TuiSessionState::default();
+        let area = Rect::new(0, 0, 50, 10);
+        let mut buffer = Buffer::empty(area);
+
+        render_activity_feed(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Activity Feed"));
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn render_activity_feed_keeps_selected_row_in_visible_window() {
+        let mut state = TuiSessionState::default();
+        for index in 0..8 {
+            state.apply_event(&agentmux_ipc::DaemonEvent::new(
+                agentmux_ipc::IpcEventKind::TaskCreated,
+                json!({ "task_id": format!("task_{index:03}") }),
+            ));
+        }
+        for _ in 0..5 {
+            state.apply_command(crate::keymap::TuiCommand::ActivityFeedPrevious);
+        }
+        let area = Rect::new(0, 0, 80, 7);
+        let mut buffer = Buffer::empty(area);
+
+        render_activity_feed(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("> [-] task_002  created  task_002"));
+        assert!(!rendered.contains("task_007"));
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn render_session_draws_activity_feed_pane() {
+        let mut state = TuiSessionState::default();
+        state.open_activity_feed_pane();
+        state.apply_event(&agentmux_ipc::DaemonEvent::new(
+            agentmux_ipc::IpcEventKind::AgentStatusChanged,
+            json!({ "agent_id": "agent_001", "status": "awaiting_input" }),
+        ));
+
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Activity Feed"));
+        assert!(rendered.contains("agent_001"));
+        assert!(rendered.contains("awaiting_input"));
     }
 
     #[test]

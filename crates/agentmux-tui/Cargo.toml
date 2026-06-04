@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 description = "Ratatui layout, pane rendering, keymap, and overlays for the agentmux TUI client"
 
+[features]
+activity-feed = []
+
 [dependencies]
 agentmux-agent = { workspace = true }
 agentmux-core = { workspace = true }

@@ -4,6 +4,8 @@
 //! can apply daemon events here, then ask `layout`/`render` to draw the result.
 
 use std::collections::BTreeMap;
+#[cfg(feature = "activity-feed")]
+use std::collections::VecDeque;
 
 use agentmux_ipc::protocol::{DaemonEvent, IpcEventKind};
 use agentmux_terminal::{CellStyle, ScreenGrid, TerminalParser};
@@ -14,6 +16,10 @@ use crate::keymap::{FocusDirection, TuiCommand};
 use crate::layout::{PaneLayout, SplitDirection};
 
 pub const CONVERSATION_LIST_PANE_ID: &str = "__agentmux_conversation_list__";
+#[cfg(feature = "activity-feed")]
+pub const ACTIVITY_FEED_PANE_ID: &str = "__agentmux_activity_feed__";
+#[cfg(feature = "activity-feed")]
+const MAX_FEED_ENTRIES: usize = 500;
 
 /// Stable pane state derived from daemon agent/session events.
 pub struct AgentPaneState {
@@ -96,6 +102,104 @@ impl Default for TerminalSize {
     }
 }
 
+#[cfg(feature = "activity-feed")]
+#[derive(Clone, Debug, Eq, PartialEq, Default)]
+pub struct EventFeedFilter {
+    pub task_id: Option<String>,
+    pub roles: Vec<String>,
+    pub kinds: Vec<String>,
+}
+
+#[cfg(feature = "activity-feed")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeedEntry {
+    pub ts: String,
+    pub actor: String,
+    pub action: String,
+    pub target: String,
+    pub kind: String,
+    pub focus_agent_id: Option<String>,
+}
+
+#[cfg(feature = "activity-feed")]
+impl FeedEntry {
+    pub fn from_event(event: &DaemonEvent) -> Option<Self> {
+        match event.kind {
+            IpcEventKind::PtyOutputChunk | IpcEventKind::ScreenDiff => None,
+            IpcEventKind::AgentStatusChanged => {
+                let agent_id = string_field(&event.payload, "agent_id")?;
+                let status = string_field(&event.payload, "status")
+                    .or_else(|| string_field(&event.payload, "new_status"))?;
+                Some(Self::new(
+                    event,
+                    agent_id.clone(),
+                    format!("status {status}"),
+                    agent_id.clone(),
+                    Some(agent_id),
+                ))
+            }
+            IpcEventKind::MessageCreated | IpcEventKind::MessageDelivered => {
+                let message_id = string_field(&event.payload, "message_id")?;
+                let status = string_field(&event.payload, "delivery_status")
+                    .unwrap_or_else(|| "created".to_string());
+                let to = endpoint_label(event.payload.get("to"));
+                Some(Self::new(
+                    event,
+                    endpoint_label(event.payload.get("from")),
+                    format!("message {status}"),
+                    to,
+                    target_agent_id(event.payload.get("to")).or(Some(message_id)),
+                ))
+            }
+            IpcEventKind::ApprovalCreated => {
+                let approval_id = string_field(&event.payload, "approval_id")?;
+                Some(Self::new(
+                    event,
+                    "policy".to_string(),
+                    "approval requested".to_string(),
+                    approval_id,
+                    None,
+                ))
+            }
+            _ => Some(Self::new(
+                event,
+                event_actor(&event.payload),
+                event_action(&event.kind),
+                event_target(&event.payload),
+                string_field(&event.payload, "agent_id"),
+            )),
+        }
+    }
+
+    fn new(
+        event: &DaemonEvent,
+        actor: String,
+        action: String,
+        target: String,
+        focus_agent_id: Option<String>,
+    ) -> Self {
+        Self {
+            ts: string_field(&event.payload, "created_at")
+                .or_else(|| string_field(&event.payload, "ts"))
+                .unwrap_or_else(|| "-".to_string()),
+            actor,
+            action,
+            target,
+            kind: event_kind_label(&event.kind).to_string(),
+            focus_agent_id,
+        }
+    }
+}
+
+#[cfg(feature = "activity-feed")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SitrepEntry {
+    pub agent_id: String,
+    pub name: String,
+    pub status: String,
+    pub needs_attention: bool,
+}
+
 /// Pure state for one attached TUI client.
 pub struct TuiSessionState {
     panes: BTreeMap<String, AgentPaneState>,
@@ -111,6 +215,20 @@ pub struct TuiSessionState {
     provider_picker_visible: bool,
     provider_picker_selected: usize,
     copy_selection: Option<CopySelection>,
+    #[cfg(feature = "activity-feed")]
+    activity_feed_visible: bool,
+    #[cfg(feature = "activity-feed")]
+    feed_entries: VecDeque<FeedEntry>,
+    #[cfg(feature = "activity-feed")]
+    sitrep: Vec<SitrepEntry>,
+    #[cfg(feature = "activity-feed")]
+    feed_scroll: usize,
+    #[cfg(feature = "activity-feed")]
+    activity_feed_selected: usize,
+    #[cfg(feature = "activity-feed")]
+    feed_filter: EventFeedFilter,
+    daemon_protocol_version: Option<u32>,
+    runtime_notice: Option<String>,
 }
 
 impl Default for TuiSessionState {
@@ -135,6 +253,20 @@ impl TuiSessionState {
             provider_picker_visible: false,
             provider_picker_selected: 0,
             copy_selection: None,
+            #[cfg(feature = "activity-feed")]
+            activity_feed_visible: false,
+            #[cfg(feature = "activity-feed")]
+            feed_entries: VecDeque::new(),
+            #[cfg(feature = "activity-feed")]
+            sitrep: Vec::new(),
+            #[cfg(feature = "activity-feed")]
+            feed_scroll: 0,
+            #[cfg(feature = "activity-feed")]
+            activity_feed_selected: 0,
+            #[cfg(feature = "activity-feed")]
+            feed_filter: EventFeedFilter::default(),
+            daemon_protocol_version: None,
+            runtime_notice: None,
         }
     }
 
@@ -157,6 +289,16 @@ impl TuiSessionState {
 
     pub fn is_conversation_list_pane(&self, pane_id: &str) -> bool {
         pane_id == CONVERSATION_LIST_PANE_ID
+            && self
+                .layout
+                .panes()
+                .iter()
+                .any(|existing| existing == pane_id)
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn is_activity_feed_pane(&self, pane_id: &str) -> bool {
+        pane_id == ACTIVITY_FEED_PANE_ID
             && self
                 .layout
                 .panes()
@@ -256,6 +398,51 @@ impl TuiSessionState {
         self.copy_selection.as_ref()
     }
 
+    #[cfg(feature = "activity-feed")]
+    pub fn feed_entries(&self) -> &VecDeque<FeedEntry> {
+        &self.feed_entries
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn sitrep(&self) -> &[SitrepEntry] {
+        &self.sitrep
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn activity_feed_selected_index(&self) -> usize {
+        self.activity_feed_selected
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn feed_scroll(&self) -> usize {
+        self.feed_scroll
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn feed_filter(&self) -> &EventFeedFilter {
+        &self.feed_filter
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn activity_feed_window_start(&self, visible_rows: usize) -> usize {
+        let total = self.feed_entries.len();
+        total
+            .saturating_sub(visible_rows)
+            .saturating_sub(self.feed_scroll.min(total.saturating_sub(visible_rows)))
+    }
+
+    pub fn daemon_protocol_version(&self) -> Option<u32> {
+        self.daemon_protocol_version
+    }
+
+    pub fn runtime_notice(&self) -> Option<&str> {
+        self.runtime_notice.as_deref()
+    }
+
+    pub fn set_runtime_notice(&mut self, notice: impl Into<String>) {
+        self.runtime_notice = Some(notice.into());
+    }
+
     pub fn set_copy_selection(&mut self, selection: CopySelection) {
         self.copy_selection = Some(selection);
     }
@@ -331,6 +518,11 @@ impl TuiSessionState {
                     self.layout.remove_pane(&focused);
                     CommandEffect::Continue
                 } else {
+                    #[cfg(feature = "activity-feed")]
+                    if focused == ACTIVITY_FEED_PANE_ID {
+                        self.close_activity_feed_pane();
+                        return CommandEffect::Continue;
+                    }
                     self.pane(&focused)
                         .map(|pane| CommandEffect::StopPane(pane.agent_id().to_string()))
                         .unwrap_or(CommandEffect::Continue)
@@ -346,6 +538,10 @@ impl TuiSessionState {
                     self.session_list_visible = false;
                     self.message_bus_visible = false;
                     self.provider_picker_visible = false;
+                    #[cfg(feature = "activity-feed")]
+                    {
+                        self.activity_feed_visible = false;
+                    }
                 }
                 CommandEffect::Continue
             }
@@ -355,6 +551,10 @@ impl TuiSessionState {
                     self.keybinding_help_visible = false;
                     self.message_bus_visible = false;
                     self.provider_picker_visible = false;
+                    #[cfg(feature = "activity-feed")]
+                    {
+                        self.activity_feed_visible = false;
+                    }
                     self.select_focused_running_session();
                 }
                 CommandEffect::Continue
@@ -365,11 +565,37 @@ impl TuiSessionState {
                     self.keybinding_help_visible = false;
                     self.session_list_visible = false;
                     self.provider_picker_visible = false;
+                    #[cfg(feature = "activity-feed")]
+                    {
+                        self.activity_feed_visible = false;
+                    }
                     CommandEffect::RefreshMessages
                 } else {
                     CommandEffect::Continue
                 }
             }
+            #[cfg(feature = "activity-feed")]
+            TuiCommand::ShowActivityFeed => {
+                self.toggle_activity_feed_pane();
+                CommandEffect::ToggleActivityFeedPane {
+                    visible: self.activity_feed_visible,
+                }
+            }
+            #[cfg(feature = "activity-feed")]
+            TuiCommand::ActivityFeedNext => {
+                self.move_activity_feed_selection(1);
+                CommandEffect::Continue
+            }
+            #[cfg(feature = "activity-feed")]
+            TuiCommand::ActivityFeedPrevious => {
+                self.move_activity_feed_selection(-1);
+                CommandEffect::Continue
+            }
+            #[cfg(feature = "activity-feed")]
+            TuiCommand::FocusFeedEntry => self
+                .selected_feed_agent_id()
+                .map(CommandEffect::FocusPaneById)
+                .unwrap_or(CommandEffect::Continue),
             TuiCommand::ToggleMessageDetails => {
                 if self.message_bus_visible
                     || self
@@ -398,6 +624,10 @@ impl TuiSessionState {
                 self.session_list_visible = false;
                 self.message_bus_visible = false;
                 self.provider_picker_visible = false;
+                #[cfg(feature = "activity-feed")]
+                {
+                    self.activity_feed_visible = false;
+                }
                 self.clear_copy_selection();
                 CommandEffect::Continue
             }
@@ -412,6 +642,10 @@ impl TuiSessionState {
         self.keybinding_help_visible = false;
         self.session_list_visible = false;
         self.message_bus_visible = false;
+        #[cfg(feature = "activity-feed")]
+        {
+            self.activity_feed_visible = false;
+        }
         if self.provider_picker_selected >= PROVIDER_OPTIONS.len() {
             self.provider_picker_selected = 0;
         }
@@ -424,7 +658,70 @@ impl TuiSessionState {
         self.session_list_visible = false;
         self.message_bus_visible = false;
         self.provider_picker_visible = false;
+        #[cfg(feature = "activity-feed")]
+        {
+            self.activity_feed_visible = false;
+        }
         self.clear_copy_selection();
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn open_activity_feed_pane(&mut self) {
+        self.activity_feed_visible = true;
+        self.layout.add_pane(ACTIVITY_FEED_PANE_ID.to_string());
+        self.layout.focus(ACTIVITY_FEED_PANE_ID);
+        self.keybinding_help_visible = false;
+        self.session_list_visible = false;
+        self.message_bus_visible = false;
+        self.provider_picker_visible = false;
+        self.clear_copy_selection();
+    }
+
+    #[cfg(feature = "activity-feed")]
+    pub fn close_activity_feed_pane(&mut self) {
+        self.activity_feed_visible = false;
+        self.layout.remove_pane(ACTIVITY_FEED_PANE_ID);
+    }
+
+    #[cfg(feature = "activity-feed")]
+    fn toggle_activity_feed_pane(&mut self) {
+        if self.activity_feed_visible {
+            self.close_activity_feed_pane();
+        } else {
+            self.open_activity_feed_pane();
+        }
+    }
+
+    #[cfg(feature = "activity-feed")]
+    fn move_activity_feed_selection(&mut self, delta: isize) {
+        let count = self.feed_entries.len();
+        if count == 0 {
+            self.activity_feed_selected = 0;
+            self.feed_scroll = 0;
+            return;
+        }
+        let count = isize::try_from(count).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.activity_feed_selected).unwrap_or(0);
+        self.activity_feed_selected = (current + delta).rem_euclid(count) as usize;
+        self.sync_activity_feed_scroll_to_selection();
+    }
+
+    #[cfg(feature = "activity-feed")]
+    fn sync_activity_feed_scroll_to_selection(&mut self) {
+        let Some(tail_index) = self.feed_entries.len().checked_sub(1) else {
+            self.feed_scroll = 0;
+            return;
+        };
+        self.activity_feed_selected = self.activity_feed_selected.min(tail_index);
+        self.feed_scroll = tail_index.saturating_sub(self.activity_feed_selected);
+    }
+
+    #[cfg(feature = "activity-feed")]
+    fn selected_feed_agent_id(&self) -> Option<String> {
+        self.feed_entries
+            .get(self.activity_feed_selected)
+            .and_then(|entry| entry.focus_agent_id.clone())
+            .filter(|agent_id| self.pane(agent_id).is_some())
     }
 
     fn move_provider_selection(&mut self, delta: isize) {
@@ -498,6 +795,12 @@ impl TuiSessionState {
     /// This mirrors the daemon-owned agent list without doing any IPC itself.
     /// Unknown or malformed agent entries are skipped.
     pub fn apply_daemon_status(&mut self, payload: &serde_json::Value) -> usize {
+        self.daemon_protocol_version = payload
+            .get("protocol_version")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .or(self.daemon_protocol_version);
+
         let Some(agents) = payload.get("agents").and_then(|value| value.as_array()) else {
             return 0;
         };
@@ -523,6 +826,13 @@ impl TuiSessionState {
                 pane.process_id = process_id;
                 pane.status = status;
                 pane.last_event = None;
+                #[cfg(feature = "activity-feed")]
+                {
+                    let sitrep_name = pane.name.clone();
+                    let sitrep_status = pane.status.clone();
+                    let _ = pane;
+                    self.upsert_sitrep(agent_id.clone(), sitrep_name, sitrep_status);
+                }
             } else {
                 let mut pane = AgentPaneState::new(
                     agent_id.clone(),
@@ -532,6 +842,8 @@ impl TuiSessionState {
                 );
                 pane.role = role;
                 pane.status = status;
+                #[cfg(feature = "activity-feed")]
+                self.upsert_sitrep(agent_id.clone(), pane.name.clone(), pane.status.clone());
                 pane.last_event = None;
                 self.layout.add_pane(agent_id.clone());
                 self.panes.insert(agent_id.clone(), pane);
@@ -641,6 +953,8 @@ impl TuiSessionState {
     /// Apply one daemon event. Malformed or unrelated event payloads are ignored.
     pub fn apply_event(&mut self, event: &DaemonEvent) -> StateChange {
         self.last_event = Some(event.kind.clone());
+        #[cfg(feature = "activity-feed")]
+        self.record_feed_event(event);
 
         match event.kind {
             IpcEventKind::AgentSpawned => self.apply_agent_spawned(event),
@@ -740,6 +1054,16 @@ impl TuiSessionState {
             return StateChange::Ignored;
         };
         pane.status = Some(status);
+        #[cfg(feature = "activity-feed")]
+        {
+            let sitrep_name = pane.name.clone();
+            let sitrep_status = pane.status.clone();
+            let _ = pane;
+            self.upsert_sitrep(agent_id.clone(), sitrep_name, sitrep_status);
+        }
+        let Some(pane) = self.panes.get_mut(&agent_id) else {
+            return StateChange::Ignored;
+        };
         pane.last_event = Some(event.kind.clone());
         StateChange::UpdatedPane(agent_id)
     }
@@ -775,8 +1099,67 @@ impl TuiSessionState {
             return StateChange::Ignored;
         }
         self.layout.remove_pane(&agent_id);
+        #[cfg(feature = "activity-feed")]
+        self.remove_sitrep(&agent_id);
         self.clamp_session_list_selection();
         StateChange::RemovedPane(agent_id)
+    }
+
+    #[cfg(feature = "activity-feed")]
+    fn record_feed_event(&mut self, event: &DaemonEvent) {
+        let Some(entry) = FeedEntry::from_event(event) else {
+            return;
+        };
+        let was_following_tail = self
+            .feed_entries
+            .len()
+            .checked_sub(1)
+            .is_none_or(|tail| self.activity_feed_selected == tail && self.feed_scroll == 0);
+        if self.feed_entries.len() == MAX_FEED_ENTRIES {
+            self.feed_entries.pop_front();
+            self.activity_feed_selected = self.activity_feed_selected.saturating_sub(1);
+        }
+        self.feed_entries.push_back(entry);
+        if was_following_tail {
+            self.activity_feed_selected = self.feed_entries.len().saturating_sub(1);
+            self.feed_scroll = 0;
+        } else {
+            self.sync_activity_feed_scroll_to_selection();
+        }
+    }
+
+    #[cfg(feature = "activity-feed")]
+    fn upsert_sitrep(&mut self, agent_id: String, name: String, status: Option<String>) {
+        let status = status.unwrap_or_else(|| "-".to_string());
+        let needs_attention = needs_attention_status(&status);
+        if let Some(entry) = self
+            .sitrep
+            .iter_mut()
+            .find(|entry| entry.agent_id == agent_id)
+        {
+            entry.name = name;
+            entry.status = status;
+            entry.needs_attention = needs_attention;
+        } else {
+            self.sitrep.push(SitrepEntry {
+                agent_id,
+                name,
+                status,
+                needs_attention,
+            });
+        }
+        self.sitrep.sort_by(|left, right| {
+            right
+                .needs_attention
+                .cmp(&left.needs_attention)
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.agent_id.cmp(&right.agent_id))
+        });
+    }
+
+    #[cfg(feature = "activity-feed")]
+    fn remove_sitrep(&mut self, agent_id: &str) {
+        self.sitrep.retain(|entry| entry.agent_id != agent_id);
     }
 }
 
@@ -797,6 +1180,12 @@ pub enum CommandEffect {
     Quit,
     SpawnAgentPane(AgentProviderChoice),
     OpenConversationListPane,
+    #[cfg(feature = "activity-feed")]
+    ToggleActivityFeedPane {
+        visible: bool,
+    },
+    #[cfg(feature = "activity-feed")]
+    FocusPaneById(String),
     StopPane(String),
     RefreshMessages,
     Unhandled(TuiCommand),
@@ -957,6 +1346,84 @@ fn string_field(payload: &serde_json::Value, field: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+#[cfg(feature = "activity-feed")]
+fn needs_attention_status(status: &str) -> bool {
+    matches!(
+        status,
+        "awaiting_input" | "needs_human" | "awaiting_approval" | "blocked" | "stalled"
+    )
+}
+
+#[cfg(feature = "activity-feed")]
+fn target_agent_id(value: Option<&Value>) -> Option<String> {
+    let value = value?;
+    let kind = value.get("kind").and_then(Value::as_str)?;
+    if kind != "agent" {
+        return None;
+    }
+    string_field(value, "id")
+}
+
+#[cfg(feature = "activity-feed")]
+fn event_actor(payload: &Value) -> String {
+    string_field(payload, "agent_id")
+        .or_else(|| string_field(payload, "client_id"))
+        .or_else(|| string_field(payload, "task_id"))
+        .unwrap_or_else(|| "daemon".to_string())
+}
+
+#[cfg(feature = "activity-feed")]
+fn event_target(payload: &Value) -> String {
+    string_field(payload, "agent_id")
+        .or_else(|| string_field(payload, "task_id"))
+        .or_else(|| string_field(payload, "message_id"))
+        .or_else(|| string_field(payload, "approval_id"))
+        .unwrap_or_else(|| "-".to_string())
+}
+
+#[cfg(feature = "activity-feed")]
+fn event_action(kind: &IpcEventKind) -> String {
+    event_kind_label(kind)
+        .rsplit('.')
+        .next()
+        .unwrap_or("event")
+        .replace('_', " ")
+}
+
+#[cfg(feature = "activity-feed")]
+fn event_kind_label(kind: &IpcEventKind) -> &'static str {
+    match kind {
+        IpcEventKind::DaemonStarted => "daemon.started",
+        IpcEventKind::DaemonStopped => "daemon.stopped",
+        IpcEventKind::ClientAttached => "client.attached",
+        IpcEventKind::ClientDetached => "client.detached",
+        IpcEventKind::TaskCreated => "task.created",
+        IpcEventKind::TaskStatusChanged => "task.status_changed",
+        IpcEventKind::AgentSpawned => "agent.spawned",
+        IpcEventKind::AgentStatusSignal => "agent.status_signal",
+        IpcEventKind::AgentStatusChanged => "agent.status_changed",
+        IpcEventKind::AgentExited => "agent.exited",
+        IpcEventKind::PtyOutputChunk => "pty.output_chunk",
+        IpcEventKind::ScreenDiff => "screen.diff",
+        IpcEventKind::TerminalSnapshotSaved => "terminal.snapshot_saved",
+        IpcEventKind::InputScriptCreated => "input_script.created",
+        IpcEventKind::InputScriptInjected => "input_script.injected",
+        IpcEventKind::InputInjected => "input.injected",
+        IpcEventKind::MessageCreated => "message.created",
+        IpcEventKind::MessageDelivered => "message.delivered",
+        IpcEventKind::ContextCreated => "context.created",
+        IpcEventKind::ContextInjected => "context.injected",
+        IpcEventKind::MailboxWritten => "mailbox.written",
+        IpcEventKind::ArtifactCreated => "artifact.created",
+        IpcEventKind::ApprovalCreated => "approval.created",
+        IpcEventKind::ApprovalDecided => "approval.decided",
+        IpcEventKind::WorktreeCreated => "worktree.created",
+        IpcEventKind::WorktreeDiffCaptured => "worktree.diff_captured",
+        IpcEventKind::PolicyDenied => "policy.denied",
+        IpcEventKind::Error => "error",
+    }
+}
+
 fn endpoint_label(value: Option<&Value>) -> String {
     let Some(value) = value else {
         return "-".to_string();
@@ -1093,6 +1560,270 @@ mod tests {
         let pane = state.pane("agent_001").expect("pane");
         assert_eq!(pane.status(), Some("awaiting_input"));
         assert_eq!(pane.chrome_title(), "impl | awaiting_input");
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn feed_entry_from_agent_status_changed_event() {
+        let entry = FeedEntry::from_event(&event(
+            IpcEventKind::AgentStatusChanged,
+            json!({ "agent_id": "agent_001", "status": "awaiting_input" }),
+        ))
+        .expect("entry");
+
+        assert_eq!(entry.actor, "agent_001");
+        assert_eq!(entry.action, "status awaiting_input");
+        assert_eq!(entry.target, "agent_001");
+        assert_eq!(entry.kind, "agent.status_changed");
+        assert_eq!(entry.focus_agent_id.as_deref(), Some("agent_001"));
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn feed_entry_from_message_created_event_includes_delivery_status() {
+        let entry = FeedEntry::from_event(&event(
+            IpcEventKind::MessageCreated,
+            json!({
+                "message_id": "msg_001",
+                "from": {"kind": "user", "id": "client_001"},
+                "to": {"kind": "agent", "id": "agent_001"},
+                "delivery_status": "pending",
+                "created_at": "2026-06-04T12:34:56+00:00"
+            }),
+        ))
+        .expect("entry");
+
+        assert_eq!(entry.ts, "2026-06-04T12:34:56+00:00");
+        assert_eq!(entry.actor, "user:client_001");
+        assert_eq!(entry.action, "message pending");
+        assert_eq!(entry.target, "agent:agent_001");
+        assert_eq!(entry.kind, "message.created");
+        assert_eq!(entry.focus_agent_id.as_deref(), Some("agent_001"));
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn feed_entry_from_approval_created_event() {
+        let entry = FeedEntry::from_event(&event(
+            IpcEventKind::ApprovalCreated,
+            json!({
+                "approval_id": "approval_001",
+                "kind": "tool",
+                "risk": "medium",
+                "title": "Run command"
+            }),
+        ))
+        .expect("entry");
+
+        assert_eq!(entry.actor, "policy");
+        assert_eq!(entry.action, "approval requested");
+        assert_eq!(entry.target, "approval_001");
+        assert_eq!(entry.kind, "approval.created");
+        assert_eq!(entry.focus_agent_id, None);
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn feed_entry_from_daemon_event_uses_sensible_daemon_actor() {
+        let entry = FeedEntry::from_event(&event(
+            IpcEventKind::DaemonStopped,
+            json!({ "socket_path": "/tmp/agentmux.sock" }),
+        ))
+        .expect("entry");
+
+        assert_eq!(entry.actor, "daemon");
+        assert_eq!(entry.action, "stopped");
+        assert_eq!(entry.target, "-");
+        assert_eq!(entry.kind, "daemon.stopped");
+        assert_eq!(entry.focus_agent_id, None);
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn activity_feed_ignores_high_frequency_output_events() {
+        assert!(
+            FeedEntry::from_event(&event(
+                IpcEventKind::PtyOutputChunk,
+                json!({ "agent_id": "agent_001", "text": "hello" }),
+            ))
+            .is_none()
+        );
+        assert!(
+            FeedEntry::from_event(&event(
+                IpcEventKind::ScreenDiff,
+                json!({ "agent_id": "agent_001", "text": "hello" }),
+            ))
+            .is_none()
+        );
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn sitrep_sorts_agents_needing_attention_first() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [
+                {"id": "agent_ready", "name": "ready", "status": "ready"},
+                {"id": "agent_waiting", "name": "waiting", "status": "awaiting_input"}
+            ]
+        }));
+
+        assert_eq!(state.sitrep()[0].agent_id, "agent_waiting");
+        assert!(state.sitrep()[0].needs_attention);
+        assert_eq!(state.sitrep()[1].agent_id, "agent_ready");
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn agent_exit_removes_sitrep_entry_that_needed_attention() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentStatusChanged,
+            json!({ "agent_id": "agent_001", "status": "awaiting_input" }),
+        ));
+
+        let change = state.apply_event(&event(
+            IpcEventKind::AgentExited,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+
+        assert_eq!(change, StateChange::RemovedPane("agent_001".to_string()));
+        assert!(state.sitrep().is_empty());
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn feed_caps_at_500_entries_and_keeps_indices_valid() {
+        let mut state = TuiSessionState::default();
+
+        for index in 0..501 {
+            state.apply_event(&event(
+                IpcEventKind::TaskCreated,
+                json!({ "task_id": format!("task_{index:03}") }),
+            ));
+        }
+
+        assert_eq!(state.feed_entries().len(), 500);
+        assert_eq!(
+            state.feed_entries().front().expect("front").target,
+            "task_001"
+        );
+        assert_eq!(
+            state.feed_entries().back().expect("back").target,
+            "task_500"
+        );
+        assert!(state.activity_feed_selected_index() < state.feed_entries().len());
+        assert!(state.feed_scroll() <= state.feed_entries().len());
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn feed_navigation_on_empty_feed_is_noop() {
+        let mut state = TuiSessionState::default();
+
+        assert_eq!(
+            state.apply_command(TuiCommand::ActivityFeedNext),
+            CommandEffect::Continue
+        );
+        assert_eq!(
+            state.apply_command(TuiCommand::ActivityFeedPrevious),
+            CommandEffect::Continue
+        );
+        assert_eq!(
+            state.apply_command(TuiCommand::FocusFeedEntry),
+            CommandEffect::Continue
+        );
+        assert_eq!(state.activity_feed_selected_index(), 0);
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn activity_feed_navigation_updates_scroll_to_keep_selection_visible() {
+        let mut state = TuiSessionState::default();
+        for index in 0..8 {
+            state.apply_event(&event(
+                IpcEventKind::TaskCreated,
+                json!({ "task_id": format!("task_{index:03}") }),
+            ));
+        }
+
+        for _ in 0..5 {
+            state.apply_command(TuiCommand::ActivityFeedPrevious);
+        }
+
+        assert_eq!(state.activity_feed_selected_index(), 2);
+        assert_eq!(state.feed_scroll(), 5);
+        assert_eq!(state.activity_feed_window_start(5), 0);
+
+        state.apply_command(TuiCommand::ActivityFeedNext);
+
+        assert_eq!(state.activity_feed_selected_index(), 3);
+        assert_eq!(state.feed_scroll(), 4);
+        assert_eq!(state.activity_feed_window_start(5), 0);
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn incoming_feed_event_does_not_steal_non_tail_selection() {
+        let mut state = TuiSessionState::default();
+        for index in 0..3 {
+            state.apply_event(&event(
+                IpcEventKind::TaskCreated,
+                json!({ "task_id": format!("task_{index:03}") }),
+            ));
+        }
+        state.apply_command(TuiCommand::ActivityFeedPrevious);
+
+        state.apply_event(&event(
+            IpcEventKind::TaskCreated,
+            json!({ "task_id": "task_003" }),
+        ));
+
+        assert_eq!(state.activity_feed_selected_index(), 1);
+        assert_eq!(state.feed_scroll(), 2);
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn focus_feed_entry_for_removed_agent_is_noop() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentExited,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+
+        assert!(state.pane("agent_001").is_none());
+        assert_eq!(
+            state.apply_command(TuiCommand::FocusFeedEntry),
+            CommandEffect::Continue
+        );
+    }
+
+    #[cfg(feature = "activity-feed")]
+    #[test]
+    fn focus_feed_entry_returns_focus_pane_effect() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_001", "name": "impl" }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentStatusChanged,
+            json!({ "agent_id": "agent_001", "status": "awaiting_input" }),
+        ));
+
+        assert_eq!(
+            state.apply_command(TuiCommand::FocusFeedEntry),
+            CommandEffect::FocusPaneById("agent_001".to_string())
+        );
     }
 
     #[test]

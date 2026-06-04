@@ -178,6 +178,7 @@ pub enum JobStatus {
 #[serde(rename_all = "snake_case")]
 pub enum InternalView {
     MessageBus,
+    ActivityFeed,
     ContextBoard,
     ApprovalQueue,
     TaskTimeline,
