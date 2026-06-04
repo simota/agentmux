@@ -290,7 +290,13 @@ enum AgentAction {
     /// Stop an agent session.
     Stop { agent_id: String },
     /// Send a message to an agent.
-    Send { agent_id: String, body: String },
+    Send {
+        /// Immediately inject the created message into the agent input.
+        #[arg(long)]
+        inject: bool,
+        agent_id: String,
+        body: String,
+    },
     /// Inject a queued message into an agent immediately.
     Inject {
         message_id: String,
@@ -334,6 +340,9 @@ enum MessageAction {
     Show { message_id: String },
     /// Send a new message.
     Send {
+        /// Immediately inject the created message into the resolved agent input.
+        #[arg(long)]
+        inject: bool,
         #[arg(long)]
         to: String,
         body: String,
@@ -552,10 +561,18 @@ async fn main() -> Result<()> {
                     send_daemon_request(&socket_path, agent_stop_request(agent_id)).await?;
                 print_response("agent", response)?;
             }
-            AgentAction::Send { agent_id, body } => {
-                let response =
-                    send_daemon_request(&socket_path, agent_send_request(agent_id, body)?).await?;
-                print_response("agent", response)?;
+            AgentAction::Send {
+                inject,
+                agent_id,
+                body,
+            } => {
+                send_message_and_maybe_inject(
+                    &socket_path,
+                    "agent",
+                    agent_send_request(agent_id, body)?,
+                    inject,
+                )
+                .await?;
             }
             AgentAction::Inject {
                 message_id,
@@ -610,10 +627,14 @@ async fn main() -> Result<()> {
                     send_daemon_request(&socket_path, message_show_request(message_id)).await?;
                 print_response("message", response)?;
             }
-            MessageAction::Send { to, body } => {
-                let response =
-                    send_daemon_request(&socket_path, message_send_request(to, body)?).await?;
-                print_response("message", response)?;
+            MessageAction::Send { inject, to, body } => {
+                send_message_and_maybe_inject(
+                    &socket_path,
+                    "message",
+                    message_send_request(to, body)?,
+                    inject,
+                )
+                .await?;
             }
             MessageAction::Inject { message_id } => {
                 let response =
@@ -2343,6 +2364,33 @@ async fn send_daemon_request(socket_path: &Path, request: ClientRequest) -> Resu
     )))
 }
 
+async fn send_message_and_maybe_inject(
+    socket_path: &Path,
+    label: &str,
+    create_request: ClientRequest,
+    inject: bool,
+) -> Result<()> {
+    let create_response = send_daemon_request(socket_path, create_request).await?;
+    if !inject {
+        return print_response(label, create_response);
+    }
+    if !create_response.ok {
+        return Err(response_error(label, create_response));
+    }
+
+    let payload = create_response.payload.unwrap_or_else(|| json!({}));
+    let message_id = payload
+        .get("message_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            AgentmuxError::IpcError("message.create response missing message_id".to_string())
+        })?
+        .to_string();
+    let inject_response =
+        send_daemon_request(socket_path, message_inject_request(message_id)).await?;
+    print_response(label, inject_response)
+}
+
 fn response_error(label: &str, response: DaemonResponse) -> AgentmuxError {
     let error = response.error.unwrap_or_else(|| {
         agentmux_ipc::ErrorBody::new(
@@ -2429,11 +2477,21 @@ fn format_sessions_payload(payload: &Value) -> String {
         return "no running sessions\n".to_string();
     }
 
-    let mut output = String::from("ID NAME ROLE PID CLIENTS\n");
+    let mut output = String::from("ID NAME ROLE STATUS INPUT PID CLIENTS\n");
     for session in sessions {
         let id = session.get("id").and_then(Value::as_str).unwrap_or("-");
         let name = session.get("name").and_then(Value::as_str).unwrap_or("-");
         let role = session.get("role").and_then(Value::as_str).unwrap_or("-");
+        let status = session.get("status").and_then(Value::as_str).unwrap_or("-");
+        let input = if session
+            .get("input_ready")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            "ready"
+        } else {
+            "-"
+        };
         let pid = session
             .get("process_id")
             .and_then(Value::as_u64)
@@ -2444,7 +2502,9 @@ fn format_sessions_payload(payload: &Value) -> String {
             .and_then(Value::as_array)
             .map(|clients| clients.len().to_string())
             .unwrap_or_else(|| "0".to_string());
-        output.push_str(&format!("{id} {name} {role} {pid} {clients}\n"));
+        output.push_str(&format!(
+            "{id} {name} {role} {status} {input} {pid} {clients}\n"
+        ));
     }
     output
 }
@@ -3088,6 +3148,44 @@ mod tests {
     }
 
     #[test]
+    fn send_commands_accept_inject_flag() {
+        let cli = Cli::try_parse_from([
+            "agentmux",
+            "agent",
+            "send",
+            "--inject",
+            "agent_01HX",
+            "hello",
+        ])
+        .unwrap();
+        let Some(Commands::Agent(args)) = cli.command else {
+            panic!("expected agent command");
+        };
+        let AgentAction::Send { inject, .. } = args.action else {
+            panic!("expected agent send action");
+        };
+        assert!(inject);
+
+        let cli = Cli::try_parse_from([
+            "agentmux",
+            "message",
+            "send",
+            "--inject",
+            "--to",
+            "agent:agent_01HX",
+            "hello",
+        ])
+        .unwrap();
+        let Some(Commands::Message(args)) = cli.command else {
+            panic!("expected message command");
+        };
+        let MessageAction::Send { inject, .. } = args.action else {
+            panic!("expected message send action");
+        };
+        assert!(inject);
+    }
+
+    #[test]
     fn format_message_history_payload_lists_messages_newest_first() {
         let payload = json!({
             "messages": [
@@ -3342,6 +3440,8 @@ mod tests {
                     "id": "agent_live",
                     "name": "shell",
                     "role": "tester",
+                    "status": "awaiting_input",
+                    "input_ready": true,
                     "process_id": 1234,
                     "has_process": true,
                     "attached_clients": ["csess_1", "csess_2"]
@@ -3358,7 +3458,7 @@ mod tests {
 
         assert_eq!(
             format_sessions_payload(&payload),
-            "ID NAME ROLE PID CLIENTS\nagent_live shell tester 1234 2\n"
+            "ID NAME ROLE STATUS INPUT PID CLIENTS\nagent_live shell tester awaiting_input ready 1234 2\n"
         );
     }
 

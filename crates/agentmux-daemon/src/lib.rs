@@ -63,6 +63,7 @@ pub struct RegisteredAgentSession {
     pub id: AgentSessionId,
     pub name: String,
     pub role: AgentRole,
+    pub status: Option<AgentStatus>,
     pub process_id: Option<u32>,
     pub attached_clients: BTreeSet<ClientSessionId>,
 }
@@ -73,6 +74,7 @@ impl RegisteredAgentSession {
             id: AgentSessionId::new(),
             name,
             role,
+            status: None,
             process_id,
             attached_clients: BTreeSet::new(),
         }
@@ -83,6 +85,7 @@ impl RegisteredAgentSession {
             id,
             name,
             role,
+            status: None,
             process_id: None,
             attached_clients: BTreeSet::new(),
         }
@@ -623,12 +626,13 @@ impl DaemonRuntime {
         evidence: impl Into<String>,
     ) -> Result<Option<AgentMessage>> {
         {
-            let state = self.state.read().await;
-            if !state.agents.contains_key(agent_id) {
+            let mut state = self.state.write().await;
+            let Some(agent) = state.agents.get_mut(agent_id) else {
                 return Err(AgentmuxError::UserError(format!(
                     "unknown agent session '{agent_id}'"
                 )));
-            }
+            };
+            agent.metadata.status = Some(status.clone());
         }
 
         let evidence = evidence.into();
@@ -1116,6 +1120,8 @@ impl DaemonRuntime {
                     "id": agent.metadata.id.to_string(),
                     "name": agent.metadata.name,
                     "role": agent_role_label(&agent.metadata.role),
+                    "status": agent.metadata.status.as_ref().map(agent_status_label),
+                    "input_ready": agent_input_ready(agent),
                     "process_id": agent.metadata.process_id,
                     "has_process": agent.pty.is_some(),
                     "attached_clients": agent
@@ -2591,6 +2597,33 @@ fn agent_role_label(role: &AgentRole) -> String {
         AgentRole::ContextManager => "context_manager".to_string(),
         AgentRole::Custom(role) => role.clone(),
     }
+}
+
+fn agent_status_label(status: &AgentStatus) -> &'static str {
+    match status {
+        AgentStatus::Starting => "starting",
+        AgentStatus::InteractiveReady => "interactive_ready",
+        AgentStatus::RunningTurn => "running_turn",
+        AgentStatus::RunningCommand => "running_command",
+        AgentStatus::AwaitingInput => "awaiting_input",
+        AgentStatus::AwaitingApproval => "awaiting_approval",
+        AgentStatus::NeedsHuman => "needs_human",
+        AgentStatus::Blocked => "blocked",
+        AgentStatus::CompletedTurn => "completed_turn",
+        AgentStatus::Stalled => "stalled",
+        AgentStatus::Exited => "exited",
+        AgentStatus::Failed => "failed",
+    }
+}
+
+fn agent_input_ready(agent: &LiveAgentSession) -> bool {
+    agent.pty.is_some()
+        && matches!(
+            agent.metadata.status.as_ref(),
+            Some(AgentStatus::AwaitingInput)
+                | Some(AgentStatus::InteractiveReady)
+                | Some(AgentStatus::CompletedTurn)
+        )
 }
 
 fn trim_result_detection_tail(output_tail: &mut String) {
@@ -4130,6 +4163,10 @@ AGENTMUX_RESULT:
         assert!(seen.contains(&IpcEventKind::AgentStatusChanged));
         assert!(seen.contains(&IpcEventKind::InputInjected));
         assert!(seen.contains(&IpcEventKind::MessageDelivered));
+
+        let status = runtime.status_payload().await;
+        assert_eq!(status["agents"][0]["status"], "awaiting_input");
+        assert_eq!(status["agents"][0]["input_ready"], true);
 
         let output = wait_for_file_contains(&output_path, "message:\nstatus driven work")
             .await
