@@ -117,6 +117,10 @@ impl TuiSessionRenderer {
         if state.session_list_visible() {
             render_session_list(area, state, buffer);
         }
+
+        if state.message_bus_visible() {
+            render_message_bus(area, state, buffer);
+        }
     }
 }
 
@@ -127,6 +131,7 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "Ctrl-g d      Detach session",
     "Ctrl-g q      Quit session",
     "Ctrl-g s      List running sessions",
+    "Ctrl-g m      Message bus",
     "Ctrl-g x      Close focused pane",
     "Ctrl-g z      Toggle pane zoom",
     "Ctrl-g arrows Move focus",
@@ -187,6 +192,62 @@ fn render_session_list(area: Rect, state: &TuiSessionState, buffer: &mut Buffer)
     paragraph.render(popup, buffer);
 }
 
+fn render_message_bus(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut lines = vec![
+        "Esc/q to close".to_string(),
+        "".to_string(),
+        format!(
+            "{:<16} {:<12} {:<12} {:<16} {:<16} {:<16} {}",
+            "CREATED", "STATUS", "KIND", "FROM", "TO", "ID", "BODY"
+        ),
+    ];
+
+    for message in state.messages().iter() {
+        lines.push(format!(
+            "{:<16} {:<12} {:<12} {:<16} {:<16} {:<16} {}",
+            truncate_cell(&compact_timestamp(&message.created_at), 16),
+            truncate_cell(&message.delivery_status, 12),
+            truncate_cell(&message.kind, 12),
+            truncate_cell(&message.from, 16),
+            truncate_cell(&message.to, 16),
+            truncate_cell(&message.message_id, 16),
+            truncate_cell(&message.body, 48),
+        ));
+    }
+
+    if state.messages().is_empty() {
+        lines.push("no messages".to_string());
+    }
+
+    let max_height = area.height.saturating_sub(2).max(8);
+    let height = u16::try_from(lines.len() + 2)
+        .unwrap_or(u16::MAX)
+        .min(max_height);
+    let popup = centered_rect(area, area.width.saturating_sub(4).max(40), height);
+    let visible_lines = popup.height.saturating_sub(2) as usize;
+    let text = lines
+        .into_iter()
+        .take(visible_lines)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Clear.render(popup, buffer);
+    let paragraph = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title("Message Bus")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .alignment(Alignment::Left)
+        .style(Style::default().fg(Color::White).bg(Color::Black));
+    paragraph.render(popup, buffer);
+}
+
 fn render_keybinding_help(area: Rect, buffer: &mut Buffer) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -204,6 +265,26 @@ fn render_keybinding_help(area: Rect, buffer: &mut Buffer) {
         .alignment(Alignment::Left)
         .style(Style::default().fg(Color::White).bg(Color::Black));
     paragraph.render(popup, buffer);
+}
+
+fn compact_timestamp(value: &str) -> String {
+    value
+        .strip_suffix("+00:00")
+        .unwrap_or(value)
+        .replace('T', " ")
+}
+
+fn truncate_cell(value: &str, max_chars: usize) -> String {
+    let normalized = value.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.chars().count() <= max_chars {
+        return normalized;
+    }
+    let mut truncated = normalized
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    truncated.push('…');
+    truncated
 }
 
 fn centered_rect(area: Rect, max_width: u16, max_height: u16) -> Rect {
@@ -404,6 +485,44 @@ mod tests {
         assert!(rendered.contains("shell"));
         assert!(rendered.contains("1234"));
         assert!(!rendered.contains("agent_restored"));
+    }
+
+    #[test]
+    fn render_session_draws_message_bus_overlay_when_visible() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "agents": [{"id": "shell", "name": "shell"}]
+        }));
+        state.apply_message_list_payload(&json!({
+            "messages": [
+                {
+                    "message_id": "msg_001",
+                    "created_at": "2026-06-04T02:00:00+00:00",
+                    "delivery_status": "delivered",
+                    "kind": "handoff",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "agent", "id": "impl" },
+                    "body": "please continue"
+                }
+            ]
+        }));
+        state.apply_command(crate::keymap::TuiCommand::ShowMessageBus);
+
+        let area = Rect::new(0, 0, 160, 20);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Message Bus"));
+        assert!(rendered.contains("STATUS"));
+        assert!(rendered.contains("msg_001"));
+        assert!(rendered.contains("agent:planner"));
+        assert!(rendered.contains("please continue"));
     }
 
     #[test]

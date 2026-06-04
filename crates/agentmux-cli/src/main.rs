@@ -1444,6 +1444,7 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
                 CommandEffect::Continue
                 | CommandEffect::SpawnShellPane
                 | CommandEffect::StopPane(_)
+                | CommandEffect::RefreshMessages
                 | CommandEffect::Unhandled(_) => {}
             }
         }
@@ -1453,7 +1454,11 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
             .poll_event(Duration::from_millis(16))
             .map_err(|error| AgentmuxError::TerminalError(format!("failed to read key: {error}")))?
         {
-            let dispatch = keymap.dispatch_with_session_list(key, state.session_list_visible());
+            let dispatch = keymap.dispatch_with_overlays(
+                key,
+                state.session_list_visible(),
+                state.message_bus_visible(),
+            );
             if let Some(command) = match &dispatch {
                 agentmux_tui::keymap::KeyDispatch::Command(command) => Some(*command),
                 _ => None,
@@ -1467,6 +1472,10 @@ async fn run_tui_session(socket_path: &Path, target: String) -> Result<()> {
                     }
                     CommandEffect::StopPane(agent_id) => {
                         writer.write(&agent_stop_request(agent_id)).await?;
+                    }
+                    CommandEffect::RefreshMessages => {
+                        writer.write(&message_list_request()).await?;
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
                     }
                     CommandEffect::Detach => {
                         writer.write(&detach_request()).await?;
@@ -1553,6 +1562,11 @@ fn apply_tui_stream_frame(
             }
             if response.id == "req_snapshot" {
                 state.apply_snapshot(&response.payload.clone().unwrap_or_else(|| json!({})));
+            }
+            if response.id == "req_message_list" {
+                state.apply_message_list_payload(
+                    &response.payload.clone().unwrap_or_else(|| json!({})),
+                );
             }
             Ok(Some(response.id))
         }
@@ -2053,6 +2067,34 @@ mod tests {
                 .trim_end(),
             "hi"
         );
+    }
+
+    #[test]
+    fn tui_stream_frame_updates_message_bus_from_message_list_response() {
+        let mut state = TuiSessionState::default();
+        let response = DaemonResponse::ok(
+            "req_message_list",
+            json!({
+                "messages": [
+                    {
+                        "message_id": "msg_1",
+                        "created_at": "2026-06-04T02:00:00+00:00",
+                        "delivery_status": "delivered",
+                        "kind": "handoff",
+                        "from": { "kind": "agent", "id": "planner" },
+                        "to": { "kind": "agent", "id": "impl" },
+                        "body": "continue"
+                    }
+                ]
+            }),
+        );
+
+        let response_id =
+            apply_tui_stream_frame(&mut state, DaemonStreamFrame::Response(response)).unwrap();
+
+        assert_eq!(response_id.as_deref(), Some("req_message_list"));
+        assert_eq!(state.messages().len(), 1);
+        assert_eq!(state.messages()[0].message_id, "msg_1");
     }
 
     #[test]

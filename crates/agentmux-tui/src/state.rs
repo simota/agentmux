@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 
 use agentmux_ipc::protocol::{DaemonEvent, IpcEventKind};
 use agentmux_terminal::{CellStyle, ScreenGrid, TerminalParser};
+use serde_json::Value;
 
 use crate::keymap::{FocusDirection, TuiCommand};
 use crate::layout::{PaneLayout, SplitDirection};
@@ -87,6 +88,8 @@ pub struct TuiSessionState {
     keybinding_help_visible: bool,
     session_list_visible: bool,
     session_list_selected: usize,
+    message_bus_visible: bool,
+    messages: Vec<MessageListItem>,
 }
 
 impl Default for TuiSessionState {
@@ -105,6 +108,8 @@ impl TuiSessionState {
             keybinding_help_visible: false,
             session_list_visible: false,
             session_list_selected: 0,
+            message_bus_visible: false,
+            messages: Vec::new(),
         }
     }
 
@@ -150,6 +155,14 @@ impl TuiSessionState {
 
     pub fn session_list_selected_index(&self) -> usize {
         self.session_list_selected
+    }
+
+    pub fn message_bus_visible(&self) -> bool {
+        self.message_bus_visible
+    }
+
+    pub fn messages(&self) -> &[MessageListItem] {
+        &self.messages
     }
 
     pub fn focus_next(&mut self) {
@@ -198,6 +211,7 @@ impl TuiSessionState {
                 self.keybinding_help_visible = !self.keybinding_help_visible;
                 if self.keybinding_help_visible {
                     self.session_list_visible = false;
+                    self.message_bus_visible = false;
                 }
                 CommandEffect::Continue
             }
@@ -205,9 +219,20 @@ impl TuiSessionState {
                 self.session_list_visible = !self.session_list_visible;
                 if self.session_list_visible {
                     self.keybinding_help_visible = false;
+                    self.message_bus_visible = false;
                     self.select_focused_running_session();
                 }
                 CommandEffect::Continue
+            }
+            TuiCommand::ShowMessageBus => {
+                self.message_bus_visible = !self.message_bus_visible;
+                if self.message_bus_visible {
+                    self.keybinding_help_visible = false;
+                    self.session_list_visible = false;
+                    CommandEffect::RefreshMessages
+                } else {
+                    CommandEffect::Continue
+                }
             }
             TuiCommand::SessionListNext => {
                 self.move_session_list_selection(1);
@@ -224,6 +249,7 @@ impl TuiSessionState {
             TuiCommand::CloseOverlay => {
                 self.keybinding_help_visible = false;
                 self.session_list_visible = false;
+                self.message_bus_visible = false;
                 CommandEffect::Continue
             }
             TuiCommand::Detach => CommandEffect::Detach,
@@ -333,6 +359,25 @@ impl TuiSessionState {
         applied
     }
 
+    pub fn apply_message_list_payload(&mut self, payload: &Value) -> usize {
+        let Some(messages) = payload.get("messages").and_then(Value::as_array) else {
+            self.messages.clear();
+            return 0;
+        };
+
+        self.messages = messages
+            .iter()
+            .filter_map(MessageListItem::from_payload)
+            .collect();
+        self.messages.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.message_id.cmp(&left.message_id))
+        });
+        self.messages.len()
+    }
+
     /// Restore a full pane snapshot returned by `agent.snapshot`.
     pub fn apply_snapshot(&mut self, payload: &serde_json::Value) -> StateChange {
         let Some(agent_id) =
@@ -409,8 +454,33 @@ impl TuiSessionState {
             IpcEventKind::PtyOutputChunk | IpcEventKind::ScreenDiff => self.apply_output(event),
             IpcEventKind::TerminalSnapshotSaved => self.apply_snapshot(&event.payload),
             IpcEventKind::AgentExited => self.apply_agent_exited(event),
+            IpcEventKind::MessageCreated | IpcEventKind::MessageDelivered => {
+                self.apply_message_event(event)
+            }
             _ => StateChange::Ignored,
         }
+    }
+
+    fn apply_message_event(&mut self, event: &DaemonEvent) -> StateChange {
+        let Some(message) = MessageListItem::from_payload(&event.payload) else {
+            return StateChange::Ignored;
+        };
+        if let Some(existing) = self
+            .messages
+            .iter_mut()
+            .find(|existing| existing.message_id == message.message_id)
+        {
+            *existing = message;
+        } else {
+            self.messages.push(message);
+        }
+        self.messages.sort_by(|left, right| {
+            right
+                .created_at
+                .cmp(&left.created_at)
+                .then_with(|| right.message_id.cmp(&left.message_id))
+        });
+        StateChange::UpdatedMessages
     }
 
     fn apply_agent_spawned(&mut self, event: &DaemonEvent) -> StateChange {
@@ -512,6 +582,7 @@ pub enum StateChange {
     UpdatedPane(String),
     FocusedPane(String),
     RemovedPane(String),
+    UpdatedMessages,
     Ignored,
 }
 
@@ -522,7 +593,35 @@ pub enum CommandEffect {
     Quit,
     SpawnShellPane,
     StopPane(String),
+    RefreshMessages,
     Unhandled(TuiCommand),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageListItem {
+    pub message_id: String,
+    pub created_at: String,
+    pub delivery_status: String,
+    pub kind: String,
+    pub from: String,
+    pub to: String,
+    pub body: String,
+}
+
+impl MessageListItem {
+    fn from_payload(payload: &Value) -> Option<Self> {
+        let message_id = string_field(payload, "message_id")?;
+        Some(Self {
+            message_id,
+            created_at: string_field(payload, "created_at").unwrap_or_else(|| "-".to_string()),
+            delivery_status: string_field(payload, "delivery_status")
+                .unwrap_or_else(|| "-".to_string()),
+            kind: string_field(payload, "kind").unwrap_or_else(|| "-".to_string()),
+            from: endpoint_label(payload.get("from")),
+            to: endpoint_label(payload.get("to")),
+            body: string_field(payload, "body").unwrap_or_default(),
+        })
+    }
 }
 
 fn string_field(payload: &serde_json::Value, field: &str) -> Option<String> {
@@ -530,6 +629,22 @@ fn string_field(payload: &serde_json::Value, field: &str) -> Option<String> {
         .get(field)
         .and_then(|value| value.as_str())
         .map(ToOwned::to_owned)
+}
+
+fn endpoint_label(value: Option<&Value>) -> String {
+    let Some(value) = value else {
+        return "-".to_string();
+    };
+    let kind = value
+        .get("kind")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let id = value.get("id").and_then(Value::as_str).unwrap_or("-");
+    if id == "-" {
+        kind.to_string()
+    } else {
+        format!("{kind}:{id}")
+    }
 }
 
 fn output_bytes(payload: &serde_json::Value) -> Option<Vec<u8>> {
@@ -763,7 +878,7 @@ mod tests {
         assert_eq!(
             state.apply_event(&event(
                 IpcEventKind::MessageCreated,
-                json!({ "message_id": "m" })
+                json!({ "body": "missing id" })
             )),
             StateChange::Ignored
         );
@@ -864,6 +979,16 @@ mod tests {
             CommandEffect::Continue
         );
         assert!(!state.session_list_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::ShowMessageBus),
+            CommandEffect::RefreshMessages
+        );
+        assert!(state.message_bus_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::CloseOverlay),
+            CommandEffect::Continue
+        );
+        assert!(!state.message_bus_visible());
     }
 
     #[test]
@@ -1001,5 +1126,78 @@ mod tests {
         assert_eq!(state.pane("a").expect("a pane").status(), Some("busy"));
         assert_eq!(state.pane("b").expect("b pane").name(), "new-b");
         assert_eq!(state.pane("b").expect("b pane").process_id(), Some(9));
+    }
+
+    #[test]
+    fn message_list_payload_updates_message_bus_state_newest_first() {
+        let mut state = TuiSessionState::default();
+
+        let applied = state.apply_message_list_payload(&json!({
+            "messages": [
+                {
+                    "message_id": "msg_old",
+                    "created_at": "2026-06-04T01:00:00+00:00",
+                    "delivery_status": "queued",
+                    "kind": "handoff",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "agent", "id": "impl" },
+                    "body": "old"
+                },
+                {
+                    "message_id": "msg_new",
+                    "created_at": "2026-06-04T02:00:00+00:00",
+                    "delivery_status": "delivered",
+                    "kind": "test_result",
+                    "from": { "kind": "orchestrator" },
+                    "to": { "kind": "role", "id": "tester" },
+                    "body": "new"
+                }
+            ]
+        }));
+
+        assert_eq!(applied, 2);
+        assert_eq!(state.messages()[0].message_id, "msg_new");
+        assert_eq!(state.messages()[0].from, "orchestrator");
+        assert_eq!(state.messages()[0].to, "role:tester");
+    }
+
+    #[test]
+    fn message_events_upsert_message_bus_state() {
+        let mut state = TuiSessionState::default();
+
+        assert_eq!(
+            state.apply_event(&event(
+                IpcEventKind::MessageCreated,
+                json!({
+                    "message_id": "msg_1",
+                    "created_at": "2026-06-04T01:00:00+00:00",
+                    "delivery_status": "queued",
+                    "kind": "handoff",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "agent", "id": "impl" },
+                    "body": "review this"
+                })
+            )),
+            StateChange::UpdatedMessages
+        );
+        assert_eq!(state.messages()[0].delivery_status, "queued");
+
+        assert_eq!(
+            state.apply_event(&event(
+                IpcEventKind::MessageDelivered,
+                json!({
+                    "message_id": "msg_1",
+                    "created_at": "2026-06-04T01:00:00+00:00",
+                    "delivery_status": "delivered",
+                    "kind": "handoff",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "agent", "id": "impl" },
+                    "body": "review this"
+                })
+            )),
+            StateChange::UpdatedMessages
+        );
+        assert_eq!(state.messages().len(), 1);
+        assert_eq!(state.messages()[0].delivery_status, "delivered");
     }
 }

@@ -178,6 +178,19 @@ Enter           focus selected session
 Esc, q          close list
 ```
 
+Message bus overlay:
+
+```text
+Ctrl-g m        open message history
+Esc, q          close message history
+```
+
+表示列:
+
+```text
+created_at, delivery_status, kind, from, to, message_id, body
+```
+
 ## 7. Command palette
 
 ```text

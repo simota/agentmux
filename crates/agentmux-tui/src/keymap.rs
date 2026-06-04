@@ -91,6 +91,15 @@ impl KeymapDispatcher {
         key: KeyEvent,
         session_list_visible: bool,
     ) -> KeyDispatch {
+        self.dispatch_with_overlays(key, session_list_visible, false)
+    }
+
+    pub fn dispatch_with_overlays(
+        &mut self,
+        key: KeyEvent,
+        session_list_visible: bool,
+        message_bus_visible: bool,
+    ) -> KeyDispatch {
         if matches!(key.kind, KeyEventKind::Release) {
             return KeyDispatch::Consumed;
         }
@@ -108,7 +117,13 @@ impl KeymapDispatcher {
         }
 
         if session_list_visible {
-            return session_list_command(key)
+            return overlay_navigation_command(key)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        if message_bus_visible {
+            return overlay_close_command(key)
                 .map(KeyDispatch::Command)
                 .unwrap_or(KeyDispatch::Consumed);
         }
@@ -139,7 +154,7 @@ impl KeyBinding {
     }
 }
 
-fn session_list_command(key: KeyEvent) -> Option<TuiCommand> {
+fn overlay_navigation_command(key: KeyEvent) -> Option<TuiCommand> {
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -151,6 +166,20 @@ fn session_list_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Down | KeyCode::Char('j') => Some(TuiCommand::SessionListNext),
         KeyCode::Up | KeyCode::Char('k') => Some(TuiCommand::SessionListPrevious),
         KeyCode::Enter => Some(TuiCommand::FocusSelectedSession),
+        KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
+        _ => None,
+    }
+}
+
+fn overlay_close_command(key: KeyEvent) -> Option<TuiCommand> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
         KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
         _ => None,
     }
@@ -330,6 +359,32 @@ mod tests {
             .dispatch_with_session_list(key(KeyCode::Char('a'), KeyModifiers::NONE), true);
 
         assert_eq!(dispatch, KeyDispatch::Consumed);
+    }
+
+    #[test]
+    fn message_bus_overlay_closes_on_escape_or_q() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch_with_overlays(key(KeyCode::Esc, KeyModifiers::NONE), false, true),
+            KeyDispatch::Command(TuiCommand::CloseOverlay)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_overlays(
+                key(KeyCode::Char('q'), KeyModifiers::NONE),
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::CloseOverlay)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_overlays(
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+                false,
+                true
+            ),
+            KeyDispatch::Consumed
+        );
     }
 
     #[test]
