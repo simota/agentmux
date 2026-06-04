@@ -2025,11 +2025,16 @@ async fn run_tui_session_inner(
                 draw_tui_frame(&mut terminal, &renderer, &state)?;
                 continue;
             }
-            let dispatch = keymap.dispatch_with_overlays(
+            let conversation_list_focused = state
+                .layout()
+                .focused()
+                .is_some_and(|pane_id| state.is_conversation_list_pane(pane_id));
+            let dispatch = keymap.dispatch_with_context(
                 key,
                 state.session_list_visible(),
                 state.message_bus_visible(),
                 state.provider_picker_visible(),
+                conversation_list_focused,
             );
             if let Some(command) = match &dispatch {
                 agentmux_tui::keymap::KeyDispatch::Command(command) => Some(*command),

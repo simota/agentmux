@@ -8,7 +8,7 @@ use ratatui::{
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
 
-use crate::state::{CopySelection, TuiSessionState};
+use crate::state::{CopySelection, MessageListItem, TuiSessionState};
 
 /// Border/status metadata for an agent pane.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -276,6 +276,7 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "Ctrl-g arrows Move focus",
     "Ctrl-g %      Split vertical + choose agent",
     "Ctrl-g \"      Split horizontal + choose agent",
+    "Msg pane      Enter/Space/d details",
     "Ctrl-g Space  Rotate split direction",
     "Ctrl-g :      Command palette",
 ];
@@ -376,7 +377,7 @@ fn render_message_bus(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) 
     }
 
     let max_height = area.height.saturating_sub(2).max(8);
-    let height = u16::try_from(message_list_lines(state, true).len() + 2)
+    let height = u16::try_from(message_list_lines(state, area.width, true).len() + 2)
         .unwrap_or(u16::MAX)
         .min(max_height);
     let popup = centered_rect(area, area.width.saturating_sub(4).max(40), height);
@@ -394,7 +395,8 @@ fn render_message_list_panel(
         return;
     }
 
-    let lines = message_list_lines(state, title == "Message Bus");
+    let overlay = title == "Message Bus";
+    let lines = message_list_lines(state, area.width, overlay);
     let visible_lines = area.height.saturating_sub(2) as usize;
     let text = lines
         .into_iter()
@@ -412,7 +414,7 @@ fn render_message_list_panel(
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(title)
+                .title(message_list_title(title, state.message_details_visible()))
                 .border_style(border_style),
         )
         .alignment(Alignment::Left)
@@ -420,27 +422,41 @@ fn render_message_list_panel(
     paragraph.render(area, buffer);
 }
 
-fn message_list_lines(state: &TuiSessionState, include_overlay_hint: bool) -> Vec<String> {
-    let mut lines = vec![format!(
-        "{:<16} {:<12} {:<12} {:<16} {:<16} {:<16} {}",
-        "CREATED", "STATUS", "KIND", "FROM", "TO", "ID", "BODY"
-    )];
+fn message_list_title(title: &'static str, details_visible: bool) -> String {
+    let mode = if details_visible {
+        "details"
+    } else {
+        "compact"
+    };
+    format!("{title} [{mode}]")
+}
+
+fn message_list_lines(
+    state: &TuiSessionState,
+    area_width: u16,
+    include_overlay_hint: bool,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let next_mode = if state.message_details_visible() {
+        "compact"
+    } else {
+        "details"
+    };
     if include_overlay_hint {
-        lines.insert(0, "Esc/q to close".to_string());
-        lines.insert(1, "".to_string());
+        lines.push(format!("Enter/Space/d {next_mode} | Esc/q close"));
+    } else {
+        lines.push(format!("Enter/Space/d {next_mode} | Ctrl-g x close"));
     }
+    lines.push("".to_string());
+
+    let content_width = usize::from(area_width.saturating_sub(4)).clamp(24, 120);
 
     for message in state.messages().iter() {
-        lines.push(format!(
-            "{:<16} {:<12} {:<12} {:<16} {:<16} {:<16} {}",
-            truncate_cell(&compact_timestamp(&message.created_at), 16),
-            truncate_cell(&message.delivery_status, 12),
-            truncate_cell(&message.kind, 12),
-            truncate_cell(&message.from, 16),
-            truncate_cell(&message.to, 16),
-            truncate_cell(&message.message_id, 16),
-            truncate_cell(&message.body, 48),
-        ));
+        if state.message_details_visible() {
+            lines.extend(message_detail_lines(message, content_width));
+        } else {
+            lines.extend(message_compact_lines(message, content_width));
+        }
     }
 
     if state.messages().is_empty() {
@@ -448,6 +464,41 @@ fn message_list_lines(state: &TuiSessionState, include_overlay_hint: bool) -> Ve
     }
 
     lines
+}
+
+fn message_compact_lines(message: &MessageListItem, content_width: usize) -> Vec<String> {
+    let meta = format!(
+        "{} / {} / {} / {}",
+        message.delivery_status,
+        message.kind,
+        message.message_id,
+        compact_timestamp(&message.created_at)
+    );
+    let route = format!("{} -> {}", message.from, message.to);
+    vec![
+        truncate_cell(&meta, content_width),
+        truncate_cell(&route, content_width),
+        truncate_cell(&message.body, content_width),
+        "".to_string(),
+    ]
+}
+
+fn message_detail_lines(message: &MessageListItem, content_width: usize) -> Vec<String> {
+    vec![
+        truncate_cell(
+            &format!("{} / {}", message.delivery_status, message.kind),
+            content_width,
+        ),
+        truncate_cell(&format!("id: {}", message.message_id), content_width),
+        truncate_cell(
+            &format!("created: {}", compact_timestamp(&message.created_at)),
+            content_width,
+        ),
+        truncate_cell(&format!("from: {}", message.from), content_width),
+        truncate_cell(&format!("to: {}", message.to), content_width),
+        truncate_cell(&format!("body: {}", message.body), content_width),
+        "".to_string(),
+    ]
 }
 
 fn render_keybinding_help(area: Rect, buffer: &mut Buffer) {
@@ -778,7 +829,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Message Bus"));
-        assert!(rendered.contains("STATUS"));
+        assert!(rendered.contains("compact"));
         assert!(rendered.contains("msg_001"));
         assert!(rendered.contains("agent:planner"));
         assert!(rendered.contains("please continue"));
@@ -813,8 +864,44 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Conversation List"));
+        assert!(rendered.contains("compact"));
         assert!(rendered.contains("msg_002"));
         assert!(rendered.contains("review this"));
+    }
+
+    #[test]
+    fn render_session_draws_message_details_when_toggled() {
+        let mut state = TuiSessionState::default();
+        state.open_conversation_list_pane();
+        state.apply_command(crate::keymap::TuiCommand::ToggleMessageDetails);
+        state.apply_message_list_payload(&json!({
+            "messages": [
+                {
+                    "message_id": "msg_003",
+                    "created_at": "2026-06-04T02:00:00+00:00",
+                    "delivery_status": "pending",
+                    "kind": "handoff",
+                    "from": { "kind": "agent", "id": "planner" },
+                    "to": { "kind": "agent", "id": "impl" },
+                    "body": "inspect carefully"
+                }
+            ]
+        }));
+
+        let area = Rect::new(0, 0, 120, 20);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("details"));
+        assert!(rendered.contains("id: msg_003"));
+        assert!(rendered.contains("from: agent:planner"));
+        assert!(rendered.contains("body: inspect carefully"));
     }
 
     #[test]

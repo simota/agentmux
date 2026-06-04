@@ -106,6 +106,7 @@ pub struct TuiSessionState {
     session_list_visible: bool,
     session_list_selected: usize,
     message_bus_visible: bool,
+    message_details_visible: bool,
     messages: Vec<MessageListItem>,
     provider_picker_visible: bool,
     provider_picker_selected: usize,
@@ -129,6 +130,7 @@ impl TuiSessionState {
             session_list_visible: false,
             session_list_selected: 0,
             message_bus_visible: false,
+            message_details_visible: false,
             messages: Vec::new(),
             provider_picker_visible: false,
             provider_picker_selected: 0,
@@ -232,6 +234,10 @@ impl TuiSessionState {
 
     pub fn messages(&self) -> &[MessageListItem] {
         &self.messages
+    }
+
+    pub fn message_details_visible(&self) -> bool {
+        self.message_details_visible
     }
 
     pub fn provider_picker_visible(&self) -> bool {
@@ -363,6 +369,17 @@ impl TuiSessionState {
                 } else {
                     CommandEffect::Continue
                 }
+            }
+            TuiCommand::ToggleMessageDetails => {
+                if self.message_bus_visible
+                    || self
+                        .layout
+                        .focused()
+                        .is_some_and(|pane_id| pane_id == CONVERSATION_LIST_PANE_ID)
+                {
+                    self.message_details_visible = !self.message_details_visible;
+                }
+                CommandEffect::Continue
             }
             TuiCommand::SessionListNext => {
                 self.move_session_list_selection(1);
@@ -1447,6 +1464,13 @@ mod tests {
         assert!(!state.provider_picker_visible());
         assert!(state.is_conversation_list_pane(CONVERSATION_LIST_PANE_ID));
         assert_eq!(state.layout().focused(), Some(CONVERSATION_LIST_PANE_ID));
+
+        assert!(!state.message_details_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::ToggleMessageDetails),
+            CommandEffect::Continue
+        );
+        assert!(state.message_details_visible());
 
         assert_eq!(
             state.apply_command(TuiCommand::ClosePane),

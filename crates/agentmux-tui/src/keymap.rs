@@ -24,6 +24,7 @@ pub enum TuiCommand {
     ShowSessionList,
     ShowAgentList,
     ShowMessageBus,
+    ToggleMessageDetails,
     ShowContextBoard,
     ShowApprovalQueue,
     SplitVertical,
@@ -105,6 +106,23 @@ impl KeymapDispatcher {
         message_bus_visible: bool,
         provider_picker_visible: bool,
     ) -> KeyDispatch {
+        self.dispatch_with_context(
+            key,
+            session_list_visible,
+            message_bus_visible,
+            provider_picker_visible,
+            false,
+        )
+    }
+
+    pub fn dispatch_with_context(
+        &mut self,
+        key: KeyEvent,
+        session_list_visible: bool,
+        message_bus_visible: bool,
+        provider_picker_visible: bool,
+        conversation_list_focused: bool,
+    ) -> KeyDispatch {
         if matches!(key.kind, KeyEventKind::Release) {
             return KeyDispatch::Consumed;
         }
@@ -134,7 +152,13 @@ impl KeymapDispatcher {
         }
 
         if message_bus_visible {
-            return overlay_close_command(key)
+            return message_list_command(key, true)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        if conversation_list_focused {
+            return message_list_command(key, false)
                 .map(KeyDispatch::Command)
                 .unwrap_or(KeyDispatch::Consumed);
         }
@@ -202,7 +226,7 @@ fn provider_picker_command(key: KeyEvent) -> Option<TuiCommand> {
     }
 }
 
-fn overlay_close_command(key: KeyEvent) -> Option<TuiCommand> {
+fn message_list_command(key: KeyEvent, close_enabled: bool) -> Option<TuiCommand> {
     if key
         .modifiers
         .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
@@ -211,7 +235,10 @@ fn overlay_close_command(key: KeyEvent) -> Option<TuiCommand> {
     }
 
     match key.code {
-        KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
+        KeyCode::Enter | KeyCode::Char(' ') | KeyCode::Char('d') => {
+            Some(TuiCommand::ToggleMessageDetails)
+        }
+        KeyCode::Esc | KeyCode::Char('q') if close_enabled => Some(TuiCommand::CloseOverlay),
         _ => None,
     }
 }
@@ -406,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn message_bus_overlay_closes_on_escape_or_q() {
+    fn message_bus_overlay_closes_or_toggles_details() {
         let mut dispatcher = KeymapDispatcher::default();
 
         assert_eq!(
@@ -429,10 +456,45 @@ mod tests {
         );
         assert_eq!(
             dispatcher.dispatch_with_overlays(
+                key(KeyCode::Enter, KeyModifiers::NONE),
+                false,
+                true,
+                false
+            ),
+            KeyDispatch::Command(TuiCommand::ToggleMessageDetails)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_overlays(
                 key(KeyCode::Char('a'), KeyModifiers::NONE),
                 false,
                 true,
                 false
+            ),
+            KeyDispatch::Consumed
+        );
+    }
+
+    #[test]
+    fn conversation_list_focus_toggles_details_and_consumes_other_keys() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch_with_context(
+                key(KeyCode::Char('d'), KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                true
+            ),
+            KeyDispatch::Command(TuiCommand::ToggleMessageDetails)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_context(
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                true
             ),
             KeyDispatch::Consumed
         );

@@ -33,6 +33,8 @@ agentmux start "agy,messages,codex"
 
 daemon未起動なら起動し、指定されたpaneを開いてからTUIを表示する。指定はcomma-separatedで、provider sessionの `claude`, `codex`, `agy` と、message履歴paneの `messages` を受け付ける。provider指定なしの `agentmux start` は通常のTUI起動と同じく、既存sessionがなければprovider pickerを表示する。
 
+`agy` provider は既定で `--dangerously-skip-permissions` を付けて起動し、tool permission prompt で停止しにくい強いpermission modeにする。`agent.spawn` payloadで明示的に `args` を渡した場合は、その指定を優先する。
+
 ### 3.1 project init
 
 ```bash
@@ -192,7 +194,7 @@ Ctrl-g r        resize mode
 Ctrl-g Space    rotate layout
 ```
 
-`Ctrl-g %` / `Ctrl-g "` は空のshell paneを作らず、provider pickerを表示する。選択肢は `Claude Code`, `Codex`, `Antigravity`, `Conversation List`。coding agentをEnterで選択すると起動してそのpaneへattachする。`Conversation List` はmessage履歴を通常paneとして開く。Esc/qで閉じる。
+`Ctrl-g %` / `Ctrl-g "` は空のshell paneを作らず、provider pickerを表示する。選択肢は `Claude Code`, `Codex`, `Antigravity`, `Conversation List`。coding agentをEnterで選択すると起動してそのpaneへattachする。`Conversation List` はmessage履歴を通常paneとして開く。`Enter` / `Space` / `d` でcompact/detail表示を切り替える。`Ctrl-g x` で閉じる。
 
 ### 6.3 Agent操作
 
@@ -217,13 +219,15 @@ Message bus overlay:
 
 ```text
 Ctrl-g m        open message history
+Enter/Space/d   toggle compact/detail
 Esc, q          close message history
 ```
 
-表示列:
+Message history表示:
 
 ```text
-created_at, delivery_status, kind, from, to, message_id, body
+compact: delivery_status / kind / message_id / created_at, route, body
+detail: delivery_status, kind, message_id, created_at, from, to, body
 ```
 
 ## 7. Command palette
