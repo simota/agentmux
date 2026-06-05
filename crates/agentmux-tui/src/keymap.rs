@@ -24,6 +24,8 @@ pub enum TuiCommand {
     ShowSessionList,
     ShowAgentList,
     ShowMessageBus,
+    #[cfg(feature = "arena")]
+    ShowArenaOverlay,
     #[cfg(feature = "activity-feed")]
     ShowActivityFeed,
     ToggleMessageDetails,
@@ -54,6 +56,12 @@ pub enum TuiCommand {
     ActivityFeedPrevious,
     #[cfg(feature = "activity-feed")]
     FocusFeedEntry,
+    #[cfg(feature = "arena")]
+    ArenaNext,
+    #[cfg(feature = "arena")]
+    ArenaPrevious,
+    #[cfg(feature = "arena")]
+    ArenaAdopt,
     CloseOverlay,
 }
 
@@ -151,6 +159,28 @@ impl KeymapDispatcher {
         conversation_list_focused: bool,
         _activity_feed_focused: bool,
     ) -> KeyDispatch {
+        self.dispatch_with_arena_context(
+            key,
+            session_list_visible,
+            message_bus_visible,
+            provider_picker_visible,
+            conversation_list_focused,
+            false,
+            _activity_feed_focused,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch_with_arena_context(
+        &mut self,
+        key: KeyEvent,
+        session_list_visible: bool,
+        message_bus_visible: bool,
+        provider_picker_visible: bool,
+        conversation_list_focused: bool,
+        _arena_overlay_visible: bool,
+        _activity_feed_focused: bool,
+    ) -> KeyDispatch {
         if matches!(key.kind, KeyEventKind::Release) {
             return KeyDispatch::Consumed;
         }
@@ -169,6 +199,13 @@ impl KeymapDispatcher {
 
         if session_list_visible {
             return overlay_navigation_command(key)
+                .map(KeyDispatch::Command)
+                .unwrap_or(KeyDispatch::Consumed);
+        }
+
+        #[cfg(feature = "arena")]
+        if _arena_overlay_visible {
+            return arena_overlay_command(key)
                 .map(KeyDispatch::Command)
                 .unwrap_or(KeyDispatch::Consumed);
         }
@@ -201,6 +238,24 @@ impl KeymapDispatcher {
         key_event_bytes(key)
             .map(KeyDispatch::ForwardToFocusedPane)
             .unwrap_or(KeyDispatch::Consumed)
+    }
+}
+
+#[cfg(feature = "arena")]
+fn arena_overlay_command(key: KeyEvent) -> Option<TuiCommand> {
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => Some(TuiCommand::ArenaNext),
+        KeyCode::Up | KeyCode::Char('k') => Some(TuiCommand::ArenaPrevious),
+        KeyCode::Char('a') | KeyCode::Enter => Some(TuiCommand::ArenaAdopt),
+        KeyCode::Esc | KeyCode::Char('q') => Some(TuiCommand::CloseOverlay),
+        _ => None,
     }
 }
 
@@ -313,6 +368,9 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Up => Some(TuiCommand::Focus(FocusDirection::Up)),
         KeyCode::Down => Some(TuiCommand::Focus(FocusDirection::Down)),
         KeyCode::Char('s') => Some(TuiCommand::ShowSessionList),
+        #[cfg(feature = "arena")]
+        KeyCode::Char('a') => Some(TuiCommand::ShowArenaOverlay),
+        #[cfg(not(feature = "arena"))]
         KeyCode::Char('a') => Some(TuiCommand::ShowAgentList),
         KeyCode::Char('m') => Some(TuiCommand::ShowMessageBus),
         #[cfg(feature = "activity-feed")]
@@ -481,6 +539,63 @@ mod tests {
                 true
             ),
             KeyDispatch::Command(TuiCommand::FocusFeedEntry)
+        );
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn prefixed_a_maps_to_arena_overlay_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        assert_eq!(
+            dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL)),
+            KeyDispatch::PrefixStarted
+        );
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('a'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ShowArenaOverlay));
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_overlay_maps_navigation_and_adopt() {
+        let mut dispatcher = KeymapDispatcher::default();
+
+        assert_eq!(
+            dispatcher.dispatch_with_arena_context(
+                key(KeyCode::Char('j'), KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
+            KeyDispatch::Command(TuiCommand::ArenaNext)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_arena_context(
+                key(KeyCode::Char('k'), KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
+            KeyDispatch::Command(TuiCommand::ArenaPrevious)
+        );
+        assert_eq!(
+            dispatcher.dispatch_with_arena_context(
+                key(KeyCode::Char('a'), KeyModifiers::NONE),
+                false,
+                false,
+                false,
+                false,
+                true,
+                false,
+            ),
+            KeyDispatch::Command(TuiCommand::ArenaAdopt)
         );
     }
 

@@ -258,6 +258,11 @@ impl TuiSessionRenderer {
             render_message_bus(area, state, buffer);
         }
 
+        #[cfg(feature = "arena")]
+        if state.arena_overlay_visible() {
+            render_arena_overlay(area, state, buffer);
+        }
+
         if let Some(notice) = state.runtime_notice() {
             render_runtime_notice(area, notice, buffer);
         }
@@ -509,6 +514,106 @@ pub fn render_activity_feed(area: Rect, state: &TuiSessionState, buffer: &mut Bu
                 Style::default().fg(Color::White)
             },
         );
+    }
+}
+
+#[cfg(feature = "arena")]
+pub fn render_arena_overlay(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let popup = centered_rect(
+        area,
+        area.width.saturating_sub(4).max(48),
+        area.height.saturating_sub(4).clamp(8, 22),
+    );
+    Clear.render(popup, buffer);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title("Arena Candidates")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    block.render(popup, buffer);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    write_line(
+        buffer,
+        inner.x,
+        inner.y,
+        inner.width,
+        "j/k select | a adopt | Esc/q close",
+        Style::default().fg(Color::DarkGray).bg(Color::Black),
+    );
+
+    if state.arena_candidates().is_empty() {
+        write_line(
+            buffer,
+            inner.x,
+            inner.y.saturating_add(2),
+            inner.width,
+            "no arena candidates",
+            Style::default().fg(Color::White).bg(Color::Black),
+        );
+        return;
+    }
+
+    let count = state.arena_candidates().len();
+    let gap = if count > 1 { 1 } else { 0 };
+    let panel_width = inner
+        .width
+        .saturating_sub(u16::try_from(gap * count.saturating_sub(1)).unwrap_or(0))
+        / u16::try_from(count).unwrap_or(1).max(1);
+    if panel_width == 0 {
+        return;
+    }
+
+    for (index, candidate) in state.arena_candidates().iter().enumerate() {
+        let Ok(index_u16) = u16::try_from(index) else {
+            break;
+        };
+        let x = inner.x + index_u16.saturating_mul(panel_width.saturating_add(1));
+        if x >= inner.x.saturating_add(inner.width) {
+            break;
+        }
+        let selected = index == state.arena_selected_index();
+        let style = if selected {
+            Style::default().fg(Color::Black).bg(Color::White)
+        } else {
+            Style::default().fg(Color::White).bg(Color::Black)
+        };
+        let badge_style = match candidate.test_status.as_str() {
+            "passed" => Style::default().fg(Color::Green).bg(Color::Black),
+            "failed" => Style::default().fg(Color::Red).bg(Color::Black),
+            _ => Style::default().fg(Color::Yellow).bg(Color::Black),
+        };
+        let lines = [
+            format!("{} {}", if selected { ">" } else { " " }, candidate.name),
+            format!("provider {}", candidate.provider),
+            format!("diff     {}", candidate.diff_stat),
+            format!("test     {}", candidate.test_status),
+            format!("summary  {}", candidate.summary),
+            format!("id       {}", candidate.worktree_id),
+        ];
+        for (row, line) in lines.iter().enumerate() {
+            let Ok(row) = u16::try_from(row) else {
+                break;
+            };
+            let y = inner.y.saturating_add(2).saturating_add(row);
+            if y >= inner.y.saturating_add(inner.height) {
+                break;
+            }
+            write_line(
+                buffer,
+                x,
+                y,
+                panel_width.min(inner.x.saturating_add(inner.width).saturating_sub(x)),
+                &truncate_to_width(line, panel_width),
+                if row == 3 { badge_style } else { style },
+            );
+        }
     }
 }
 
@@ -1042,6 +1147,60 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Activity Feed"));
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn render_arena_overlay_with_empty_state_does_not_panic() {
+        let mut state = TuiSessionState::default();
+        state.apply_command(crate::keymap::TuiCommand::ShowArenaOverlay);
+        let area = Rect::new(0, 0, 80, 12);
+        let mut buffer = Buffer::empty(area);
+
+        render_arena_overlay(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Arena Candidates"));
+        assert!(rendered.contains("no arena candidates"));
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn render_session_draws_arena_overlay() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "protocol_version": 3,
+            "agents": [],
+            "arena_candidates": [
+                {
+                    "worktree_id": "wt_001",
+                    "name": "agentmux/task-a",
+                    "provider": "codex",
+                    "diff_stat": "1 file changed",
+                    "test_status": "passed",
+                    "summary": "ready"
+                }
+            ]
+        }));
+        state.apply_command(crate::keymap::TuiCommand::ShowArenaOverlay);
+        let area = Rect::new(0, 0, 120, 18);
+        let mut buffer = Buffer::empty(area);
+
+        TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+        let rendered = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Arena Candidates"));
+        assert!(rendered.contains("codex"));
+        assert!(rendered.contains("passed"));
+        assert!(rendered.contains("wt_001"));
     }
 
     #[cfg(feature = "activity-feed")]

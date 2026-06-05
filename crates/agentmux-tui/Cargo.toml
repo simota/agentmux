@@ -9,6 +9,7 @@ description = "Ratatui layout, pane rendering, keymap, and overlays for the agen
 
 [features]
 activity-feed = []
+arena = []
 
 [dependencies]
 agentmux-agent = { workspace = true }
