@@ -200,6 +200,49 @@ pub struct SitrepEntry {
     pub needs_attention: bool,
 }
 
+#[cfg(feature = "arena")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArenaCandidateState {
+    pub worktree_id: String,
+    pub name: String,
+    pub provider: String,
+    pub diff_stat: String,
+    pub test_status: String,
+    pub summary: String,
+}
+
+#[cfg(feature = "arena")]
+impl ArenaCandidateState {
+    fn from_payload(payload: &Value) -> Option<Self> {
+        let worktree_id = string_field(payload, "worktree_id")?;
+        Some(Self {
+            name: string_field(payload, "name")
+                .or_else(|| string_field(payload, "branch_name"))
+                .unwrap_or_else(|| worktree_id.clone()),
+            worktree_id,
+            provider: string_field(payload, "provider").unwrap_or_else(|| "-".to_string()),
+            diff_stat: string_field(payload, "diff_stat").unwrap_or_else(|| "-".to_string()),
+            test_status: string_field(payload, "test_status")
+                .unwrap_or_else(|| "pending".to_string()),
+            summary: string_field(payload, "summary").unwrap_or_default(),
+        })
+    }
+
+    fn from_worktree_created(payload: &Value) -> Option<Self> {
+        let worktree = payload.get("worktree").unwrap_or(payload);
+        let worktree_id = string_field(worktree, "worktree_id")
+            .or_else(|| string_field(payload, "worktree_id"))?;
+        Some(Self {
+            name: string_field(worktree, "branch_name").unwrap_or_else(|| worktree_id.clone()),
+            worktree_id,
+            provider: string_field(payload, "provider").unwrap_or_else(|| "-".to_string()),
+            diff_stat: "-".to_string(),
+            test_status: "pending".to_string(),
+            summary: string_field(payload, "summary").unwrap_or_default(),
+        })
+    }
+}
+
 /// Pure state for one attached TUI client.
 pub struct TuiSessionState {
     panes: BTreeMap<String, AgentPaneState>,
@@ -227,6 +270,12 @@ pub struct TuiSessionState {
     activity_feed_selected: usize,
     #[cfg(feature = "activity-feed")]
     feed_filter: EventFeedFilter,
+    #[cfg(feature = "arena")]
+    arena_overlay_visible: bool,
+    #[cfg(feature = "arena")]
+    arena_candidates: Vec<ArenaCandidateState>,
+    #[cfg(feature = "arena")]
+    arena_selected: usize,
     daemon_protocol_version: Option<u32>,
     runtime_notice: Option<String>,
 }
@@ -265,6 +314,12 @@ impl TuiSessionState {
             activity_feed_selected: 0,
             #[cfg(feature = "activity-feed")]
             feed_filter: EventFeedFilter::default(),
+            #[cfg(feature = "arena")]
+            arena_overlay_visible: false,
+            #[cfg(feature = "arena")]
+            arena_candidates: Vec::new(),
+            #[cfg(feature = "arena")]
+            arena_selected: 0,
             daemon_protocol_version: None,
             runtime_notice: None,
         }
@@ -421,6 +476,21 @@ impl TuiSessionState {
     #[cfg(feature = "activity-feed")]
     pub fn feed_filter(&self) -> &EventFeedFilter {
         &self.feed_filter
+    }
+
+    #[cfg(feature = "arena")]
+    pub fn arena_overlay_visible(&self) -> bool {
+        self.arena_overlay_visible
+    }
+
+    #[cfg(feature = "arena")]
+    pub fn arena_candidates(&self) -> &[ArenaCandidateState] {
+        &self.arena_candidates
+    }
+
+    #[cfg(feature = "arena")]
+    pub fn arena_selected_index(&self) -> usize {
+        self.arena_selected
     }
 
     #[cfg(feature = "activity-feed")]
@@ -596,6 +666,37 @@ impl TuiSessionState {
                 .selected_feed_agent_id()
                 .map(CommandEffect::FocusPaneById)
                 .unwrap_or(CommandEffect::Continue),
+            #[cfg(feature = "arena")]
+            TuiCommand::ShowArenaOverlay => {
+                self.arena_overlay_visible = !self.arena_overlay_visible;
+                if self.arena_overlay_visible {
+                    self.keybinding_help_visible = false;
+                    self.session_list_visible = false;
+                    self.message_bus_visible = false;
+                    self.provider_picker_visible = false;
+                    #[cfg(feature = "activity-feed")]
+                    {
+                        self.activity_feed_visible = false;
+                    }
+                    self.clamp_arena_selection();
+                }
+                CommandEffect::Continue
+            }
+            #[cfg(feature = "arena")]
+            TuiCommand::ArenaNext => {
+                self.move_arena_selection(1);
+                CommandEffect::Continue
+            }
+            #[cfg(feature = "arena")]
+            TuiCommand::ArenaPrevious => {
+                self.move_arena_selection(-1);
+                CommandEffect::Continue
+            }
+            #[cfg(feature = "arena")]
+            TuiCommand::ArenaAdopt => self
+                .selected_arena_worktree_id()
+                .map(CommandEffect::ArenaAdopt)
+                .unwrap_or(CommandEffect::Continue),
             TuiCommand::ToggleMessageDetails => {
                 if self.message_bus_visible
                     || self
@@ -628,6 +729,10 @@ impl TuiSessionState {
                 {
                     self.activity_feed_visible = false;
                 }
+                #[cfg(feature = "arena")]
+                {
+                    self.arena_overlay_visible = false;
+                }
                 self.clear_copy_selection();
                 CommandEffect::Continue
             }
@@ -646,6 +751,10 @@ impl TuiSessionState {
         {
             self.activity_feed_visible = false;
         }
+        #[cfg(feature = "arena")]
+        {
+            self.arena_overlay_visible = false;
+        }
         if self.provider_picker_selected >= PROVIDER_OPTIONS.len() {
             self.provider_picker_selected = 0;
         }
@@ -661,6 +770,10 @@ impl TuiSessionState {
         #[cfg(feature = "activity-feed")]
         {
             self.activity_feed_visible = false;
+        }
+        #[cfg(feature = "arena")]
+        {
+            self.arena_overlay_visible = false;
         }
         self.clear_copy_selection();
     }
@@ -722,6 +835,34 @@ impl TuiSessionState {
             .get(self.activity_feed_selected)
             .and_then(|entry| entry.focus_agent_id.clone())
             .filter(|agent_id| self.pane(agent_id).is_some())
+    }
+
+    #[cfg(feature = "arena")]
+    fn move_arena_selection(&mut self, delta: isize) {
+        let count = self.arena_candidates.len();
+        if count == 0 {
+            self.arena_selected = 0;
+            return;
+        }
+        let count = isize::try_from(count).unwrap_or(isize::MAX);
+        let current = isize::try_from(self.arena_selected).unwrap_or(0);
+        self.arena_selected = (current + delta).rem_euclid(count) as usize;
+    }
+
+    #[cfg(feature = "arena")]
+    fn clamp_arena_selection(&mut self) {
+        if self.arena_candidates.is_empty() {
+            self.arena_selected = 0;
+        } else if self.arena_selected >= self.arena_candidates.len() {
+            self.arena_selected = self.arena_candidates.len() - 1;
+        }
+    }
+
+    #[cfg(feature = "arena")]
+    fn selected_arena_worktree_id(&self) -> Option<String> {
+        self.arena_candidates
+            .get(self.arena_selected)
+            .map(|candidate| candidate.worktree_id.clone())
     }
 
     fn move_provider_selection(&mut self, delta: isize) {
@@ -802,6 +943,8 @@ impl TuiSessionState {
             .or(self.daemon_protocol_version);
 
         let Some(agents) = payload.get("agents").and_then(|value| value.as_array()) else {
+            #[cfg(feature = "arena")]
+            self.apply_arena_candidates_payload(payload);
             return 0;
         };
 
@@ -852,6 +995,8 @@ impl TuiSessionState {
         }
 
         self.clamp_session_list_selection();
+        #[cfg(feature = "arena")]
+        self.apply_arena_candidates_payload(payload);
         applied
     }
 
@@ -968,7 +1113,97 @@ impl TuiSessionState {
             IpcEventKind::MessageCreated | IpcEventKind::MessageDelivered => {
                 self.apply_message_event(event)
             }
+            #[cfg(feature = "arena")]
+            IpcEventKind::WorktreeCreated
+            | IpcEventKind::WorktreeDiffCaptured
+            | IpcEventKind::WorktreeTestCompleted
+            | IpcEventKind::WorktreeAdoptRequested => self.apply_arena_event(event),
             _ => StateChange::Ignored,
+        }
+    }
+
+    #[cfg(feature = "arena")]
+    fn apply_arena_candidates_payload(&mut self, payload: &Value) {
+        let Some(candidates) = payload.get("arena_candidates").and_then(Value::as_array) else {
+            return;
+        };
+        self.arena_candidates = candidates
+            .iter()
+            .filter_map(ArenaCandidateState::from_payload)
+            .collect();
+        self.clamp_arena_selection();
+    }
+
+    #[cfg(feature = "arena")]
+    fn apply_arena_event(&mut self, event: &DaemonEvent) -> StateChange {
+        match event.kind {
+            IpcEventKind::WorktreeCreated => {
+                let Some(candidate) = ArenaCandidateState::from_worktree_created(&event.payload)
+                else {
+                    return StateChange::Ignored;
+                };
+                self.upsert_arena_candidate(candidate);
+                StateChange::UpdatedMessages
+            }
+            IpcEventKind::WorktreeDiffCaptured => {
+                let Some(worktree_id) = string_field(&event.payload, "worktree_id") else {
+                    return StateChange::Ignored;
+                };
+                let stat = string_field(&event.payload, "stat").unwrap_or_else(|| "-".to_string());
+                self.update_arena_candidate(&worktree_id, |candidate| candidate.diff_stat = stat);
+                StateChange::UpdatedMessages
+            }
+            IpcEventKind::WorktreeTestCompleted => {
+                let Some(worktree_id) = string_field(&event.payload, "worktree_id") else {
+                    return StateChange::Ignored;
+                };
+                let status =
+                    string_field(&event.payload, "status").unwrap_or_else(|| "-".to_string());
+                self.update_arena_candidate(&worktree_id, |candidate| {
+                    candidate.test_status = status
+                });
+                StateChange::UpdatedMessages
+            }
+            IpcEventKind::WorktreeAdoptRequested => {
+                let Some(worktree_id) = string_field(&event.payload, "worktree_id") else {
+                    return StateChange::Ignored;
+                };
+                let approval_id =
+                    string_field(&event.payload, "approval_id").unwrap_or_else(|| "-".to_string());
+                self.update_arena_candidate(&worktree_id, |candidate| {
+                    candidate.summary = format!("approval {approval_id}")
+                });
+                StateChange::UpdatedMessages
+            }
+            _ => StateChange::Ignored,
+        }
+    }
+
+    #[cfg(feature = "arena")]
+    fn upsert_arena_candidate(&mut self, candidate: ArenaCandidateState) {
+        if let Some(existing) = self
+            .arena_candidates
+            .iter_mut()
+            .find(|existing| existing.worktree_id == candidate.worktree_id)
+        {
+            *existing = candidate;
+        } else {
+            self.arena_candidates.push(candidate);
+        }
+        self.clamp_arena_selection();
+    }
+
+    #[cfg(feature = "arena")]
+    fn update_arena_candidate<F>(&mut self, worktree_id: &str, update: F)
+    where
+        F: FnOnce(&mut ArenaCandidateState),
+    {
+        if let Some(candidate) = self
+            .arena_candidates
+            .iter_mut()
+            .find(|candidate| candidate.worktree_id == worktree_id)
+        {
+            update(candidate);
         }
     }
 
@@ -1186,6 +1421,8 @@ pub enum CommandEffect {
     },
     #[cfg(feature = "activity-feed")]
     FocusPaneById(String),
+    #[cfg(feature = "arena")]
+    ArenaAdopt(String),
     StopPane(String),
     RefreshMessages,
     Unhandled(TuiCommand),
@@ -1419,6 +1656,8 @@ fn event_kind_label(kind: &IpcEventKind) -> &'static str {
         IpcEventKind::ApprovalDecided => "approval.decided",
         IpcEventKind::WorktreeCreated => "worktree.created",
         IpcEventKind::WorktreeDiffCaptured => "worktree.diff_captured",
+        IpcEventKind::WorktreeAdoptRequested => "worktree.adopt_requested",
+        IpcEventKind::WorktreeTestCompleted => "worktree.test_completed",
         IpcEventKind::PolicyDenied => "policy.denied",
         IpcEventKind::Error => "error",
     }
@@ -1824,6 +2063,111 @@ mod tests {
             state.apply_command(TuiCommand::FocusFeedEntry),
             CommandEffect::FocusPaneById("agent_001".to_string())
         );
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_events_update_candidates_and_adopt_effect() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::WorktreeCreated,
+            json!({
+                "worktree": {
+                    "worktree_id": "wt_001",
+                    "branch_name": "agentmux/task-a"
+                },
+                "provider": "codex"
+            }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::WorktreeDiffCaptured,
+            json!({ "worktree_id": "wt_001", "stat": "1 file changed" }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::WorktreeTestCompleted,
+            json!({ "worktree_id": "wt_001", "status": "passed" }),
+        ));
+
+        assert_eq!(state.arena_candidates().len(), 1);
+        assert_eq!(state.arena_candidates()[0].provider, "codex");
+        assert_eq!(state.arena_candidates()[0].diff_stat, "1 file changed");
+        assert_eq!(state.arena_candidates()[0].test_status, "passed");
+        assert_eq!(
+            state.apply_command(TuiCommand::ArenaAdopt),
+            CommandEffect::ArenaAdopt("wt_001".to_string())
+        );
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_adopt_with_empty_selection_is_noop() {
+        let mut state = TuiSessionState::default();
+
+        assert_eq!(
+            state.apply_command(TuiCommand::ShowArenaOverlay),
+            CommandEffect::Continue
+        );
+        assert!(state.arena_overlay_visible());
+        assert_eq!(
+            state.apply_command(TuiCommand::ArenaAdopt),
+            CommandEffect::Continue
+        );
+        assert_eq!(state.arena_selected_index(), 0);
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_candidate_refresh_clamps_selection_while_overlay_is_open() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "protocol_version": 3,
+            "agents": [],
+            "arena_candidates": [
+                { "worktree_id": "wt_001", "provider": "claude" },
+                { "worktree_id": "wt_002", "provider": "codex" }
+            ]
+        }));
+        state.apply_command(TuiCommand::ShowArenaOverlay);
+        state.apply_command(TuiCommand::ArenaPrevious);
+
+        assert_eq!(state.arena_selected_index(), 1);
+
+        state.apply_daemon_status(&json!({
+            "protocol_version": 3,
+            "agents": [],
+            "arena_candidates": [
+                { "worktree_id": "wt_001", "provider": "claude" }
+            ]
+        }));
+
+        assert_eq!(state.arena_selected_index(), 0);
+        assert_eq!(
+            state.apply_command(TuiCommand::ArenaAdopt),
+            CommandEffect::ArenaAdopt("wt_001".to_string())
+        );
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn daemon_status_seeds_arena_candidates() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "protocol_version": 3,
+            "agents": [],
+            "arena_candidates": [
+                {
+                    "worktree_id": "wt_001",
+                    "agent_id": "agent_001",
+                    "provider": "claude",
+                    "diff_stat": "2 files changed",
+                    "test_status": "failed"
+                }
+            ]
+        }));
+
+        assert_eq!(state.arena_candidates().len(), 1);
+        assert_eq!(state.arena_candidates()[0].worktree_id, "wt_001");
+        assert_eq!(state.arena_candidates()[0].test_status, "failed");
     }
 
     #[test]
