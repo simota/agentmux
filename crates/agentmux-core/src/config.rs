@@ -73,6 +73,10 @@ impl AgentmuxConfig {
             "automation.human_input_quiet_ms",
             self.automation.human_input_quiet_ms,
         )?;
+        validate_positive(
+            "automation.result_detection_tail_bytes",
+            self.automation.result_detection_tail_bytes as u64,
+        )?;
 
         for (field, value) in [
             (
@@ -184,6 +188,18 @@ impl AgentmuxConfig {
                     .required_bool("automation.auto_approve_shell_commands")?,
                 auto_full_access: parsed.required_bool("automation.auto_full_access")?,
                 human_input_quiet_ms: parsed.required_u64("automation.human_input_quiet_ms")?,
+                message_inject_send_delay_ms: parsed.optional_u64_or(
+                    "automation.message_inject_send_delay_ms",
+                    DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
+                )?,
+                message_paste_enter_delay_ms: parsed.optional_u64_or(
+                    "automation.message_paste_enter_delay_ms",
+                    DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS,
+                )?,
+                result_detection_tail_bytes: parsed.optional_usize_or(
+                    "automation.result_detection_tail_bytes",
+                    DEFAULT_RESULT_DETECTION_TAIL_BYTES,
+                )?,
             },
             policy: PolicyConfig {
                 allow_read_only_commands: parsed
@@ -270,7 +286,20 @@ pub struct AutomationConfig {
     pub auto_approve_shell_commands: bool,
     pub auto_full_access: bool,
     pub human_input_quiet_ms: u64,
+    /// Settle delay before writing an injected message into the target PTY, giving
+    /// the agent TUI composer time to finish drip-rendering the previous turn.
+    pub message_inject_send_delay_ms: u64,
+    /// Delay inserted between the bracketed-paste body and the trailing Enter so the
+    /// two byte sequences land in separate PTY read chunks (otherwise crossterm
+    /// coalesces the `\r` into the paste buffer instead of treating it as a submit).
+    pub message_paste_enter_delay_ms: u64,
+    /// Upper bound on the PTY output tail scanned for `AGENTMUX_RESULT` markers.
+    pub result_detection_tail_bytes: usize,
 }
+
+pub const DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS: u64 = 5000;
+pub const DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS: u64 = 120;
+pub const DEFAULT_RESULT_DETECTION_TAIL_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicyConfig {
@@ -404,6 +433,20 @@ impl ParsedConfig {
             .get(key)
             .map(|value| parse_bool(key, value))
             .unwrap_or(Ok(false))
+    }
+
+    fn optional_u64_or(&self, key: &str, default: u64) -> Result<u64> {
+        self.values
+            .get(key)
+            .map(|value| parse_u64(key, value))
+            .unwrap_or(Ok(default))
+    }
+
+    fn optional_usize_or(&self, key: &str, default: usize) -> Result<usize> {
+        self.values
+            .get(key)
+            .map(|value| parse_usize(key, value))
+            .unwrap_or(Ok(default))
     }
 
     fn required_usize(&self, key: &str) -> Result<usize> {
@@ -807,5 +850,75 @@ mod tests {
         assert_eq!(config.test.default_command, "cargo test");
 
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn automation_config_parses_three_new_fields_from_toml() {
+        // The example config contains explicit non-default-looking values that
+        // happen to match the defaults; verify the round-trip so any future
+        // change to the example is caught immediately.
+        let config = AgentmuxConfig::parse_str(EXAMPLE_CONFIG).unwrap();
+        assert_eq!(
+            config.automation.message_inject_send_delay_ms,
+            DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
+            "message_inject_send_delay_ms parsed from example TOML"
+        );
+        assert_eq!(
+            config.automation.message_paste_enter_delay_ms,
+            DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS,
+            "message_paste_enter_delay_ms parsed from example TOML"
+        );
+        assert_eq!(
+            config.automation.result_detection_tail_bytes,
+            DEFAULT_RESULT_DETECTION_TAIL_BYTES,
+            "result_detection_tail_bytes parsed from example TOML"
+        );
+    }
+
+    #[test]
+    fn automation_config_absent_new_fields_fall_back_to_defaults() {
+        // Strip all three optional lines so they are truly absent.
+        let stripped = EXAMPLE_CONFIG
+            .lines()
+            .filter(|l| {
+                !l.starts_with("message_inject_send_delay_ms")
+                    && !l.starts_with("message_paste_enter_delay_ms")
+                    && !l.starts_with("result_detection_tail_bytes")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let config = AgentmuxConfig::parse_str(&stripped).unwrap();
+        assert_eq!(
+            config.automation.message_inject_send_delay_ms,
+            DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
+            "absent message_inject_send_delay_ms must default to 5000"
+        );
+        assert_eq!(
+            config.automation.message_paste_enter_delay_ms,
+            DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS,
+            "absent message_paste_enter_delay_ms must default to 120"
+        );
+        assert_eq!(
+            config.automation.result_detection_tail_bytes,
+            DEFAULT_RESULT_DETECTION_TAIL_BYTES,
+            "absent result_detection_tail_bytes must default to 65536"
+        );
+    }
+
+    #[test]
+    fn automation_config_rejects_zero_result_detection_tail_bytes() {
+        // validate_positive rejects 0; confirm the error names the field.
+        let invalid = EXAMPLE_CONFIG.replace(
+            "result_detection_tail_bytes = 65536",
+            "result_detection_tail_bytes = 0",
+        );
+        let error = AgentmuxConfig::parse_str(&invalid).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("automation.result_detection_tail_bytes"),
+            "error must name the field, got: {error}"
+        );
     }
 }

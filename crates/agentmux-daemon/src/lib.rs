@@ -21,6 +21,10 @@ use agentmux_agent::{
 use agentmux_context::{
     ContextBroker, ContextItem, ContextPackRequest, MailboxConfig, NewContextItem,
 };
+use agentmux_core::config::{
+    AutomationConfig, ContextConfig, DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
+    DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS, DEFAULT_RESULT_DETECTION_TAIL_BYTES,
+};
 use agentmux_core::{
     AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ApprovalId, ClientId,
     ClientSessionId, ContextItemId, ContextKind, ContextScope, ContextSource, DateTimeUtc,
@@ -113,6 +117,61 @@ struct ArenaCandidate {
     test_status: Option<TestRunStatus>,
 }
 
+/// Timing and size knobs that drive message injection into agent PTYs.
+///
+/// Sourced from `AutomationConfig` (+ `ContextConfig.max_inline_chars`) so the
+/// previously hardcoded constants can be tuned per project. The `Default` impl
+/// reproduces the historical production values; tests construct a zero-delay
+/// variant via [`InjectionTiming::test`] so injection runs instantly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InjectionTiming {
+    /// Settle delay before writing an injected message into the target PTY.
+    send_delay: Duration,
+    /// Delay between the bracketed-paste body and the trailing Enter.
+    paste_enter_delay: Duration,
+    /// Upper bound on the PTY tail scanned for `AGENTMUX_RESULT` markers.
+    result_detection_tail_bytes: usize,
+    /// Inline-context budget used when rendering an injected message prompt.
+    max_inline_chars: usize,
+}
+
+impl InjectionTiming {
+    /// Build timing from project config (`[automation]` + `[context]`).
+    fn from_config(automation: &AutomationConfig, context: &ContextConfig) -> Self {
+        Self {
+            send_delay: Duration::from_millis(automation.message_inject_send_delay_ms),
+            paste_enter_delay: Duration::from_millis(automation.message_paste_enter_delay_ms),
+            result_detection_tail_bytes: automation.result_detection_tail_bytes,
+            max_inline_chars: context.max_inline_chars,
+        }
+    }
+
+    /// Zero-delay variant used by tests so injection completes instantly while
+    /// preserving byte ordering and size limits.
+    #[cfg(test)]
+    fn test() -> Self {
+        Self {
+            send_delay: Duration::ZERO,
+            paste_enter_delay: Duration::ZERO,
+            ..Self::default()
+        }
+    }
+}
+
+impl Default for InjectionTiming {
+    fn default() -> Self {
+        Self {
+            send_delay: Duration::from_millis(DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS),
+            paste_enter_delay: Duration::from_millis(DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS),
+            result_detection_tail_bytes: DEFAULT_RESULT_DETECTION_TAIL_BYTES,
+            max_inline_chars: DEFAULT_MAX_INLINE_CHARS,
+        }
+    }
+}
+
+/// Fallback inline-context budget when no `[context]` config is wired in.
+const DEFAULT_MAX_INLINE_CHARS: usize = 2048;
+
 struct DaemonState {
     clients: BTreeMap<ClientSessionId, Option<AgentSessionId>>,
     agents: BTreeMap<AgentSessionId, LiveAgentSession>,
@@ -124,10 +183,19 @@ struct DaemonState {
     approvals: ApprovalQueue,
     layout_presets: BTreeMap<String, serde_json::Value>,
     default_project_id: ProjectId,
+    injection_timing: InjectionTiming,
 }
 
 impl Default for DaemonState {
     fn default() -> Self {
+        // Tests rely on instant injection; production uses the historical
+        // 5s settle / 120ms paste-enter timing. Real config can override the
+        // timing via `DaemonRuntime::with_injection_config`.
+        #[cfg(test)]
+        let injection_timing = InjectionTiming::test();
+        #[cfg(not(test))]
+        let injection_timing = InjectionTiming::default();
+
         Self {
             clients: BTreeMap::new(),
             agents: BTreeMap::new(),
@@ -139,6 +207,7 @@ impl Default for DaemonState {
             approvals: ApprovalQueue::new(),
             layout_presets: BTreeMap::new(),
             default_project_id: ProjectId::new(),
+            injection_timing,
         }
     }
 }
@@ -162,6 +231,19 @@ impl DaemonRuntime {
 
     pub fn with_event_log(mut self, event_log: EventLog) -> Self {
         self.event_log = Some(event_log);
+        self
+    }
+
+    /// Override message-injection timing/size knobs from project config
+    /// (`[automation]` + `[context]`). Without this, the daemon uses the
+    /// historical production defaults (5s settle, 120ms paste-enter, 64KiB tail).
+    pub async fn with_injection_config(
+        self,
+        automation: &AutomationConfig,
+        context: &ContextConfig,
+    ) -> Self {
+        self.state.write().await.injection_timing =
+            InjectionTiming::from_config(automation, context);
         self
     }
 
@@ -364,6 +446,12 @@ impl DaemonRuntime {
         let runtime = self.clone();
         let events = self.events.clone();
         tokio::spawn(async move {
+            let result_detection_tail_bytes = runtime
+                .state
+                .read()
+                .await
+                .injection_timing
+                .result_detection_tail_bytes;
             let mut output_tail = String::new();
             // Content-hash dedup across the session lifetime (drip/repaint emits
             // the same result repeatedly; distinct results must still persist).
@@ -379,7 +467,7 @@ impl DaemonRuntime {
                         }
                         let text = String::from_utf8_lossy(&bytes).into_owned();
                         output_tail.push_str(&text);
-                        trim_result_detection_tail(&mut output_tail);
+                        trim_result_detection_tail(&mut output_tail, result_detection_tail_bytes);
                         let _ = events.send(DaemonEvent::new(
                             IpcEventKind::PtyOutputChunk,
                             json!({
@@ -716,15 +804,7 @@ impl DaemonRuntime {
     pub async fn inject_message(&self, id: &MessageId) -> Result<AgentMessage> {
         let now = DateTimeUtc::now_utc();
         let prepared = self.prepare_manual_message_injection(id, now).await?;
-        tokio::time::sleep(message_inject_send_delay()).await;
-        let write_result = self.write_prepared_message_injection(&prepared).await;
-        self.finish_and_emit_message_injection(
-            &prepared.message_id,
-            &prepared.agent_id,
-            now,
-            write_result,
-        )
-        .await
+        self.settle_write_and_finish(&prepared, now).await
     }
 
     pub async fn inject_message_to_agent(
@@ -736,8 +816,27 @@ impl DaemonRuntime {
         let prepared = self
             .prepare_manual_message_injection_for_agent(id, agent_id, now)
             .await?;
-        tokio::time::sleep(message_inject_send_delay()).await;
-        let write_result = self.write_prepared_message_injection(&prepared).await;
+        self.settle_write_and_finish(&prepared, now).await
+    }
+
+    /// Wait the settle delay, write the prepared injection into the target PTY,
+    /// then finish and emit the delivery event. Shared by the manual-inject and
+    /// idle-delivery paths.
+    ///
+    /// The settle delay gives the target TUI composer time to finish
+    /// drip-rendering the previous turn before it receives bracketed-paste
+    /// input. The delay is `Duration::ZERO` in tests (see `InjectionTiming`), so
+    /// the sleep is a no-op there and delivery still completes end-to-end.
+    async fn settle_write_and_finish(
+        &self,
+        prepared: &PreparedInjection,
+        now: DateTimeUtc,
+    ) -> Result<AgentMessage> {
+        let send_delay = self.state.read().await.injection_timing.send_delay;
+        if !send_delay.is_zero() {
+            tokio::time::sleep(send_delay).await;
+        }
+        let write_result = self.write_prepared_message_injection(prepared).await;
         self.finish_and_emit_message_injection(
             &prepared.message_id,
             &prepared.agent_id,
@@ -807,21 +906,7 @@ impl DaemonRuntime {
             return Ok(None);
         };
 
-        // Settle delay: the target TUI composer may still be drip-rendering the previous
-        // turn and not yet ready to accept bracketed-paste input. Wait before writing to
-        // the PTY, mirroring the same delay used by the manual inject_message path.
-        // message_inject_send_delay() returns Duration::ZERO under #[cfg(test)].
-        tokio::time::sleep(message_inject_send_delay()).await;
-
-        let write_result = self.write_prepared_message_injection(&prepared).await;
-        let message = self
-            .finish_and_emit_message_injection(
-                &prepared.message_id,
-                &prepared.agent_id,
-                now,
-                write_result,
-            )
-            .await?;
+        let message = self.settle_write_and_finish(&prepared, now).await?;
         Ok(Some(message))
     }
 
@@ -879,22 +964,8 @@ impl DaemonRuntime {
                 recipients.len()
             )));
         };
-        let (provider, context) = delivery_render_inputs(&state, agent_id, &message)?;
-        let thread = message
-            .thread_id
-            .as_ref()
-            .and_then(|thread_id| state.messages.get_thread(thread_id))
-            .cloned();
-        let prompt = agentmux_message::render_prompt(&message, provider, &context, thread.as_ref());
-        state
-            .messages
-            .update_delivery_status(id, DeliveryStatus::Injecting, now)?;
-
-        Ok(PreparedInjection {
-            message_id: id.clone(),
-            agent_id: agent_id.clone(),
-            prompt,
-        })
+        let agent_id = agent_id.clone();
+        prepare_message_injection_for_resolved(&mut state, id, &agent_id, &message, now)
     }
 
     async fn prepare_manual_message_injection_for_agent(
@@ -914,55 +985,79 @@ impl DaemonRuntime {
                 "unknown agent session '{agent_id}'"
             )));
         }
-        let (provider, context) = delivery_render_inputs(&state, agent_id, &message)?;
-        let thread = message
-            .thread_id
-            .as_ref()
-            .and_then(|thread_id| state.messages.get_thread(thread_id))
-            .cloned();
-        let prompt = agentmux_message::render_prompt(&message, provider, &context, thread.as_ref());
-        state
-            .messages
-            .update_delivery_status(id, DeliveryStatus::Injecting, now)?;
-
-        Ok(PreparedInjection {
-            message_id: id.clone(),
-            agent_id: agent_id.clone(),
-            prompt,
-        })
+        prepare_message_injection_for_resolved(&mut state, id, agent_id, &message, now)
     }
 
-    async fn write_prepared_message_injection(&self, prepared: &PreparedInjection) -> Result<()> {
-        let script = message_input_script(prepared);
-        self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_CREATED, &script)?;
-
-        {
-            let state = self.state.read().await;
-            let Some(agent) = state.agents.get(&prepared.agent_id) else {
-                return Err(AgentmuxError::UserError(format!(
-                    "unknown agent session '{}'",
-                    prepared.agent_id
-                )));
-            };
-            let Some(pty) = &agent.pty else {
-                return Err(AgentmuxError::UserError(format!(
-                    "agent session '{}' has no live PTY",
-                    prepared.agent_id
-                )));
-            };
-            let mut pty = pty.lock().map_err(|_| {
-                AgentmuxError::Internal(format!(
-                    "PTY lock for agent '{}' is poisoned",
-                    prepared.agent_id
-                ))
-            })?;
-            for action in &script.actions {
-                match encode_input_action(action)? {
-                    EncodedInputStep::Bytes(bytes) => pty.write_bytes(&bytes)?,
-                    EncodedInputStep::Wait(duration) => std::thread::sleep(duration),
+    /// Write an input script's actions to an agent's PTY, preserving byte order
+    /// while never blocking the Tokio worker across a `Wait`.
+    ///
+    /// Each contiguous run of byte-steps is flushed under a short-lived
+    /// `state.read()` + PTY `Mutex` lock that is dropped *before* the
+    /// subsequent `Wait` is awaited with `tokio::time::sleep`. No std `Mutex`
+    /// guard is ever held across an `.await`, and the observable timing (the
+    /// 120ms paste→enter gap) is unchanged.
+    async fn write_input_actions_to_agent_pty(
+        &self,
+        agent_id: &AgentSessionId,
+        actions: &[InputAction],
+    ) -> Result<()> {
+        let mut pending: Vec<u8> = Vec::new();
+        for action in actions {
+            match encode_input_action(action)? {
+                EncodedInputStep::Bytes(bytes) => pending.extend_from_slice(&bytes),
+                EncodedInputStep::Wait(duration) => {
+                    // Flush everything written so far, release all locks, then
+                    // sleep asynchronously without holding the PTY mutex. A zero
+                    // wait is skipped entirely so it introduces no scheduler yield
+                    // (matching the previous in-lock `thread::sleep(ZERO)`).
+                    self.write_bytes_to_agent_pty(agent_id, &pending).await?;
+                    pending.clear();
+                    if !duration.is_zero() {
+                        tokio::time::sleep(duration).await;
+                    }
                 }
             }
         }
+        self.write_bytes_to_agent_pty(agent_id, &pending).await
+    }
+
+    /// Write a byte buffer to an agent's PTY under a short-lived lock.
+    ///
+    /// The `state.read()` guard and the PTY `std::sync::Mutex` guard are both
+    /// confined to a non-async scope and dropped before this function returns,
+    /// so no guard can leak across an `.await` in the caller.
+    async fn write_bytes_to_agent_pty(
+        &self,
+        agent_id: &AgentSessionId,
+        bytes: &[u8],
+    ) -> Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let state = self.state.read().await;
+        let Some(agent) = state.agents.get(agent_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        };
+        let Some(pty) = &agent.pty else {
+            return Err(AgentmuxError::UserError(format!(
+                "agent session '{agent_id}' has no live PTY"
+            )));
+        };
+        let mut pty = pty.lock().map_err(|_| {
+            AgentmuxError::Internal(format!("PTY lock for agent '{agent_id}' is poisoned"))
+        })?;
+        pty.write_bytes(bytes)
+    }
+
+    async fn write_prepared_message_injection(&self, prepared: &PreparedInjection) -> Result<()> {
+        let paste_enter_delay = self.state.read().await.injection_timing.paste_enter_delay;
+        let script = message_input_script(prepared, paste_enter_delay);
+        self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_CREATED, &script)?;
+
+        self.write_input_actions_to_agent_pty(&prepared.agent_id, &script.actions)
+            .await?;
 
         self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_INJECTED, &script)?;
         self.publish(DaemonEvent::new(
@@ -2000,33 +2095,8 @@ impl DaemonRuntime {
     pub async fn send_input_script(&self, script: &InputScript) -> Result<()> {
         self.append_input_script_event("input_script.created", script)?;
 
-        {
-            let state = self.state.read().await;
-            let Some(agent) = state.agents.get(&script.target_agent_id) else {
-                return Err(AgentmuxError::UserError(format!(
-                    "unknown agent session '{}'",
-                    script.target_agent_id
-                )));
-            };
-            let Some(pty) = &agent.pty else {
-                return Err(AgentmuxError::UserError(format!(
-                    "agent session '{}' has no live PTY",
-                    script.target_agent_id
-                )));
-            };
-            let mut pty = pty.lock().map_err(|_| {
-                AgentmuxError::Internal(format!(
-                    "PTY lock for agent '{}' is poisoned",
-                    script.target_agent_id
-                ))
-            })?;
-            for action in &script.actions {
-                match encode_input_action(action)? {
-                    EncodedInputStep::Bytes(bytes) => pty.write_bytes(&bytes)?,
-                    EncodedInputStep::Wait(duration) => std::thread::sleep(duration),
-                }
-            }
-        }
+        self.write_input_actions_to_agent_pty(&script.target_agent_id, &script.actions)
+            .await?;
 
         self.append_input_script_event("input_script.injected", script)?;
         self.publish(DaemonEvent::new(
@@ -3538,6 +3608,34 @@ fn parse_shell_stub_result(agent_name: &str, stdout: &str) -> Result<AgentResult
     }
 }
 
+/// Render inputs + prompt for an already-resolved recipient, mark the message
+/// `Injecting`, and build the `PreparedInjection`. Shared by both manual-inject
+/// preparation paths (auto-resolved target vs. explicitly chosen agent).
+fn prepare_message_injection_for_resolved(
+    state: &mut DaemonState,
+    id: &MessageId,
+    agent_id: &AgentSessionId,
+    message: &AgentMessage,
+    now: DateTimeUtc,
+) -> Result<PreparedInjection> {
+    let (provider, context) = delivery_render_inputs(state, agent_id, message)?;
+    let thread = message
+        .thread_id
+        .as_ref()
+        .and_then(|thread_id| state.messages.get_thread(thread_id))
+        .cloned();
+    let prompt = agentmux_message::render_prompt(message, provider, &context, thread.as_ref());
+    state
+        .messages
+        .update_delivery_status(id, DeliveryStatus::Injecting, now)?;
+
+    Ok(PreparedInjection {
+        message_id: id.clone(),
+        agent_id: agent_id.clone(),
+        prompt,
+    })
+}
+
 fn delivery_render_inputs(
     state: &DaemonState,
     agent_id: &AgentSessionId,
@@ -3557,7 +3655,7 @@ fn delivery_render_inputs(
             project_id: state.default_project_id.clone(),
             task_id: message.task_id.clone(),
             attached_context_ids: message.context_refs.clone(),
-            max_inline_chars: 2048,
+            max_inline_chars: state.injection_timing.max_inline_chars,
         },
         MailboxConfig {
             project_root,
@@ -3582,7 +3680,12 @@ fn message_prompt_context_from_pack(pack: agentmux_context::ContextPack) -> Prom
     }
 }
 
-fn message_input_script(prepared: &PreparedInjection) -> InputScript {
+/// Build the three-action injection script: PasteText, a `paste_enter_delay`
+/// Wait, then PressEnter.  The Wait ensures the paste body and the trailing `\r`
+/// land in separate PTY read chunks; without it Codex's crossterm bracketed-paste
+/// handler coalesces the `\r` into the paste buffer instead of treating it as a
+/// submit keypress.  The delay is sourced from `InjectionTiming` (config-driven).
+fn message_input_script(prepared: &PreparedInjection, paste_enter_delay: Duration) -> InputScript {
     InputScript {
         id: InputScriptId::new(),
         target_agent_id: prepared.agent_id.clone(),
@@ -3590,36 +3693,12 @@ fn message_input_script(prepared: &PreparedInjection) -> InputScript {
         preconditions: Vec::new(),
         actions: vec![
             InputAction::PasteText(prepared.prompt.clone()),
-            InputAction::Wait(message_paste_enter_delay()),
+            InputAction::Wait(paste_enter_delay),
             InputAction::PressEnter,
         ],
         safety: InputSafety::Safe,
         created_at: DateTimeUtc::now_utc(),
     }
-}
-
-#[cfg(not(test))]
-fn message_inject_send_delay() -> Duration {
-    Duration::from_secs(5)
-}
-
-#[cfg(test)]
-fn message_inject_send_delay() -> Duration {
-    Duration::ZERO
-}
-
-/// Delay inserted between PasteText and PressEnter inside `message_input_script`
-/// to ensure the two byte sequences land in separate PTY read chunks.  Without
-/// this gap, Codex's crossterm bracketed-paste handler coalesces the trailing
-/// `\r` into the paste buffer instead of treating it as a submit keypress.
-#[cfg(not(test))]
-fn message_paste_enter_delay() -> Duration {
-    Duration::from_millis(120)
-}
-
-#[cfg(test)]
-fn message_paste_enter_delay() -> Duration {
-    Duration::ZERO
 }
 
 fn provider_for_agent_name(name: &str) -> AgentProvider {
@@ -3703,18 +3782,15 @@ fn agent_input_ready(agent: &LiveAgentSession) -> bool {
         )
 }
 
-fn trim_result_detection_tail(output_tail: &mut String) {
-    const MAX_RESULT_DETECTION_TAIL: usize = 64 * 1024;
-    if output_tail.len() <= MAX_RESULT_DETECTION_TAIL {
+fn trim_result_detection_tail(output_tail: &mut String, max_tail_bytes: usize) {
+    if output_tail.len() <= max_tail_bytes {
         return;
     }
 
     let keep_from = output_tail
         .char_indices()
         .rev()
-        .find_map(|(index, _)| {
-            (output_tail.len() - index <= MAX_RESULT_DETECTION_TAIL).then_some(index)
-        })
+        .find_map(|(index, _)| (output_tail.len() - index <= max_tail_bytes).then_some(index))
         .unwrap_or(0);
     output_tail.drain(..keep_from);
 }
@@ -4464,7 +4540,7 @@ mod tests {
             agent_id: AgentSessionId::new(),
             prompt: "hello world".to_string(),
         };
-        let script = message_input_script(&prepared);
+        let script = message_input_script(&prepared, Duration::from_millis(120));
         assert_eq!(
             script.actions.len(),
             3,
@@ -4482,6 +4558,57 @@ mod tests {
             matches!(script.actions[2], InputAction::PressEnter),
             "third action must be PressEnter"
         );
+    }
+
+    /// Regression: the split-write path in `write_input_actions_to_agent_pty`
+    /// flushes pending bytes, releases the PTY lock, awaits the sleep, then
+    /// re-acquires the lock for the next write.  Byte ordering must be preserved:
+    /// bracketed-paste bytes first, then (after the Wait) the `\r` enter byte —
+    /// even when the Wait duration is zero (cfg(test)).
+    #[test]
+    fn split_write_path_preserves_paste_then_enter_byte_order() {
+        let prepared = PreparedInjection {
+            message_id: MessageId::new(),
+            agent_id: AgentSessionId::new(),
+            prompt: "order check".to_string(),
+        };
+        // Duration::ZERO mimics cfg(test) timing (no real sleep in production tests).
+        let script = message_input_script(&prepared, Duration::ZERO);
+
+        // Collect the encoded bytes in the order `write_input_actions_to_agent_pty`
+        // would flush them: each Wait boundary produces a separate flush, so we
+        // split on Wait actions and verify the byte sequences on each side.
+        let mut chunks: Vec<Vec<u8>> = Vec::new();
+        let mut current: Vec<u8> = Vec::new();
+        for action in &script.actions {
+            match encode_input_action(action).expect("encoding must succeed") {
+                EncodedInputStep::Bytes(bytes) => current.extend_from_slice(&bytes),
+                EncodedInputStep::Wait(_) => {
+                    chunks.push(std::mem::take(&mut current));
+                }
+            }
+        }
+        if !current.is_empty() {
+            chunks.push(current);
+        }
+
+        // Chunk 0: bracketed-paste wrapping the prompt text.
+        assert_eq!(chunks.len(), 2, "one chunk before Wait, one after");
+        assert!(
+            chunks[0].starts_with(b"\x1b[200~"),
+            "chunk 0 must start with bracketed-paste open"
+        );
+        assert!(
+            chunks[0].ends_with(b"\x1b[201~"),
+            "chunk 0 must end with bracketed-paste close"
+        );
+        assert!(
+            chunks[0].windows(11).any(|w| w == b"order check"),
+            "chunk 0 must contain the prompt body"
+        );
+
+        // Chunk 1: the submit Enter byte, written after the Wait.
+        assert_eq!(chunks[1], b"\r", "chunk 1 must be exactly the carriage-return enter byte");
     }
 
     #[test]
@@ -6610,9 +6737,9 @@ AGENTMUX_RESULT:
 
     /// Regression test for the settle-delay fix in `deliver_idle_messages_for_agent`.
     ///
-    /// After the fix, `deliver_idle_messages_for_agent` awaits `message_inject_send_delay()`
-    /// (Duration::ZERO under cfg(test)) before writing to the PTY.  This test confirms that
-    /// the added sleep does NOT break delivery: the message still reaches the live PTY and
+    /// After the fix, `deliver_idle_messages_for_agent` awaits the settle delay
+    /// (`InjectionTiming::send_delay`, Duration::ZERO under cfg(test)) before writing to the
+    /// PTY.  This test confirms that the added sleep does NOT break delivery: the message still reaches the live PTY and
     /// is returned with DeliveryStatus::Delivered.
     #[tokio::test]
     async fn deliver_idle_messages_settle_delay_does_not_break_delivery() {
@@ -6656,7 +6783,7 @@ AGENTMUX_RESULT:
             .expect("message is created");
 
         // Directly call `deliver_idle_messages_for_agent` (the auto idle-delivery path).
-        // In cfg(test) message_inject_send_delay() == Duration::ZERO, so the settle sleep
+        // In cfg(test) `InjectionTiming::send_delay` == Duration::ZERO, so the settle sleep
         // is a no-op and delivery must still succeed end-to-end.
         let delivered = tokio::time::timeout(
             Duration::from_secs(5),

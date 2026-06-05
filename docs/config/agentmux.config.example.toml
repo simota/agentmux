@@ -27,6 +27,12 @@ auto_approve_file_edits = false
 auto_approve_shell_commands = false
 auto_full_access = false
 human_input_quiet_ms = 2500
+# Settle delay (ms) before writing an injected message into the target PTY.
+message_inject_send_delay_ms = 5000
+# Delay (ms) between the bracketed-paste body and the trailing Enter.
+message_paste_enter_delay_ms = 120
+# Upper bound (bytes) on the PTY tail scanned for AGENTMUX_RESULT markers.
+result_detection_tail_bytes = 65536
 
 [policy]
 allow_read_only_commands = "Ask"
