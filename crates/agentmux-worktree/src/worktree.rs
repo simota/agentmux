@@ -79,6 +79,14 @@ pub struct CapturedDiff {
     pub stat: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeOutcome {
+    Clean,
+    Dirty,
+    Conflict,
+}
+
 /// Project-configured test command to run in a target worktree.
 #[derive(Debug, Clone)]
 pub struct TestCommand {
@@ -207,6 +215,76 @@ impl WorktreeManager {
         }
         run_git(&self.repo_root, args)?;
         Ok(())
+    }
+
+    pub fn merge_to_integration_branch(
+        &self,
+        worktree: &Worktree,
+        integration_branch: &str,
+    ) -> Result<MergeOutcome> {
+        validate_git_ref_name(&worktree.branch_name, "worktree.branch_name")?;
+        validate_git_ref_name(&worktree.base_branch, "worktree.base_branch")?;
+        validate_git_ref_name(integration_branch, "integration_branch")?;
+        validate_worktree_path(&worktree.path)?;
+
+        ensure_repo_root_clean(&self.repo_root)?;
+        let original_head = current_head(&self.repo_root)?;
+        let result = (|| {
+            checkout_or_create_branch(&self.repo_root, integration_branch, &worktree.base_branch)?;
+            run_git(
+                &self.repo_root,
+                [
+                    OsStr::new("reset"),
+                    OsStr::new("--hard"),
+                    OsStr::new(&worktree.base_branch),
+                ],
+            )?;
+            let merge_output = run_git_raw(
+                &self.repo_root,
+                [
+                    OsStr::new("merge"),
+                    OsStr::new("--no-commit"),
+                    OsStr::new("--no-ff"),
+                    OsStr::new(&worktree.branch_name),
+                ],
+            )?;
+
+            if !merge_output.status.success() {
+                let conflicts = unresolved_conflicts(&self.repo_root)?;
+                if !conflicts.is_empty() {
+                    abort_conflicted_merge(&self.repo_root, &conflicts)?;
+                    return Ok(MergeOutcome::Conflict);
+                }
+                return Err(git_failure("git merge failed", merge_output));
+            }
+
+            if integration_branch_is_dirty(&self.repo_root)? {
+                run_git(
+                    &self.repo_root,
+                    [
+                        OsStr::new("-c"),
+                        OsStr::new("user.name=Agentmux"),
+                        OsStr::new("-c"),
+                        OsStr::new("user.email=agentmux@example.invalid"),
+                        OsStr::new("commit"),
+                        OsStr::new("-m"),
+                        OsStr::new(&format!(
+                            "Promote worktree {} into {integration_branch}",
+                            worktree.id
+                        )),
+                    ],
+                )?;
+                return Ok(MergeOutcome::Dirty);
+            }
+
+            Ok(MergeOutcome::Clean)
+        })();
+        let restore = restore_head(&self.repo_root, &original_head);
+        match (result, restore) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(_), Err(error)) | (Err(_), Err(error)) => Err(error),
+        }
     }
 
     pub fn capture_diff_artifact(
@@ -544,7 +622,116 @@ fn utf8_stdout(output: Output, command: &str) -> Result<String> {
     })
 }
 
+fn checkout_or_create_branch(repo_root: &Path, branch: &str, base_branch: &str) -> Result<()> {
+    let checkout = run_git_raw(repo_root, [OsStr::new("checkout"), OsStr::new(branch)])?;
+    if checkout.status.success() {
+        return Ok(());
+    }
+
+    run_git(
+        repo_root,
+        [
+            OsStr::new("checkout"),
+            OsStr::new("-b"),
+            OsStr::new(branch),
+            OsStr::new(base_branch),
+        ],
+    )?;
+    Ok(())
+}
+
+fn current_head(repo_root: &Path) -> Result<String> {
+    let branch = run_git_raw(
+        repo_root,
+        [
+            OsStr::new("symbolic-ref"),
+            OsStr::new("--quiet"),
+            OsStr::new("--short"),
+            OsStr::new("HEAD"),
+        ],
+    )?;
+    if branch.status.success() {
+        return Ok(utf8_stdout(branch, "git symbolic-ref --short HEAD")?
+            .trim()
+            .to_string());
+    }
+
+    Ok(utf8_stdout(
+        run_git(repo_root, [OsStr::new("rev-parse"), OsStr::new("HEAD")])?,
+        "git rev-parse HEAD",
+    )?
+    .trim()
+    .to_string())
+}
+
+fn restore_head(repo_root: &Path, head: &str) -> Result<()> {
+    run_git(repo_root, [OsStr::new("checkout"), OsStr::new(head)])?;
+    Ok(())
+}
+
+fn ensure_repo_root_clean(repo_root: &Path) -> Result<()> {
+    if integration_branch_is_dirty(repo_root)? {
+        return Err(AgentmuxError::UserError(
+            "repo_root must be clean before promoting a worktree".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn unresolved_conflicts(repo_root: &Path) -> Result<String> {
+    let output = run_git(
+        repo_root,
+        [
+            OsStr::new("diff"),
+            OsStr::new("--name-only"),
+            OsStr::new("--diff-filter=U"),
+        ],
+    )?;
+    utf8_stdout(output, "git diff --name-only --diff-filter=U")
+}
+
+fn abort_conflicted_merge(repo_root: &Path, conflicts: &str) -> Result<()> {
+    let abort = run_git_raw(repo_root, [OsStr::new("merge"), OsStr::new("--abort")])?;
+    if !abort.status.success() {
+        return Err(AgentmuxError::UserError(format!(
+            "git merge conflicted in {} and merge --abort failed: {}",
+            conflicts.trim(),
+            git_failure("git merge --abort failed", abort)
+        )));
+    }
+    if repo_root.join(".git/MERGE_HEAD").exists() {
+        return Err(AgentmuxError::UserError(format!(
+            "git merge conflicted in {} and merge --abort left MERGE_HEAD",
+            conflicts.trim()
+        )));
+    }
+    Ok(())
+}
+
+fn integration_branch_is_dirty(repo_root: &Path) -> Result<bool> {
+    let output = run_git(
+        repo_root,
+        [
+            OsStr::new("status"),
+            OsStr::new("--porcelain"),
+            OsStr::new("--untracked-files=no"),
+        ],
+    )?;
+    Ok(!utf8_stdout(output, "git status --porcelain")?
+        .trim()
+        .is_empty())
+}
+
 fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a OsStr>) -> Result<Output> {
+    let output = run_git_raw(repo_root, args)?;
+    if !output.status.success() {
+        return Err(git_failure("git worktree failed", output));
+    }
+
+    Ok(output)
+}
+
+fn run_git_raw<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a OsStr>) -> Result<Output> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo_root)
@@ -552,16 +739,14 @@ fn run_git<'a>(repo_root: &Path, args: impl IntoIterator<Item = &'a OsStr>) -> R
         .output()
         .map_err(|error| AgentmuxError::ProviderError(format!("failed to run git: {error}")))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if stderr.is_empty() { stdout } else { stderr };
-        return Err(AgentmuxError::UserError(format!(
-            "git worktree failed: {detail}"
-        )));
-    }
-
     Ok(output)
+}
+
+fn git_failure(prefix: &str, output: Output) -> AgentmuxError {
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let detail = if stderr.is_empty() { stdout } else { stderr };
+    AgentmuxError::UserError(format!("{prefix}: {detail}"))
 }
 
 fn run_shell_command(worktree_path: &Path, command: &str) -> Result<Output> {
@@ -689,6 +874,273 @@ branch refs/heads/agentmux/task-codex
         assert!(!worktree.path.exists());
         let listed = manager.list_worktrees().unwrap();
         assert!(!listed.iter().any(|entry| entry.path == worktree.path));
+    }
+
+    #[test]
+    fn merge_to_integration_branch_returns_clean_when_branch_has_no_changes() {
+        let fixture = GitFixture::new();
+        fixture.init_with_readme();
+        let manager = WorktreeManager::new(
+            ProjectId::new(),
+            fixture.repo.clone(),
+            fixture.repo.join(".agentmux/worktrees"),
+        )
+        .unwrap();
+        let worktree = manager
+            .create_worktree(CreateWorktree {
+                task_id: TaskId::new(),
+                task_slug: "Task 123".to_string(),
+                agent_name: "Codex".to_string(),
+                owner_agent_id: None,
+                base_branch: "main".to_string(),
+            })
+            .unwrap();
+
+        let outcome = manager
+            .merge_to_integration_branch(&worktree, "agentmux/integration")
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::Clean);
+        assert_eq!(fixture.git_stdout(["branch", "--show-current"]), "main\n");
+        assert_eq!(
+            fixture.git_stdout(["status", "--porcelain", "--untracked-files=no"]),
+            ""
+        );
+    }
+
+    #[test]
+    fn merge_to_integration_branch_returns_dirty_for_successful_merge() {
+        let fixture = GitFixture::new();
+        fixture.init_with_readme();
+        let manager = WorktreeManager::new(
+            ProjectId::new(),
+            fixture.repo.clone(),
+            fixture.repo.join(".agentmux/worktrees"),
+        )
+        .unwrap();
+        let worktree = manager
+            .create_worktree(CreateWorktree {
+                task_id: TaskId::new(),
+                task_slug: "Task 123".to_string(),
+                agent_name: "Codex".to_string(),
+                owner_agent_id: None,
+                base_branch: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(worktree.path.join("feature.txt"), "candidate\n").unwrap();
+        fixture.git_in(&worktree.path, ["add", "feature.txt"]);
+        fixture.git_in(
+            &worktree.path,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "candidate",
+            ],
+        );
+
+        let outcome = manager
+            .merge_to_integration_branch(&worktree, "agentmux/integration")
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::Dirty);
+        assert_eq!(fixture.git_stdout(["branch", "--show-current"]), "main\n");
+        assert_eq!(
+            fixture.git_stdout(["status", "--porcelain", "--untracked-files=no"]),
+            ""
+        );
+        assert!(!fixture.repo.join("feature.txt").exists());
+        fixture.git(["checkout", "agentmux/integration"]);
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("feature.txt")).unwrap(),
+            "candidate\n"
+        );
+        assert_eq!(
+            fixture.git_stdout(["diff", "--name-only", "--diff-filter=U"]),
+            ""
+        );
+    }
+
+    #[test]
+    fn merge_to_integration_branch_aborts_on_conflict() {
+        let fixture = GitFixture::new();
+        fixture.init_with_readme();
+        let manager = WorktreeManager::new(
+            ProjectId::new(),
+            fixture.repo.clone(),
+            fixture.repo.join(".agentmux/worktrees"),
+        )
+        .unwrap();
+        let worktree = manager
+            .create_worktree(CreateWorktree {
+                task_id: TaskId::new(),
+                task_slug: "Task 123".to_string(),
+                agent_name: "Codex".to_string(),
+                owner_agent_id: None,
+                base_branch: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(worktree.path.join("README.md"), "candidate\n").unwrap();
+        fixture.git_in(&worktree.path, ["add", "README.md"]);
+        fixture.git_in(
+            &worktree.path,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "candidate",
+            ],
+        );
+        fixture.git(["checkout", "main"]);
+        fs::write(fixture.repo.join("README.md"), "base advanced\n").unwrap();
+        fixture.git(["add", "README.md"]);
+        fixture.git([
+            "-c",
+            "user.name=Agentmux Test",
+            "-c",
+            "user.email=agentmux@example.invalid",
+            "commit",
+            "-m",
+            "base advanced",
+        ]);
+
+        let outcome = manager
+            .merge_to_integration_branch(&worktree, "agentmux/integration")
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::Conflict);
+        assert_eq!(fixture.git_stdout(["branch", "--show-current"]), "main\n");
+        assert_eq!(
+            fixture.git_stdout(["status", "--porcelain", "--untracked-files=no"]),
+            ""
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("README.md")).unwrap(),
+            "base advanced\n"
+        );
+        fixture.git(["checkout", "agentmux/integration"]);
+        assert_eq!(
+            fixture.git_stdout(["diff", "--name-only", "--diff-filter=U"]),
+            ""
+        );
+        assert!(!fixture.repo.join(".git/MERGE_HEAD").exists());
+    }
+
+    #[test]
+    fn merge_to_integration_branch_errors_when_repo_root_is_dirty_before_starting() {
+        let fixture = GitFixture::new();
+        fixture.init_with_readme();
+        let manager = WorktreeManager::new(
+            ProjectId::new(),
+            fixture.repo.clone(),
+            fixture.repo.join(".agentmux/worktrees"),
+        )
+        .unwrap();
+        let first = manager
+            .create_worktree(CreateWorktree {
+                task_id: TaskId::new(),
+                task_slug: "Task 123".to_string(),
+                agent_name: "Codex".to_string(),
+                owner_agent_id: None,
+                base_branch: "main".to_string(),
+            })
+            .unwrap();
+        fs::write(first.path.join("feature-a.txt"), "candidate a\n").unwrap();
+        fixture.git_in(&first.path, ["add", "feature-a.txt"]);
+        fixture.git_in(
+            &first.path,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "candidate-a",
+            ],
+        );
+        fs::write(fixture.repo.join("README.md"), "dirty\n").unwrap();
+
+        let error = manager
+            .merge_to_integration_branch(&first, "agentmux/integration")
+            .expect_err("dirty repo_root is rejected");
+
+        assert!(error.to_string().contains("repo_root must be clean"));
+        assert_eq!(fixture.git_stdout(["branch", "--show-current"]), "main\n");
+        assert_eq!(
+            fixture.git_stdout(["diff", "--name-only", "--diff-filter=U"]),
+            ""
+        );
+    }
+
+    #[test]
+    fn merge_to_integration_branch_refreshes_existing_integration_from_base() {
+        let fixture = GitFixture::new();
+        fixture.init_with_readme();
+        let manager = WorktreeManager::new(
+            ProjectId::new(),
+            fixture.repo.clone(),
+            fixture.repo.join(".agentmux/worktrees"),
+        )
+        .unwrap();
+        let worktree = manager
+            .create_worktree(CreateWorktree {
+                task_id: TaskId::new(),
+                task_slug: "Task 123".to_string(),
+                agent_name: "Codex".to_string(),
+                owner_agent_id: None,
+                base_branch: "main".to_string(),
+            })
+            .unwrap();
+        fixture.git(["checkout", "-b", "agentmux/integration", "main"]);
+        fixture.git(["checkout", "main"]);
+        fs::write(fixture.repo.join("base.txt"), "advanced\n").unwrap();
+        fixture.git(["add", "base.txt"]);
+        fixture.git([
+            "-c",
+            "user.name=Agentmux Test",
+            "-c",
+            "user.email=agentmux@example.invalid",
+            "commit",
+            "-m",
+            "base advanced",
+        ]);
+        fs::write(worktree.path.join("feature.txt"), "candidate\n").unwrap();
+        fixture.git_in(&worktree.path, ["add", "feature.txt"]);
+        fixture.git_in(
+            &worktree.path,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "candidate",
+            ],
+        );
+
+        let outcome = manager
+            .merge_to_integration_branch(&worktree, "agentmux/integration")
+            .unwrap();
+
+        assert_eq!(outcome, MergeOutcome::Dirty);
+        assert_eq!(fixture.git_stdout(["branch", "--show-current"]), "main\n");
+        fixture.git(["checkout", "agentmux/integration"]);
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("base.txt")).unwrap(),
+            "advanced\n"
+        );
+        assert_eq!(
+            fs::read_to_string(fixture.repo.join("feature.txt")).unwrap(),
+            "candidate\n"
+        );
     }
 
     #[test]
@@ -856,6 +1308,26 @@ branch refs/heads/agentmux/task-codex
         }
 
         fn git<const N: usize>(&self, args: [&str; N]) {
+            self.git_in(&self.repo, args);
+        }
+
+        fn git_in<const N: usize>(&self, cwd: &Path, args: [&str; N]) {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        fn git_stdout<const N: usize>(&self, args: [&str; N]) -> String {
             let output = Command::new("git")
                 .arg("-C")
                 .arg(&self.repo)
@@ -869,6 +1341,7 @@ branch refs/heads/agentmux/task-codex
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
+            String::from_utf8(output.stdout).unwrap()
         }
     }
 
