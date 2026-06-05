@@ -303,6 +303,15 @@ impl vte::Perform for GridPerformer<'_> {
         }
 
         match action {
+            'h' => self.set_mode(params, intermediates, true),
+            'l' => self.set_mode(params, intermediates, false),
+            // Sequences with private markers / intermediates (e.g. XTMODKEYS
+            // `CSI > 4;2 m`, kitty keyboard `CSI > 1 u` / `CSI < u`, DECSCUSR
+            // `CSI SP q`) are not SGR/cursor commands. Routing them into the
+            // standard handlers corrupts state — `CSI > 4;2 m` would set
+            // underline+dim for the rest of the session because the agent never
+            // emits an SGR reset for attributes it believes it never enabled.
+            _ if !intermediates.is_empty() => {}
             '@' => self.grid().insert_blank_chars(Self::param(params, 0, 1)),
             'A' => self
                 .grid()
@@ -347,8 +356,6 @@ impl vte::Perform for GridPerformer<'_> {
             's' => self.save_cursor(),
             'u' => self.restore_cursor(),
             'm' => self.apply_sgr(params),
-            'h' => self.set_mode(params, intermediates, true),
-            'l' => self.set_mode(params, intermediates, false),
             _ => {}
         }
     }
@@ -443,6 +450,32 @@ mod tests {
 
         assert_eq!(parser.grid().cursor().col, 4);
         assert_eq!(parser.grid().line_text(0).as_deref(), Some("変換    "));
+    }
+
+    #[test]
+    fn xtmodkeys_sequence_is_not_applied_as_sgr() {
+        let mut parser = TerminalParser::new(2, 8);
+
+        // Real Claude Code startup prefix: kitty keyboard pop/push, XTMODKEYS
+        // modifyOtherKeys=2, synchronized output. None of these are SGR.
+        parser.advance(b"\x1b[?25l\x1b[<u\x1b[>1u\x1b[>4;2m\x1b[?2026hA");
+
+        let cell = parser.grid().cell(0, 0).expect("printed cell");
+        assert_eq!(cell.ch, 'A');
+        assert!(!cell.style.underline, "CSI >4;2m must not set underline");
+        assert!(!cell.style.dim, "CSI >4;2m must not set dim");
+    }
+
+    #[test]
+    fn kitty_keyboard_sequences_do_not_restore_cursor() {
+        let mut parser = TerminalParser::new(2, 4);
+
+        // Save at (0,2), move to (1,0); `CSI > 1 u` (kitty push) must not be
+        // treated as SCORC cursor restore.
+        parser.advance(b"\x1b[1;3H\x1b[s\x1b[2;1H\x1b[>1u\x1b[<uX");
+
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("    "));
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("X   "));
     }
 
     #[test]
