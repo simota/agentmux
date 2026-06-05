@@ -13,6 +13,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agentmux_core::{AgentmuxConfig, AgentmuxError, error::Result};
+#[cfg(feature = "arena")]
+use agentmux_ipc::ARENA_PROTOCOL_VERSION;
 use agentmux_ipc::{
     ClientHello, ClientRequest, DaemonResponse, DaemonStreamFrame, IpcCommand, JsonlReader,
     JsonlWriter,
@@ -295,6 +297,14 @@ enum TaskAction {
         /// Team template name (defined in `config.toml`).
         #[arg(long)]
         team: Option<String>,
+        /// Comma-separated providers to run in isolated arena worktrees.
+        #[cfg(feature = "arena")]
+        #[arg(long)]
+        arena: Option<String>,
+        /// Base branch for arena worktrees.
+        #[cfg(feature = "arena")]
+        #[arg(long)]
+        base_branch: Option<String>,
     },
     /// Show task status.
     Status { task_id: String },
@@ -578,9 +588,30 @@ async fn main() -> Result<()> {
             }
         },
         Commands::Task(args) => match args.action {
+            #[cfg(not(feature = "arena"))]
             TaskAction::Run { description, team } => {
                 let response =
                     send_daemon_request(&socket_path, task_run_request(description, team)?).await?;
+                print_response("task", response)?;
+            }
+            #[cfg(feature = "arena")]
+            TaskAction::Run {
+                description,
+                team,
+                arena,
+                base_branch,
+            } => {
+                if arena.is_some() && !daemon_supports_arena(&socket_path).await? {
+                    eprintln!(
+                        "Arena unsupported by this daemon; upgrade daemon protocol to {ARENA_PROTOCOL_VERSION} or newer."
+                    );
+                    return Ok(());
+                }
+                let response = send_daemon_request(
+                    &socket_path,
+                    task_run_request(description, team, arena, base_branch)?,
+                )
+                .await?;
                 print_response("task", response)?;
             }
             TaskAction::Status { task_id } => {
@@ -835,6 +866,7 @@ fn tui_daemon_status_request() -> ClientRequest {
     ClientRequest::new("req_tui_status", IpcCommand::DaemonStatus, json!({}))
 }
 
+#[cfg(not(feature = "arena"))]
 fn task_run_request(description: String, team: Option<String>) -> Result<ClientRequest> {
     let project_path = std::env::current_dir()
         .map_err(|error| AgentmuxError::Internal(format!("failed to resolve cwd: {error}")))?;
@@ -848,6 +880,56 @@ fn task_run_request(description: String, team: Option<String>) -> Result<ClientR
             "team": team.unwrap_or_else(|| "claude-codex".to_string()),
         }),
     ))
+}
+
+#[cfg(feature = "arena")]
+fn task_run_request(
+    description: String,
+    team: Option<String>,
+    arena: Option<String>,
+    base_branch: Option<String>,
+) -> Result<ClientRequest> {
+    let project_path = std::env::current_dir()
+        .map_err(|error| AgentmuxError::Internal(format!("failed to resolve cwd: {error}")))?;
+    let mut payload = json!({
+        "project_path": project_path,
+        "body": description,
+        "team": team.unwrap_or_else(|| "claude-codex".to_string()),
+    });
+
+    if let Some(arena) = arena {
+        let providers = arena
+            .split(',')
+            .map(str::trim)
+            .filter(|provider| !provider.is_empty())
+            .collect::<Vec<_>>();
+        if providers.is_empty() {
+            return Err(AgentmuxError::UserError(
+                "task run --arena requires at least one provider".to_string(),
+            ));
+        }
+        payload["runner"] = json!("arena");
+        payload["arena"] = json!(arena);
+        payload["providers"] = json!(providers);
+        if let Some(base_branch) = base_branch.filter(|value| !value.trim().is_empty()) {
+            payload["base_branch"] = json!(base_branch);
+        }
+    }
+
+    Ok(ClientRequest::new(
+        "req_task_run",
+        IpcCommand::TaskRun,
+        payload,
+    ))
+}
+
+#[cfg(feature = "arena")]
+fn worktree_adopt_request(worktree_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_worktree_adopt",
+        IpcCommand::WorktreeAdopt,
+        json!({ "worktree_id": worktree_id }),
+    )
 }
 
 fn attach_request(target: String) -> ClientRequest {
@@ -868,6 +950,28 @@ fn snapshot_request(target: String) -> ClientRequest {
 
 fn detach_request() -> ClientRequest {
     ClientRequest::new("req_detach", IpcCommand::ClientDetach, json!({}))
+}
+
+#[cfg(feature = "arena")]
+async fn daemon_supports_arena(socket_path: &Path) -> Result<bool> {
+    let response = send_daemon_request(socket_path, daemon_status_request()).await?;
+    if !response.ok {
+        return Ok(false);
+    }
+    Ok(response
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.get("protocol_version"))
+        .and_then(Value::as_u64)
+        .and_then(|version| u32::try_from(version).ok())
+        .is_some_and(|version| version >= ARENA_PROTOCOL_VERSION))
+}
+
+#[cfg(feature = "arena")]
+fn daemon_supports_arena_state(state: &TuiSessionState) -> bool {
+    state
+        .daemon_protocol_version()
+        .is_some_and(|version| version >= ARENA_PROTOCOL_VERSION)
 }
 
 #[cfg(feature = "activity-feed")]
@@ -2104,6 +2208,27 @@ async fn run_tui_session_inner(
                 .layout()
                 .focused()
                 .is_some_and(|pane_id| state.is_activity_feed_pane(pane_id));
+            #[cfg(all(feature = "arena", feature = "activity-feed"))]
+            let dispatch = keymap.dispatch_with_arena_context(
+                key,
+                state.session_list_visible(),
+                state.message_bus_visible(),
+                state.provider_picker_visible(),
+                conversation_list_focused,
+                state.arena_overlay_visible(),
+                activity_feed_focused,
+            );
+            #[cfg(all(feature = "arena", not(feature = "activity-feed")))]
+            let dispatch = keymap.dispatch_with_arena_context(
+                key,
+                state.session_list_visible(),
+                state.message_bus_visible(),
+                state.provider_picker_visible(),
+                conversation_list_focused,
+                state.arena_overlay_visible(),
+                false,
+            );
+            #[cfg(all(not(feature = "arena"), feature = "activity-feed"))]
             #[cfg(feature = "activity-feed")]
             let dispatch = keymap.dispatch_with_activity_feed_context(
                 key,
@@ -2113,7 +2238,7 @@ async fn run_tui_session_inner(
                 conversation_list_focused,
                 activity_feed_focused,
             );
-            #[cfg(not(feature = "activity-feed"))]
+            #[cfg(all(not(feature = "arena"), not(feature = "activity-feed")))]
             let dispatch = keymap.dispatch_with_context(
                 key,
                 state.session_list_visible(),
@@ -2179,6 +2304,15 @@ async fn run_tui_session_inner(
                     CommandEffect::FocusPaneById(agent_id) => {
                         state.layout_mut().focus(&agent_id);
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                    #[cfg(feature = "arena")]
+                    CommandEffect::ArenaAdopt(worktree_id) => {
+                        if daemon_supports_arena_state(&state) {
+                            writer.write(&worktree_adopt_request(worktree_id)).await?;
+                        } else {
+                            state.set_runtime_notice("Arena unsupported by this daemon");
+                            draw_tui_frame(&mut terminal, &renderer, &state)?;
+                        }
                     }
                     CommandEffect::StopPane(agent_id) => {
                         writer.write(&agent_stop_request(agent_id)).await?;
@@ -2960,9 +3094,18 @@ mod tests {
 
     #[test]
     fn task_run_request_matches_spec_payload() {
+        #[cfg(not(feature = "arena"))]
         let request = task_run_request(
             "refresh token bugを修正".to_string(),
             Some("claude-codex".to_string()),
+        )
+        .unwrap();
+        #[cfg(feature = "arena")]
+        let request = task_run_request(
+            "refresh token bugを修正".to_string(),
+            Some("claude-codex".to_string()),
+            None,
+            None,
         )
         .unwrap();
 
@@ -2975,9 +3118,69 @@ mod tests {
 
     #[test]
     fn task_run_defaults_to_claude_codex_team() {
+        #[cfg(not(feature = "arena"))]
         let request = task_run_request("fix failing tests".to_string(), None).unwrap();
+        #[cfg(feature = "arena")]
+        let request = task_run_request("fix failing tests".to_string(), None, None, None).unwrap();
 
         assert_eq!(request.payload["team"], "claude-codex");
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_task_run_request_sets_runner_and_providers() {
+        let request = task_run_request(
+            "compare implementations".to_string(),
+            None,
+            Some("claude,codex".to_string()),
+            Some("main".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(request.command, IpcCommand::TaskRun);
+        assert_eq!(request.payload["runner"], "arena");
+        assert_eq!(request.payload["providers"][0], "claude");
+        assert_eq!(request.payload["providers"][1], "codex");
+        assert_eq!(request.payload["base_branch"], "main");
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_task_run_request_rejects_empty_provider_list() {
+        let error = task_run_request(
+            "compare implementations".to_string(),
+            None,
+            Some(" , , ".to_string()),
+            None,
+        )
+        .expect_err("empty arena provider list is rejected");
+
+        assert!(error.to_string().contains("at least one provider"));
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_task_run_request_allows_single_provider() {
+        let request = task_run_request(
+            "compare implementation".to_string(),
+            None,
+            Some("claude".to_string()),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.payload["runner"], "arena");
+        assert_eq!(request.payload["providers"].as_array().unwrap().len(), 1);
+        assert_eq!(request.payload["providers"][0], "claude");
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_adopt_request_targets_worktree_adopt_ipc() {
+        let request = worktree_adopt_request("wt_01HX".to_string());
+
+        assert_eq!(request.command, IpcCommand::WorktreeAdopt);
+        assert_eq!(request.payload["worktree_id"], "wt_01HX");
     }
 
     #[test]
@@ -3522,6 +3725,30 @@ mod tests {
             "agents": []
         }));
         assert!(daemon_supports_event_subscribe(&state));
+    }
+
+    #[cfg(feature = "arena")]
+    #[test]
+    fn arena_actions_are_gated_by_daemon_protocol_version() {
+        let mut state = TuiSessionState::default();
+        state.apply_daemon_status(&json!({
+            "protocol_version": ARENA_PROTOCOL_VERSION - 1,
+            "agents": []
+        }));
+
+        assert!(!daemon_supports_arena_state(&state));
+
+        state.set_runtime_notice("Arena unsupported by this daemon");
+        assert_eq!(
+            state.runtime_notice(),
+            Some("Arena unsupported by this daemon")
+        );
+
+        state.apply_daemon_status(&json!({
+            "protocol_version": ARENA_PROTOCOL_VERSION,
+            "agents": []
+        }));
+        assert!(daemon_supports_arena_state(&state));
     }
 
     #[test]
