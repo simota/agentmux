@@ -103,6 +103,8 @@ v0.1では単純なembedded migrationsでよい。
 - approval.decided
 - worktree.created
 - worktree.diff_captured
+- worktree.adopt_requested
+- worktree.test_completed
 - policy.denied
 - error
 
@@ -218,7 +220,13 @@ client→daemonのread-onlyコマンド。送信後、daemonはfilter条件に�
 - context.inject
 - context.export
 
-### 7.6 Approval
+### 7.6 Worktree（Arena）
+
+- worktree.adopt
+
+`worktree.adopt` は対象 worktree の adoption approval を queue し、`approval_id` を返す。差分未 capture / test 未通過 / 既存 pending adoption が 1 件超の場合はエラーを返す。本コマンドは `ARENA_PROTOCOL_VERSION`（3）以上でのみ有効。
+
+### 7.7 Approval
 
 - approval.list
 - approval.approve
@@ -268,8 +276,9 @@ handshakeのprotocol番号は**厳密等価**で判定し、mismatch時はgracef
 
 | 定数 | 値 | 意味 |
 |---|---|---|
-| `PROTOCOL_VERSION` | 2 | 現在のprotocol番号。protocol shapeに変更があるたびにbumpする。 |
+| `PROTOCOL_VERSION` | 3 | 現在のprotocol番号。protocol shapeに変更があるたびにbumpする。 |
 | `EVENT_SUBSCRIBE_PROTOCOL_VERSION` | 2 | `event.subscribe`コマンドをサポートする最初のprotocol version。clientはdaemonの`protocol_version`がこの値以上のときだけ`event.subscribe`を送る。 |
+| `ARENA_PROTOCOL_VERSION` | 3 | `worktree.adopt`・arena run をサポートする最初のprotocol version。clientはdaemonの`protocol_version`がこの値以上のときだけarena系コマンドを送る。v2以前のdaemonへはdowngrade noticeを返す。 |
 
 ## 12. Error response
 

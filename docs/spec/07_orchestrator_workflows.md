@@ -172,10 +172,11 @@ AGENTMUX_RESULT JSONで approve/request_changes/needs_tests を返してくだ�
 
 ## 9. Integrator workflow
 
-v0.1では完全自動mergeは行わない。reviewerがapproveした候補をfinal summaryに出し、ユーザーがpromoteする。
+v0.1では完全自動mergeは行わない。reviewerがapproveした候補をfinal summaryに出し、ユーザーがpromoteまたはadoptする。
 
 ```bash
 agentmux worktree promote task-123-codex
+agentmux worktree adopt <worktree_id>   # arena runnerの場合
 ```
 
 promoteは以下を行う。
@@ -188,6 +189,24 @@ promoteは以下を行う。
 6. final diff表示
 
 commit/pushはデフォルト手動。
+
+### 9.1 Arena runner workflow（Cargo feature `arena`）
+
+`task run --arena <p1>,<p2>` で起動した task では、promote の代わりに adopt flow を使う。
+
+```text
+arena task起動
+  -> provider ごとにworktree作成 + agent spawn
+  -> 各agent: 実装 -> AGENTMUX_RESULT completed
+  -> diff capture + test capture（自動）
+  -> TUI Arena overlay で candidate を比較（Ctrl-g a）
+  -> adopt対象を選択して a/Enter
+  -> worktree.adopt -> approval queue へ積む
+  -> approval approve -> merge_to_integration_branch 実行
+  -> MergeOutcome: Clean/Dirty -> 完了 / Conflict -> WorktreeStatus::Conflicted
+```
+
+Arena overlay では provider 別の diff stat・test status・summary を横並びで比較できる。`WorktreeTestCompleted` event を受けて TUI はpollingなしで更新される。
 
 ## 10. Event-driven loop
 

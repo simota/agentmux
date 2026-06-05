@@ -146,10 +146,21 @@ struct ApprovalRequest {
     description: String,
     proposed_input: Option<InputScript>,
     command: Option<String>,
+    worktree_id: Option<WorktreeId>, // arena adopt approval で設定される
     context_refs: Vec<ContextItemId>,
     status: ApprovalStatus,
 }
 ```
+
+### 7.1 Arena adopt approval
+
+Arena worktree の adoption（`worktree.adopt`）は `ApprovalKind::GitCommit`・`RiskLevel::High` の approval として queue される。command は `git merge --no-commit --no-ff`。`worktree_id` フィールドに対象 worktree ID が入る。
+
+readiness 二段階検証:
+1. **キュー時**: diff capture 済み + tests passed + pending adoption 1 件以下。
+2. **approve 直前**: 同条件を再検証する（queue 後に状態が変わった場合に備える）。
+
+いずれかの検証が失敗した場合は approve を拒否してエラーを返す。
 
 TUI表示例:
 
