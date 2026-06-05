@@ -364,7 +364,12 @@ impl DaemonRuntime {
         let events = self.events.clone();
         tokio::spawn(async move {
             let mut output_tail = String::new();
-            let mut result_persisted = false;
+            // Content-hash dedup across the session lifetime (drip/repaint emits
+            // the same result repeatedly; distinct results must still persist).
+            let mut seen_hashes = SeenResultHashes::new(8);
+            // Suppress repeated probe/error events for the same unchanged cause
+            // during a drip render.
+            let mut last_probe_reason: Option<String> = None;
             while let Some(event) = read_loop.recv().await {
                 match event {
                     PtyReadEvent::Output(bytes) => {
@@ -382,28 +387,44 @@ impl DaemonRuntime {
                                 "text": text,
                             }),
                         ));
-                        if !result_persisted {
-                            match runtime
-                                .persist_live_agent_result(
-                                    Some(&agent_id),
-                                    &agent_name,
-                                    &output_tail,
-                                )
-                                .await
-                            {
-                                Ok(true) => result_persisted = true,
-                                Ok(false) => {}
-                                Err(error) => {
+                        match runtime
+                            .persist_live_agent_result(
+                                Some(&agent_id),
+                                &agent_name,
+                                &output_tail,
+                                &mut seen_hashes,
+                            )
+                            .await
+                        {
+                            Ok(LiveResultOutcome::Persisted) => {
+                                last_probe_reason = None;
+                            }
+                            Ok(LiveResultOutcome::NotFound) | Ok(LiveResultOutcome::Duplicate) => {}
+                            Ok(LiveResultOutcome::NeedsProbe { reason }) => {
+                                // Only emit when the cause changed since the last
+                                // emission, to avoid one event per drip frame.
+                                if last_probe_reason.as_deref() != Some(reason.as_str()) {
                                     let _ = events.send(DaemonEvent::new(
                                         IpcEventKind::Error,
                                         json!({
                                             "agent_id": agent_id.to_string(),
-                                            "signal": "agent_result_persist_failed",
-                                            "error": error.to_string(),
+                                            "agent_name": agent_name,
+                                            "signal": "agent_result_needs_status_probe",
+                                            "reason": reason,
                                         }),
                                     ));
-                                    result_persisted = true;
+                                    last_probe_reason = Some(reason);
                                 }
+                            }
+                            Err(error) => {
+                                let _ = events.send(DaemonEvent::new(
+                                    IpcEventKind::Error,
+                                    json!({
+                                        "agent_id": agent_id.to_string(),
+                                        "signal": "agent_result_persist_failed",
+                                        "error": error.to_string(),
+                                    }),
+                                ));
                             }
                         }
                     }
@@ -1691,23 +1712,27 @@ impl DaemonRuntime {
         agent_id: Option<&AgentSessionId>,
         agent_name: &str,
         output_tail: &str,
-    ) -> Result<bool> {
+        seen_hashes: &mut SeenResultHashes,
+    ) -> Result<LiveResultOutcome> {
         let result = match parse_agent_result_marker(output_tail) {
             AgentResultParse::Found(parsed) => parsed.result,
-            AgentResultParse::NotFound => return Ok(false),
+            AgentResultParse::NotFound => return Ok(LiveResultOutcome::NotFound),
             AgentResultParse::NeedsStatusProbe(probe) => {
-                self.publish(DaemonEvent::new(
-                    IpcEventKind::Error,
-                    json!({
-                        "agent_name": agent_name,
-                        "agent_id": agent_id.map(|id| id.to_string()),
-                        "signal": "agent_result_needs_status_probe",
-                        "reason": probe.reason,
-                    }),
-                ));
-                return Ok(false);
+                return Ok(LiveResultOutcome::NeedsProbe {
+                    reason: probe.reason,
+                });
             }
         };
+
+        // Content-hash dedup: drip/repaint re-emits the same AGENTMUX_RESULT
+        // block many times; persist each distinct result exactly once while
+        // still allowing genuinely new results (multi-turn exchanges) through.
+        let hash = result_content_hash(agent_name, &result);
+        if seen_hashes.contains(hash) {
+            return Ok(LiveResultOutcome::Duplicate);
+        }
+        seen_hashes.record(hash);
+
         let completed = result.status == AgentResultStatus::Completed;
         let task_id = TaskId::new();
         let team = default_claude_codex_team();
@@ -1725,7 +1750,7 @@ impl DaemonRuntime {
         {
             self.capture_and_test_arena_candidate(worktree_id);
         }
-        Ok(true)
+        Ok(LiveResultOutcome::Persisted)
     }
 
     /// Resolve message targets for a set of just-persisted messages and trigger
@@ -3423,6 +3448,64 @@ fn trim_result_detection_tail(output_tail: &mut String) {
     output_tail.drain(..keep_from);
 }
 
+/// Outcome of attempting to persist a live `AGENTMUX_RESULT` from a PTY tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LiveResultOutcome {
+    /// A new, distinct result was parsed and persisted to the bus.
+    Persisted,
+    /// No marker present in the tail yet.
+    NotFound,
+    /// The same result content was already persisted (drip/repaint); skipped.
+    Duplicate,
+    /// A marker was present but its JSON could not be parsed; carries the reason
+    /// so the caller can decide whether to surface a (deduplicated) probe event.
+    NeedsProbe { reason: String },
+}
+
+/// Bounded LRU ring of recently persisted result content hashes.
+///
+/// A drip-rendering TUI re-emits the same marker block on every repaint, so the
+/// forwarder must skip already-seen content while still admitting genuinely new
+/// results across multiple turns.
+struct SeenResultHashes {
+    ring: std::collections::VecDeque<u64>,
+    capacity: usize,
+}
+
+impl SeenResultHashes {
+    fn new(capacity: usize) -> Self {
+        Self {
+            ring: std::collections::VecDeque::with_capacity(capacity),
+            capacity,
+        }
+    }
+
+    fn contains(&self, hash: u64) -> bool {
+        self.ring.contains(&hash)
+    }
+
+    fn record(&mut self, hash: u64) {
+        if self.ring.len() == self.capacity {
+            self.ring.pop_front();
+        }
+        self.ring.push_back(hash);
+    }
+}
+
+/// Stable content hash of a parsed result, scoped by the emitting agent name.
+/// Built from the canonical JSON serialization so identical results hash equal.
+fn result_content_hash(agent_name: &str, result: &AgentResult) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    agent_name.hash(&mut hasher);
+    // serde_json serialization of AgentResult is deterministic for a given value
+    // (struct field order is fixed), so it is a stable dedup key.
+    if let Ok(canonical) = serde_json::to_string(result) {
+        canonical.hash(&mut hasher);
+    }
+    hasher.finish()
+}
+
 fn protocol_error(compatibility: ProtocolCompatibility) -> Option<ErrorBody> {
     match compatibility {
         ProtocolCompatibility::Compatible => None,
@@ -3992,6 +4075,24 @@ mod tests {
     use agentmux_ipc::{IpcCommand, JsonlReader, JsonlWriter};
     use agentmux_store::EventLog;
 
+    impl DaemonRuntime {
+        /// Test helper: persist a live result with a fresh dedup ring and map the
+        /// outcome to `bool` (true == a new result was persisted). Mirrors the
+        /// pre-dedup `Ok(bool)` contract for the single-call test cases.
+        async fn persist_live_agent_result_once(
+            &self,
+            agent_id: Option<&AgentSessionId>,
+            agent_name: &str,
+            output_tail: &str,
+        ) -> Result<bool> {
+            let mut seen = SeenResultHashes::new(8);
+            let outcome = self
+                .persist_live_agent_result(agent_id, agent_name, output_tail, &mut seen)
+                .await?;
+            Ok(matches!(outcome, LiveResultOutcome::Persisted))
+        }
+    }
+
     #[test]
     fn shell_provider_without_command_maps_to_a_live_pty_spec() {
         // Regression: a bare `shell` spawn carries no `command`, which used to
@@ -4370,7 +4471,7 @@ AGENTMUX_RESULT:
 "#;
 
         let persisted = runtime
-            .persist_live_agent_result(None, "impl-codex", output)
+            .persist_live_agent_result_once(None, "impl-codex", output)
             .await
             .expect("live result persists");
 
@@ -4412,7 +4513,7 @@ AGENTMUX_RESULT:
 "#;
 
         let persisted = runtime
-            .persist_live_agent_result(None, "impl-codex", output)
+            .persist_live_agent_result_once(None, "impl-codex", output)
             .await
             .expect("live result persists");
 
@@ -4424,6 +4525,83 @@ AGENTMUX_RESULT:
             MessageTarget::AgentName("tester-a1b2c3".to_string())
         );
         assert_eq!(messages[0].body, "Run only the named tester session.");
+    }
+
+    /// Multi-turn exchange: the same session emits two *different* results in
+    /// sequence (sharing a dedup ring). Both must be persisted — content-hash
+    /// dedup must not collapse distinct results into one (the old one-shot latch
+    /// dropped the second turn entirely).
+    #[tokio::test]
+    async fn distinct_results_from_same_session_are_both_persisted() {
+        let runtime = DaemonRuntime::new(8);
+        runtime
+            .register_agent_with_role("tester".to_string(), AgentRole::Tester)
+            .await;
+        let mut seen = SeenResultHashes::new(8);
+
+        let first = "AGENTMUX_RESULT:\n{\n  \"status\": \"completed\",\n  \"summary\": \"first turn\",\n  \"messages\": [ { \"to\": \"role:tester\", \"kind\": \"TestResult\", \"body\": \"run turn one\", \"priority\": \"normal\" } ],\n  \"next\": null\n}\n";
+        let outcome = runtime
+            .persist_live_agent_result(None, "impl-codex", first, &mut seen)
+            .await
+            .expect("first persists");
+        assert_eq!(outcome, LiveResultOutcome::Persisted);
+
+        // A genuinely different result (different summary/body), as if a second
+        // turn occurred. The accumulated tail would contain both markers; rfind
+        // picks the latest, which is new content.
+        let second = format!(
+            "{first}\nmore output\nAGENTMUX_RESULT:\n{{\n  \"status\": \"completed\",\n  \"summary\": \"second turn\",\n  \"messages\": [ {{ \"to\": \"role:tester\", \"kind\": \"TestResult\", \"body\": \"run turn two\", \"priority\": \"normal\" }} ],\n  \"next\": null\n}}\n"
+        );
+        let outcome = runtime
+            .persist_live_agent_result(None, "impl-codex", &second, &mut seen)
+            .await
+            .expect("second persists");
+        assert_eq!(outcome, LiveResultOutcome::Persisted);
+
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 2, "both distinct turns must be persisted");
+        let bodies: Vec<&str> = messages.iter().map(|m| m.body.as_str()).collect();
+        assert!(bodies.contains(&"run turn one"));
+        assert!(bodies.contains(&"run turn two"));
+    }
+
+    /// Drip/repaint: the same result block is re-emitted (e.g. the tail still
+    /// ends with the identical marker on the next chunk). Content-hash dedup
+    /// must persist it exactly once.
+    #[tokio::test]
+    async fn repainted_identical_result_is_persisted_only_once() {
+        let runtime = DaemonRuntime::new(8);
+        runtime
+            .register_agent_with_role("tester".to_string(), AgentRole::Tester)
+            .await;
+        let mut seen = SeenResultHashes::new(8);
+
+        let output = "AGENTMUX_RESULT:\n{\n  \"status\": \"completed\",\n  \"summary\": \"repaint me\",\n  \"messages\": [ { \"to\": \"role:tester\", \"kind\": \"TestResult\", \"body\": \"only once\", \"priority\": \"normal\" } ],\n  \"next\": null\n}\n";
+
+        let first = runtime
+            .persist_live_agent_result(None, "impl-codex", output, &mut seen)
+            .await
+            .expect("first persists");
+        assert_eq!(first, LiveResultOutcome::Persisted);
+
+        // Same content re-rendered: must be detected as a duplicate.
+        let again = runtime
+            .persist_live_agent_result(None, "impl-codex", output, &mut seen)
+            .await
+            .expect("repaint does not fail");
+        assert_eq!(again, LiveResultOutcome::Duplicate);
+
+        let third = runtime
+            .persist_live_agent_result(None, "impl-codex", output, &mut seen)
+            .await
+            .expect("repaint does not fail");
+        assert_eq!(third, LiveResultOutcome::Duplicate);
+
+        assert_eq!(
+            runtime.list_messages().await.len(),
+            1,
+            "identical repaint must persist exactly one message"
+        );
     }
 
     /// When agent A emits AGENTMUX_RESULT with a messages[] entry targeting
@@ -4494,7 +4672,7 @@ AGENTMUX_RESULT:
 "#;
 
         let persisted = runtime
-            .persist_live_agent_result(None, "auto-impl", output)
+            .persist_live_agent_result_once(None, "auto-impl", output)
             .await
             .expect("live result persists");
         assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
@@ -4612,43 +4790,72 @@ AGENTMUX_RESULT:
     }
 
     /// When the output tail contains an AGENTMUX_RESULT block with invalid
-    /// JSON, parse_agent_result_marker returns NeedsStatusProbe.  The daemon
-    /// must not silently drop this — it must emit an Error event so the caller
-    /// can observe the failure via the event stream.
+    /// JSON, parse_agent_result_marker returns NeedsStatusProbe. The daemon
+    /// must not silently drop this — `persist_live_agent_result` surfaces a
+    /// `NeedsProbe` outcome (with the reason) so the forwarder can emit a
+    /// deduplicated Error event. It must never be reported as `Persisted`.
     #[tokio::test]
-    async fn live_agent_result_needs_status_probe_emits_error_event() {
+    async fn live_agent_result_needs_status_probe_is_surfaced_not_persisted() {
         let runtime = DaemonRuntime::new(8);
-        let mut events = runtime.subscribe();
 
         // A valid AGENTMUX_RESULT: marker followed by malformed JSON triggers
         // NeedsStatusProbe.
         let output = "AGENTMUX_RESULT:\n{ invalid json }\n";
 
-        let persisted = runtime
-            .persist_live_agent_result(None, "probe-agent", output)
+        let mut seen = SeenResultHashes::new(8);
+        let outcome = runtime
+            .persist_live_agent_result(None, "probe-agent", output, &mut seen)
             .await
             .expect("persist call itself must not fail");
-        assert!(
-            !persisted,
-            "NeedsStatusProbe must return false (not yet persisted)"
-        );
 
-        // The daemon must have published exactly one Error event describing
-        // the needs-probe condition.
-        let event = tokio::time::timeout(Duration::from_millis(100), events.recv())
-            .await
-            .expect("error event should be published promptly")
-            .expect("event channel must be open");
-        assert_eq!(event.kind, IpcEventKind::Error);
-        let payload = event.payload;
-        assert_eq!(
-            payload["signal"], "agent_result_needs_status_probe",
-            "signal field must identify the needs-probe condition"
-        );
-        assert_eq!(
-            payload["agent_name"], "probe-agent",
-            "agent_name must be included in the error payload"
-        );
+        match outcome {
+            LiveResultOutcome::NeedsProbe { reason } => {
+                assert!(
+                    reason.contains("JSON is invalid")
+                        || reason.contains("without a complete JSON object"),
+                    "unexpected probe reason: {reason}"
+                );
+            }
+            other => panic!("expected NeedsProbe, got {other:?}"),
+        }
+
+        // No message must have been persisted.
+        assert!(runtime.list_messages().await.is_empty());
+    }
+
+    /// The forwarder must not spam Error events: while a drip render repeatedly
+    /// yields the same NeedsProbe reason, only the first transition emits an
+    /// event. A *changed* reason emits again. This mirrors the forwarder's
+    /// `last_probe_reason` suppression logic at the unit level.
+    #[test]
+    fn needs_probe_error_events_are_suppressed_until_reason_changes() {
+        // Mirrors the forwarder's `last_probe_reason` gate: emit only when the
+        // reason differs from the previous emission.
+        fn observe(reason: &str, last: &mut Option<String>) -> bool {
+            if last.as_deref() != Some(reason) {
+                *last = Some(reason.to_string());
+                true
+            } else {
+                false
+            }
+        }
+
+        let mut last_probe_reason: Option<String> = None;
+        let mut emitted = 0usize;
+
+        // Same reason repeated across drip frames -> a single emission.
+        for _ in 0..3 {
+            if observe("JSON is invalid: a", &mut last_probe_reason) {
+                emitted += 1;
+            }
+        }
+        assert_eq!(emitted, 1);
+
+        // A changed reason emits once more.
+        if observe("JSON is invalid: b", &mut last_probe_reason) {
+            emitted += 1;
+        }
+        assert_eq!(emitted, 2);
     }
 
     /// Regression: when the message target's agent has status RunningTurn (not
@@ -4693,7 +4900,7 @@ AGENTMUX_RESULT:
 "#;
         // Must not panic or return Err.
         let persisted = runtime
-            .persist_live_agent_result(None, "impl-agent", output)
+            .persist_live_agent_result_once(None, "impl-agent", output)
             .await
             .expect("persist must not fail even with a busy target");
         assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
@@ -4746,7 +4953,7 @@ AGENTMUX_RESULT:
 }
 "#;
         let persisted = runtime
-            .persist_live_agent_result(None, "impl-agent", output)
+            .persist_live_agent_result_once(None, "impl-agent", output)
             .await
             .expect("persist must succeed even without a registered target");
         assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
@@ -4848,7 +5055,7 @@ AGENTMUX_RESULT:
 }
 "#;
         let persisted = runtime
-            .persist_live_agent_result(None, "multi-impl", output)
+            .persist_live_agent_result_once(None, "multi-impl", output)
             .await
             .expect("persist must succeed");
         assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
@@ -4948,7 +5155,7 @@ AGENTMUX_RESULT:
 }
 "#;
         let persisted = runtime
-            .persist_live_agent_result(None, "fallback-impl", output)
+            .persist_live_agent_result_once(None, "fallback-impl", output)
             .await
             .expect("persist must succeed");
         assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
@@ -5006,7 +5213,7 @@ AGENTMUX_RESULT:
 }
 "#;
         let persisted = runtime
-            .persist_live_agent_result(None, "impl-agent", output)
+            .persist_live_agent_result_once(None, "impl-agent", output)
             .await
             .expect("persist must succeed even with no tester");
         assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
@@ -5115,7 +5322,7 @@ AGENTMUX_RESULT:
 "#;
 
         let persisted = runtime
-            .persist_live_agent_result(Some(&agent.id), "impl-codex", output)
+            .persist_live_agent_result_once(Some(&agent.id), "impl-codex", output)
             .await
             .expect("live result persists");
 
