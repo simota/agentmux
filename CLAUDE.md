@@ -148,13 +148,35 @@ AGENTMUX_RESULT:
 
 Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
 
+Always send messages with inject delivery. Both `messages[]` entries and `agentmux message send` default to `delivery_mode: inject_when_idle`: the daemon automatically injects the rendered prompt into the target session's PTY as soon as that session is idle. Keep that default — never pass `delivery_mode: inbox_only`, because inbox-only messages are not injected and the target agent will never see them. After sending, do not wait for or request a manual injection; delivery happens automatically.
+
+When an agentmux bus message is injected into your session, always reply through `messages[]` in the next `AGENTMUX_RESULT`. Reply to the sender with `agent:<sender-session-name>` when available, or use the requested `reply_to` / target context if the injected prompt provides one. Do not ask the user for confirmation before sending normal message replies or progress updates. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
+
+Avoid unbounded agent-to-agent loops. Only if the same pair of agents has exchanged messages for 3 or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user. Configure this threshold before installing the protocol with `AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS`; the default is 3.
+
 Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind prevents the result messages from being stored.
 
 Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
 
 Each live session receives its own identity through environment variables: `AGENTMUX_AGENT_NAME`, `AGENTMUX_AGENT_ROLE`, and `AGENTMUX_AGENT_ID`. Use `AGENTMUX_AGENT_NAME` when another session needs to reply to exactly this session.
 
-To inject an existing bus message into a live session, use `agentmux message inject <message_id>` only when the message target resolves to exactly one session. If the target can resolve to multiple sessions (for example `role:tester`) or you need a specific pane, use `agentmux agent inject <message_id> <agent_id>` after checking `agentmux sessions`; this explicitly selects the session that receives the PTY input.
+Common TUI workflows:
+
+- Start multiple panes with `agentmux start "agy,codex"` or include message history with `agentmux start "agy,messages,codex"`.
+- Inside the TUI, `Ctrl-g %` and `Ctrl-g "` open the new pane picker. Choose `Claude Code`, `Codex`, `Antigravity`, or `Conversation List`.
+- `Conversation List` opens the message history as a normal pane. `Ctrl-g m` opens the same history as a temporary overlay.
+- `Ctrl-g s` shows running sessions with their names, roles, and process IDs.
+- `Ctrl-g x` closes the focused local pane or stops the focused agent pane.
+
+Message inspection commands:
+
+- `agentmux message list` shows stored bus messages newest first.
+- `agentmux sessions` shows live agent sessions and their stable names/roles.
+- `agentmux start "messages"` opens only the message history pane.
+
+Manual injection is a fallback for messages that were not auto-delivered yet (for example the target was busy or had not spawned when the message was created). In that case use `agentmux message inject <message_id>` only when the message target resolves to exactly one session. If the target can resolve to multiple sessions (for example `role:tester`) or you need a specific pane, use `agentmux agent inject <message_id> <agent_id>` after checking `agentmux sessions`; this explicitly selects the session that receives the PTY input.
+
+Injection is asynchronous: the daemon records the message first, then waits briefly before writing the rendered message into the target PTY. If the TUI list updates before the text appears in the agent pane, wait a few seconds before retrying.
 
 ```json
 {

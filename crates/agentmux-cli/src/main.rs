@@ -70,7 +70,9 @@ AGENTMUX_RESULT:
 }
 ```
 
-Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Message delivery defaults to inject: routed messages are stored and then injected into the target session when possible. Keep `messages: []` when no cross-agent message is needed.
+Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
+
+Always send messages with inject delivery. Both `messages[]` entries and `agentmux message send` default to `delivery_mode: inject_when_idle`: the daemon automatically injects the rendered prompt into the target session's PTY as soon as that session is idle. Keep that default — never pass `delivery_mode: inbox_only`, because inbox-only messages are not injected and the target agent will never see them. After sending, do not wait for or request a manual injection; delivery happens automatically.
 
 When an agentmux bus message is injected into your session, always reply through `messages[]` in the next `AGENTMUX_RESULT`. Reply to the sender with `agent:<sender-session-name>` when available, or use the requested `reply_to` / target context if the injected prompt provides one. Do not ask the user for confirmation before sending normal message replies or progress updates. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
 
@@ -96,7 +98,7 @@ Message inspection commands:
 - `agentmux sessions` shows live agent sessions and their stable names/roles.
 - `agentmux start "messages"` opens only the message history pane.
 
-To inject an existing bus message into a live session, use `agentmux message inject <message_id>` only when the message target resolves to exactly one session. If the target can resolve to multiple sessions (for example `role:tester`) or you need a specific pane, use `agentmux agent inject <message_id> <agent_id>` after checking `agentmux sessions`; this explicitly selects the session that receives the PTY input.
+Manual injection is a fallback for messages that were not auto-delivered yet (for example the target was busy or had not spawned when the message was created). In that case use `agentmux message inject <message_id>` only when the message target resolves to exactly one session. If the target can resolve to multiple sessions (for example `role:tester`) or you need a specific pane, use `agentmux agent inject <message_id> <agent_id>` after checking `agentmux sessions`; this explicitly selects the session that receives the PTY input.
 
 Injection is asynchronous: the daemon records the message first, then waits briefly before writing the rendered message into the target PTY. If the TUI list updates before the text appears in the agent pane, wait a few seconds before retrying.
 
@@ -4234,7 +4236,9 @@ mod tests {
         assert_eq!(contents.matches(RESULT_PROTOCOL_MARKER_START).count(), 1);
         assert!(contents.contains("AGENTMUX_RESULT:"));
         assert!(contents.contains("messages[]"));
-        assert!(contents.contains("Message delivery defaults to inject"));
+        assert!(contents.contains("Always send messages with inject delivery"));
+        assert!(contents.contains("never pass `delivery_mode: inbox_only`"));
+        assert!(contents.contains("Manual injection is a fallback"));
         assert!(contents.contains("always reply through `messages[]`"));
         assert!(contents.contains(
             "Do not ask the user for confirmation before sending normal message replies"
