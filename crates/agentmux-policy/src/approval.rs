@@ -2,7 +2,9 @@
 
 use std::collections::BTreeMap;
 
-use agentmux_core::{ApprovalId, ApprovalKind, ApprovalStatus, ContextItemId, RiskLevel};
+use agentmux_core::{
+    ApprovalId, ApprovalKind, ApprovalStatus, ContextItemId, RiskLevel, WorktreeId,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::policy::{PolicyDecision, PolicyEngine};
@@ -17,6 +19,8 @@ pub struct ApprovalRequest {
     pub description: String,
     pub proposed_input: Option<String>,
     pub command: Option<String>,
+    #[serde(default)]
+    pub worktree_id: Option<WorktreeId>,
     pub context_refs: Vec<ContextItemId>,
     pub status: ApprovalStatus,
 }
@@ -37,6 +41,23 @@ impl ApprovalRequest {
             description: reason,
             proposed_input: None,
             command: Some(command),
+            worktree_id: None,
+            context_refs: Vec::new(),
+            status: ApprovalStatus::Pending,
+        }
+    }
+
+    pub fn worktree_adopt(worktree_id: WorktreeId) -> Self {
+        Self {
+            id: ApprovalId::new(),
+            kind: ApprovalKind::GitCommit,
+            risk: RiskLevel::High,
+            title: format!("Approval required: adopt worktree {worktree_id}"),
+            description: "Merge the selected arena worktree into the integration branch."
+                .to_string(),
+            proposed_input: None,
+            command: Some("git merge --no-commit --no-ff".to_string()),
+            worktree_id: Some(worktree_id),
             context_refs: Vec::new(),
             status: ApprovalStatus::Pending,
         }
@@ -116,6 +137,7 @@ impl ApprovalQueue {
             description: classification.reason,
             proposed_input: None,
             command: Some(command.to_string()),
+            worktree_id: None,
             context_refs: Vec::new(),
             status: ApprovalStatus::Pending,
         };
