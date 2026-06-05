@@ -807,6 +807,12 @@ impl DaemonRuntime {
             return Ok(None);
         };
 
+        // Settle delay: the target TUI composer may still be drip-rendering the previous
+        // turn and not yet ready to accept bracketed-paste input. Wait before writing to
+        // the PTY, mirroring the same delay used by the manual inject_message path.
+        // message_inject_send_delay() returns Duration::ZERO under #[cfg(test)].
+        tokio::time::sleep(message_inject_send_delay()).await;
+
         let write_result = self.write_prepared_message_injection(&prepared).await;
         let message = self
             .finish_and_emit_message_injection(
@@ -6597,6 +6603,77 @@ AGENTMUX_RESULT:
             .await
             .expect("message reached PTY");
         assert!(output.contains("message:\nstatus driven work"));
+
+        terminate_agent_process(&runtime, &agent.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// Regression test for the settle-delay fix in `deliver_idle_messages_for_agent`.
+    ///
+    /// After the fix, `deliver_idle_messages_for_agent` awaits `message_inject_send_delay()`
+    /// (Duration::ZERO under cfg(test)) before writing to the PTY.  This test confirms that
+    /// the added sleep does NOT break delivery: the message still reaches the live PTY and
+    /// is returned with DeliveryStatus::Delivered.
+    #[tokio::test]
+    async fn deliver_idle_messages_settle_delay_does_not_break_delivery() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-settle-delay-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("settle-delay.txt");
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime
+            .spawn_agent(
+                "settle-codex".to_string(),
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("agent is spawned");
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "settle delay regression check".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect("message is created");
+
+        // Directly call `deliver_idle_messages_for_agent` (the auto idle-delivery path).
+        // In cfg(test) message_inject_send_delay() == Duration::ZERO, so the settle sleep
+        // is a no-op and delivery must still succeed end-to-end.
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput),
+        )
+        .await
+        .expect("idle delivery should not hang")
+        .expect("idle delivery succeeds")
+        .expect("message is delivered");
+
+        assert_eq!(delivered.id, message.id);
+        assert_eq!(delivered.delivery_status, DeliveryStatus::Delivered);
+
+        let output = wait_for_file_contains(&output_path, "message:\nsettle delay regression check")
+            .await
+            .expect("message reached PTY");
+        assert!(output.contains("message:\nsettle delay regression check"));
 
         terminate_agent_process(&runtime, &agent.id.to_string()).await;
         std::fs::remove_dir_all(root).expect("temporary root is removed");
