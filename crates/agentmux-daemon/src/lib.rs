@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use agentmux_agent::adapter::InputSafety;
 use agentmux_agent::{
-    AgentResult, AgentResultParse, AgentRouteIdentity, EncodedInputStep, InputAction, InputScript,
-    StandardWorkflowState, WorkflowHandoffContext, advance_standard_workflow,
-    default_claude_codex_team, encode_input_action, parse_agent_result_marker, plan_task_run,
-    route_agent_result,
+    AgentResult, AgentResultParse, AgentResultStatus, AgentRouteIdentity, EncodedInputStep,
+    InputAction, InputScript, StandardWorkflowState, WorkflowHandoffContext,
+    advance_standard_workflow, default_claude_codex_team, encode_input_action,
+    parse_agent_result_marker, plan_task_run, route_agent_result,
 };
 use agentmux_context::{
     ContextBroker, ContextItem, ContextPackRequest, MailboxConfig, NewContextItem,
@@ -39,7 +39,10 @@ use agentmux_policy::{ApprovalEvent, ApprovalQueue, ApprovalQueueError, Approval
 use agentmux_pty::{CTRL_C, PtyHandle, PtyReadEvent, PtySpawnSpec};
 use agentmux_store::{EventLog, EventLogEntry};
 use agentmux_terminal::TerminalParser;
-use agentmux_worktree::{CaptureDiff, TestCommand, TestRunStatus, Worktree};
+use agentmux_worktree::{
+    CaptureDiff, CreateWorktree, MergeOutcome, TestCommand, TestRunStatus, Worktree,
+    WorktreeManager,
+};
 use serde_json::json;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
@@ -95,14 +98,26 @@ impl RegisteredAgentSession {
 
 struct LiveAgentSession {
     metadata: RegisteredAgentSession,
+    worktree_id: Option<WorktreeId>,
     pty: Option<Mutex<PtyHandle>>,
     terminal: Arc<Mutex<TerminalParser>>,
+}
+
+#[derive(Debug, Clone)]
+struct ArenaCandidate {
+    worktree_id: WorktreeId,
+    agent_id: AgentSessionId,
+    provider: String,
+    diff_stat: Option<String>,
+    test_status: Option<TestRunStatus>,
 }
 
 struct DaemonState {
     clients: BTreeMap<ClientSessionId, Option<AgentSessionId>>,
     agents: BTreeMap<AgentSessionId, LiveAgentSession>,
     worktrees: BTreeMap<WorktreeId, Worktree>,
+    worktree_repo_roots: BTreeMap<WorktreeId, PathBuf>,
+    arena_candidates: BTreeMap<WorktreeId, ArenaCandidate>,
     messages: MessageBus,
     contexts: ContextBroker,
     approvals: ApprovalQueue,
@@ -116,6 +131,8 @@ impl Default for DaemonState {
             clients: BTreeMap::new(),
             agents: BTreeMap::new(),
             worktrees: BTreeMap::new(),
+            worktree_repo_roots: BTreeMap::new(),
+            arena_candidates: BTreeMap::new(),
             messages: MessageBus::new(),
             contexts: ContextBroker::new(),
             approvals: ApprovalQueue::new(),
@@ -273,7 +290,18 @@ impl DaemonRuntime {
         &self,
         name: String,
         role: AgentRole,
+        spec: PtySpawnSpec,
+    ) -> Result<RegisteredAgentSession> {
+        self.spawn_agent_with_role_and_worktree(name, role, spec, None)
+            .await
+    }
+
+    pub async fn spawn_agent_with_role_and_worktree(
+        &self,
+        name: String,
+        role: AgentRole,
         mut spec: PtySpawnSpec,
+        worktree_id: Option<WorktreeId>,
     ) -> Result<RegisteredAgentSession> {
         let mut agent = RegisteredAgentSession::with_role(name.clone(), role, None);
         spec.env
@@ -302,6 +330,7 @@ impl DaemonRuntime {
             agent.id.clone(),
             LiveAgentSession {
                 metadata: agent.clone(),
+                worktree_id: worktree_id.clone(),
                 pty: Some(Mutex::new(pty)),
                 terminal,
             },
@@ -318,6 +347,7 @@ impl DaemonRuntime {
                 "name": agent.name,
                 "role": agent_role_label(&agent.role),
                 "process_id": agent.process_id,
+                "worktree_id": worktree_id.as_ref().map(ToString::to_string),
             }),
         ));
         Ok(agent)
@@ -354,7 +384,11 @@ impl DaemonRuntime {
                         ));
                         if !result_persisted {
                             match runtime
-                                .persist_live_agent_result(&agent_name, &output_tail)
+                                .persist_live_agent_result(
+                                    Some(&agent_id),
+                                    &agent_name,
+                                    &output_tail,
+                                )
                                 .await
                             {
                                 Ok(true) => result_persisted = true,
@@ -909,6 +943,14 @@ impl DaemonRuntime {
         state.worktrees.insert(worktree.id.clone(), worktree);
     }
 
+    async fn register_worktree_with_repo_root(&self, worktree: Worktree, repo_root: PathBuf) {
+        let mut state = self.state.write().await;
+        state
+            .worktree_repo_roots
+            .insert(worktree.id.clone(), repo_root);
+        state.worktrees.insert(worktree.id.clone(), worktree);
+    }
+
     pub async fn list_worktrees(&self) -> Vec<Worktree> {
         let state = self.state.read().await;
         state.worktrees.values().cloned().collect()
@@ -942,6 +984,8 @@ impl DaemonRuntime {
                 "stat": captured.stat,
             }),
         ));
+        self.record_arena_diff(&worktree.id, captured.stat.clone())
+            .await;
 
         Ok(json!({
             "worktree": worktree_payload(&worktree),
@@ -991,6 +1035,16 @@ impl DaemonRuntime {
                         "artifact_id": test_run.artifact.id.to_string(),
                     }),
                 ));
+                self.record_arena_test(&worktree.id, test_run.status).await;
+                self.publish(DaemonEvent::new(
+                    IpcEventKind::WorktreeTestCompleted,
+                    json!({
+                        "worktree_id": worktree.id.to_string(),
+                        "status": test_run.status,
+                        "command": test_run.command,
+                        "exit_code": test_run.exit_code,
+                    }),
+                ));
                 Ok(json!({
                     "worktree": worktree_payload(&worktree),
                     "test": {
@@ -1014,9 +1068,28 @@ impl DaemonRuntime {
         }
     }
 
-    pub async fn promote_worktree(&self, worktree_id: &WorktreeId) -> Result<Worktree> {
-        self.set_worktree_status(worktree_id, WorktreeStatus::Promoted)
-            .await
+    async fn promote_worktree(&self, worktree_id: &WorktreeId) -> Result<Worktree> {
+        self.ensure_arena_candidate_ready(worktree_id).await?;
+        let worktree = self.worktree_by_id(worktree_id).await?;
+        let repo_root = self.repo_root_for_worktree(worktree_id, &worktree).await;
+        let manager = WorktreeManager::new(
+            worktree.project_id.clone(),
+            repo_root.clone(),
+            repo_root.join(".agentmux/worktrees"),
+        )?;
+        match manager.merge_to_integration_branch(&worktree, "agentmux/integration")? {
+            MergeOutcome::Conflict => {
+                self.set_worktree_status(worktree_id, WorktreeStatus::Conflicted)
+                    .await?;
+                Err(AgentmuxError::UserError(format!(
+                    "worktree '{worktree_id}' merge conflicted and was aborted"
+                )))
+            }
+            MergeOutcome::Clean | MergeOutcome::Dirty => {
+                self.set_worktree_status(worktree_id, WorktreeStatus::Promoted)
+                    .await
+            }
+        }
     }
 
     pub async fn archive_worktree(&self, worktree_id: &WorktreeId) -> Result<Worktree> {
@@ -1037,6 +1110,36 @@ impl DaemonRuntime {
         let _ = self.append_approval_event(&event);
         self.publish(approval_daemon_event(&event));
         request
+    }
+
+    async fn request_worktree_adoption(&self, worktree_id: WorktreeId) -> Result<ApprovalRequest> {
+        let _ = self.worktree_by_id(&worktree_id).await?;
+        self.ensure_arena_candidate_ready(&worktree_id).await?;
+        {
+            let state = self.state.read().await;
+            if let Some(existing) = state
+                .approvals
+                .pending()
+                .into_iter()
+                .find(|request| request.worktree_id.is_some())
+            {
+                return Err(AgentmuxError::UserError(format!(
+                    "worktree adoption approval '{}' is already pending",
+                    existing.id
+                )));
+            }
+        }
+        let request = self
+            .submit_approval_request(ApprovalRequest::worktree_adopt(worktree_id.clone()))
+            .await;
+        self.publish(DaemonEvent::new(
+            IpcEventKind::WorktreeAdoptRequested,
+            json!({
+                "worktree_id": worktree_id.to_string(),
+                "approval_id": request.id.to_string(),
+            }),
+        ));
+        Ok(request)
     }
 
     pub async fn list_approvals(&self) -> Vec<ApprovalRequest> {
@@ -1078,7 +1181,53 @@ impl DaemonRuntime {
 
         let _ = self.append_approval_event(&event);
         self.publish(approval_daemon_event(&event));
+        if let Some(worktree_id) = request.worktree_id.clone() {
+            let runtime = self.clone();
+            tokio::spawn(async move {
+                if approved {
+                    if let Err(error) = runtime.promote_worktree(&worktree_id).await {
+                        runtime.publish(DaemonEvent::new(
+                            IpcEventKind::Error,
+                            json!({
+                                "worktree_id": worktree_id.to_string(),
+                                "signal": "worktree_promote_failed",
+                                "error": error.to_string(),
+                            }),
+                        ));
+                    }
+                } else if let Err(error) = runtime.archive_worktree(&worktree_id).await {
+                    runtime.publish(DaemonEvent::new(
+                        IpcEventKind::Error,
+                        json!({
+                            "worktree_id": worktree_id.to_string(),
+                            "signal": "worktree_archive_failed",
+                            "error": error.to_string(),
+                        }),
+                    ));
+                }
+            });
+        }
         Ok(request)
+    }
+
+    async fn ensure_arena_candidate_ready(&self, worktree_id: &WorktreeId) -> Result<()> {
+        let state = self.state.read().await;
+        let Some(candidate) = state.arena_candidates.get(worktree_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "worktree '{worktree_id}' is not a registered arena candidate"
+            )));
+        };
+        if candidate.diff_stat.is_none() {
+            return Err(AgentmuxError::UserError(format!(
+                "worktree '{worktree_id}' adoption requires captured diff"
+            )));
+        }
+        if candidate.test_status != Some(TestRunStatus::Passed) {
+            return Err(AgentmuxError::UserError(format!(
+                "worktree '{worktree_id}' adoption requires passed tests"
+            )));
+        }
+        Ok(())
     }
 
     async fn worktree_by_id(&self, worktree_id: &WorktreeId) -> Result<Worktree> {
@@ -1088,6 +1237,33 @@ impl DaemonRuntime {
             .get(worktree_id)
             .cloned()
             .ok_or_else(|| AgentmuxError::UserError(format!("unknown worktree '{worktree_id}'")))
+    }
+
+    async fn repo_root_for_worktree(
+        &self,
+        worktree_id: &WorktreeId,
+        worktree: &Worktree,
+    ) -> PathBuf {
+        let state = self.state.read().await;
+        state
+            .worktree_repo_roots
+            .get(worktree_id)
+            .cloned()
+            .unwrap_or_else(|| worktree.path.clone())
+    }
+
+    async fn record_arena_diff(&self, worktree_id: &WorktreeId, stat: String) {
+        let mut state = self.state.write().await;
+        if let Some(candidate) = state.arena_candidates.get_mut(worktree_id) {
+            candidate.diff_stat = Some(stat);
+        }
+    }
+
+    async fn record_arena_test(&self, worktree_id: &WorktreeId, status: TestRunStatus) {
+        let mut state = self.state.write().await;
+        if let Some(candidate) = state.arena_candidates.get_mut(worktree_id) {
+            candidate.test_status = Some(status);
+        }
     }
 
     async fn set_worktree_status(
@@ -1171,6 +1347,7 @@ impl DaemonRuntime {
                     "input_ready": agent_input_ready(agent),
                     "process_id": agent.metadata.process_id,
                     "has_process": agent.pty.is_some(),
+                    "worktree_id": agent.worktree_id.as_ref().map(ToString::to_string),
                     "attached_clients": agent
                         .metadata
                         .attached_clients
@@ -1180,12 +1357,26 @@ impl DaemonRuntime {
                 })
             })
             .collect();
+        let arena_candidates = state
+            .arena_candidates
+            .values()
+            .map(|candidate| {
+                json!({
+                    "worktree_id": candidate.worktree_id.to_string(),
+                    "agent_id": candidate.agent_id.to_string(),
+                    "provider": candidate.provider,
+                    "diff_stat": candidate.diff_stat,
+                    "test_status": candidate.test_status,
+                })
+            })
+            .collect::<Vec<_>>();
 
         json!({
             "protocol_version": agentmux_ipc::PROTOCOL_VERSION,
             "client_count": state.clients.len(),
             "agent_count": state.agents.len(),
             "agents": agents,
+            "arena_candidates": arena_candidates,
         })
     }
 
@@ -1286,6 +1477,115 @@ impl DaemonRuntime {
         ))
     }
 
+    pub async fn run_task_with_arena(
+        &self,
+        body: String,
+        providers: Vec<String>,
+        project_path: PathBuf,
+        base_branch: String,
+    ) -> Result<serde_json::Value> {
+        if body.trim().is_empty() {
+            return Err(AgentmuxError::UserError(
+                "task.run requires non-empty body".to_string(),
+            ));
+        }
+        if providers.is_empty() {
+            return Err(AgentmuxError::UserError(
+                "arena task.run requires at least one provider".to_string(),
+            ));
+        }
+        let mut provider_labels = BTreeSet::new();
+        for provider in &providers {
+            let label = slug_label(provider);
+            if !provider_labels.insert(label.clone()) {
+                return Err(AgentmuxError::UserError(format!(
+                    "arena provider label '{label}' is duplicated"
+                )));
+            }
+        }
+
+        let task_id = TaskId::new();
+        let project_id = {
+            let state = self.state.read().await;
+            state.default_project_id.clone()
+        };
+        let manager = WorktreeManager::new(
+            project_id,
+            project_path.clone(),
+            project_path.join(".agentmux/worktrees"),
+        )?;
+        let task_slug = body.trim().to_string();
+        let mut candidates = Vec::new();
+
+        for provider in providers {
+            let agent_name = format!("impl-{}", slug_label(&provider));
+            let worktree = manager.create_worktree(CreateWorktree {
+                task_id: task_id.clone(),
+                task_slug: task_slug.clone(),
+                agent_name: agent_name.clone(),
+                owner_agent_id: None,
+                base_branch: base_branch.clone(),
+            })?;
+            self.register_worktree_with_repo_root(worktree.clone(), project_path.clone())
+                .await;
+
+            let mut env: BTreeMap<String, String> = std::env::vars().collect();
+            env.insert("TERM".to_string(), "xterm-256color".to_string());
+            let spec = PtySpawnSpec {
+                command: provider_command(&provider),
+                args: default_provider_args(Some(provider.as_str())),
+                cwd: worktree.path.clone(),
+                env,
+                size: Default::default(),
+            };
+            let agent = self
+                .spawn_agent_with_role_and_worktree(
+                    agent_name,
+                    AgentRole::Implementer,
+                    spec,
+                    Some(worktree.id.clone()),
+                )
+                .await?;
+            {
+                let mut state = self.state.write().await;
+                if let Some(stored) = state.worktrees.get_mut(&worktree.id) {
+                    stored.owner_agent_id = Some(agent.id.clone());
+                }
+                state.arena_candidates.insert(
+                    worktree.id.clone(),
+                    ArenaCandidate {
+                        worktree_id: worktree.id.clone(),
+                        agent_id: agent.id.clone(),
+                        provider: provider.clone(),
+                        diff_stat: None,
+                        test_status: None,
+                    },
+                );
+            }
+            self.publish(DaemonEvent::new(
+                IpcEventKind::WorktreeCreated,
+                json!({
+                    "worktree": worktree_payload(&worktree),
+                    "agent_id": agent.id.to_string(),
+                    "provider": provider,
+                }),
+            ));
+            candidates.push(json!({
+                "worktree": worktree_payload(&worktree),
+                "agent_id": agent.id.to_string(),
+                "name": agent.name,
+            }));
+        }
+
+        Ok(json!({
+            "task_id": task_id.to_string(),
+            "runner": "arena",
+            "project_path": project_path.display().to_string(),
+            "base_branch": base_branch,
+            "candidates": candidates,
+        }))
+    }
+
     async fn register_task_team_message_agents(
         &self,
         task_id: &TaskId,
@@ -1340,13 +1640,19 @@ impl DaemonRuntime {
         Ok(messages)
     }
 
-    async fn persist_live_agent_result(&self, agent_name: &str, output_tail: &str) -> Result<bool> {
+    async fn persist_live_agent_result(
+        &self,
+        agent_id: Option<&AgentSessionId>,
+        agent_name: &str,
+        output_tail: &str,
+    ) -> Result<bool> {
         let result = match parse_agent_result_marker(output_tail) {
             AgentResultParse::Found(parsed) => parsed.result,
             AgentResultParse::NotFound | AgentResultParse::NeedsStatusProbe(_) => {
                 return Ok(false);
             }
         };
+        let completed = result.status == AgentResultStatus::Completed;
         let task_id = TaskId::new();
         let team = default_claude_codex_team();
         let agent = AgentRouteIdentity {
@@ -1355,7 +1661,72 @@ impl DaemonRuntime {
         };
         self.persist_agent_result_messages(&agent, task_id, &team, result)
             .await?;
+        if completed
+            && let Some(worktree_id) = self.resolve_agent_worktree(agent_id, agent_name).await
+            && self.is_arena_candidate(&worktree_id).await
+        {
+            self.capture_and_test_arena_candidate(worktree_id);
+        }
         Ok(true)
+    }
+
+    async fn resolve_agent_worktree(
+        &self,
+        agent_id: Option<&AgentSessionId>,
+        agent_name: &str,
+    ) -> Option<WorktreeId> {
+        let state = self.state.read().await;
+        if let Some(agent_id) = agent_id
+            && let Some(agent) = state.agents.get(agent_id)
+        {
+            return agent.worktree_id.clone();
+        }
+        state
+            .agents
+            .values()
+            .find(|agent| agent.metadata.name == agent_name)
+            .and_then(|agent| agent.worktree_id.clone())
+    }
+
+    async fn is_arena_candidate(&self, worktree_id: &WorktreeId) -> bool {
+        let state = self.state.read().await;
+        state.arena_candidates.contains_key(worktree_id)
+    }
+
+    fn capture_and_test_arena_candidate(&self, worktree_id: WorktreeId) {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            if let Err(error) = runtime.capture_worktree_diff(&worktree_id).await {
+                runtime.publish(DaemonEvent::new(
+                    IpcEventKind::Error,
+                    json!({
+                        "worktree_id": worktree_id.to_string(),
+                        "signal": "worktree_diff_capture_failed",
+                        "error": error.to_string(),
+                    }),
+                ));
+                return;
+            }
+            if let Err(error) = runtime
+                .run_worktree_test(
+                    &worktree_id,
+                    TestCommand {
+                        name: "default".to_string(),
+                        command: "cargo test".to_string(),
+                    },
+                )
+                .await
+            {
+                runtime.publish(DaemonEvent::new(
+                    IpcEventKind::Error,
+                    json!({
+                        "worktree_id": worktree_id.to_string(),
+                        "signal": "worktree_test_failed",
+                        "error": error.to_string(),
+                    }),
+                ));
+            }
+        });
     }
 
     pub async fn send_input_script(&self, script: &InputScript) -> Result<()> {
@@ -1515,6 +1886,7 @@ impl LiveAgentSession {
     fn metadata(metadata: RegisteredAgentSession) -> Self {
         Self {
             metadata,
+            worktree_id: None,
             pty: None,
             terminal: Arc::new(Mutex::new(TerminalParser::default())),
         }
@@ -1856,6 +2228,8 @@ fn event_kind_label(kind: &IpcEventKind) -> &'static str {
         IpcEventKind::ApprovalDecided => "approval.decided",
         IpcEventKind::WorktreeCreated => "worktree.created",
         IpcEventKind::WorktreeDiffCaptured => "worktree.diff_captured",
+        IpcEventKind::WorktreeAdoptRequested => "worktree.adopt_requested",
+        IpcEventKind::WorktreeTestCompleted => "worktree.test_completed",
         IpcEventKind::PolicyDenied => "policy.denied",
         IpcEventKind::Error => "error",
     }
@@ -1911,6 +2285,34 @@ async fn handle_request(
                     );
                 }
             };
+            if runner == "arena" {
+                let providers = match arena_providers_payload(&request.payload) {
+                    Ok(providers) => providers,
+                    Err(error) => {
+                        return DaemonResponse::error(
+                            request.id,
+                            ErrorBody::new("INVALID_ARENA_PROVIDERS", error.to_string()),
+                        );
+                    }
+                };
+                let base_branch = request
+                    .payload
+                    .get("base_branch")
+                    .and_then(|value| value.as_str())
+                    .filter(|value| !value.trim().is_empty())
+                    .unwrap_or("main")
+                    .to_string();
+                return match runtime
+                    .run_task_with_arena(body, providers, project_path, base_branch)
+                    .await
+                {
+                    Ok(payload) => DaemonResponse::ok(request.id, payload),
+                    Err(error) => DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("TASK_RUN_FAILED", error.to_string()),
+                    ),
+                };
+            }
             if runner != "shell-stub" {
                 return DaemonResponse::error(
                     request.id,
@@ -2440,8 +2842,8 @@ async fn handle_request(
                     );
                 }
             };
-            match runtime.promote_worktree(&worktree_id).await {
-                Ok(worktree) => DaemonResponse::ok(request.id, worktree_payload(&worktree)),
+            match runtime.request_worktree_adoption(worktree_id).await {
+                Ok(approval) => DaemonResponse::ok(request.id, approval_payload(&approval)),
                 Err(error) => DaemonResponse::error(
                     request.id,
                     ErrorBody::new("WORKTREE_PROMOTE_FAILED", error.to_string()),
@@ -2463,6 +2865,24 @@ async fn handle_request(
                 Err(error) => DaemonResponse::error(
                     request.id,
                     ErrorBody::new("WORKTREE_ARCHIVE_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::WorktreeAdopt => {
+            let worktree_id = match worktree_id_payload(&request.payload, "worktree.adopt") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_WORKTREE_ID", error.to_string()),
+                    );
+                }
+            };
+            match runtime.request_worktree_adoption(worktree_id).await {
+                Ok(approval) => DaemonResponse::ok(request.id, approval_payload(&approval)),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("WORKTREE_ADOPT_FAILED", error.to_string()),
                 ),
             }
         }
@@ -2584,6 +3004,35 @@ fn task_run_payload(payload: &serde_json::Value) -> Result<(String, String, Path
         .or_else(|| std::env::var("AGENTMUX_TASK_RUNNER").ok())
         .unwrap_or_else(|| "shell-stub".to_string());
     Ok((body, team, project_path, runner))
+}
+
+fn arena_providers_payload(payload: &serde_json::Value) -> Result<Vec<String>> {
+    let providers =
+        if let Some(values) = payload.get("providers").and_then(|value| value.as_array()) {
+            values
+                .iter()
+                .map(|value| {
+                    value.as_str().map(str::to_string).ok_or_else(|| {
+                        AgentmuxError::UserError("providers must be strings".to_string())
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?
+        } else if let Some(value) = payload.get("arena").and_then(|value| value.as_str()) {
+            value.split(',').map(str::to_string).collect()
+        } else {
+            Vec::new()
+        };
+    let providers = providers
+        .into_iter()
+        .map(|provider| provider.trim().to_string())
+        .filter(|provider| !provider.is_empty())
+        .collect::<Vec<_>>();
+    if providers.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "arena task.run requires providers or arena".to_string(),
+        ));
+    }
+    Ok(providers)
 }
 
 #[derive(Debug)]
@@ -3227,6 +3676,7 @@ fn approval_payload(approval: &ApprovalRequest) -> serde_json::Value {
         "description": approval.description,
         "proposed_input": approval.proposed_input,
         "command": approval.command,
+        "worktree_id": approval.worktree_id.as_ref().map(ToString::to_string),
         "context_refs": approval.context_refs.iter().map(ToString::to_string).collect::<Vec<_>>(),
         "status": approval.status,
     })
@@ -3367,6 +3817,38 @@ fn default_provider_args(provider: Option<&str>) -> Vec<String> {
     match provider {
         Some("agy") => vec!["--dangerously-skip-permissions".to_string()],
         _ => Vec::new(),
+    }
+}
+
+fn provider_command(provider: &str) -> String {
+    match provider {
+        "shell" => std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string()),
+        "claude" => "claude".to_string(),
+        "codex" => "codex".to_string(),
+        "agy" => "agy".to_string(),
+        custom => custom.to_string(),
+    }
+}
+
+fn slug_label(value: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash && !slug.is_empty() {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    while slug.ends_with('-') {
+        slug.pop();
+    }
+    if slug.is_empty() {
+        "agent".to_string()
+    } else {
+        slug
     }
 }
 
@@ -3763,7 +4245,7 @@ AGENTMUX_RESULT:
 "#;
 
         let persisted = runtime
-            .persist_live_agent_result("impl-codex", output)
+            .persist_live_agent_result(None, "impl-codex", output)
             .await
             .expect("live result persists");
 
@@ -3805,7 +4287,7 @@ AGENTMUX_RESULT:
 "#;
 
         let persisted = runtime
-            .persist_live_agent_result("impl-codex", output)
+            .persist_live_agent_result(None, "impl-codex", output)
             .await
             .expect("live result persists");
 
@@ -3817,6 +4299,71 @@ AGENTMUX_RESULT:
             MessageTarget::AgentName("tester-a1b2c3".to_string())
         );
         assert_eq!(messages[0].body, "Run only the named tester session.");
+    }
+
+    #[tokio::test]
+    async fn live_agent_result_for_non_arena_worktree_does_not_capture_or_test() {
+        let runtime = DaemonRuntime::new(8);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: std::env::temp_dir(),
+            branch_name: "agentmux/task-non-arena".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::Ready,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.clone();
+        runtime.register_worktree(worktree).await;
+        let agent = RegisteredAgentSession::with_role(
+            "impl-codex".to_string(),
+            AgentRole::Implementer,
+            None,
+        );
+        {
+            let mut state = runtime.state.write().await;
+            state.agents.insert(
+                agent.id.clone(),
+                LiveAgentSession {
+                    metadata: agent.clone(),
+                    worktree_id: Some(worktree_id.clone()),
+                    pty: None,
+                    terminal: Arc::new(Mutex::new(TerminalParser::new(24, 80))),
+                },
+            );
+        }
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Non arena implementation complete.",
+  "changed_files": [],
+  "messages": [],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+
+        let persisted = runtime
+            .persist_live_agent_result(Some(&agent.id), "impl-codex", output)
+            .await
+            .expect("live result persists");
+
+        assert!(persisted);
+        tokio::time::sleep(Duration::from_millis(75)).await;
+        assert_eq!(
+            runtime.worktree_by_id(&worktree_id).await.unwrap().status,
+            WorktreeStatus::Ready
+        );
+        assert!(
+            runtime.status_payload().await["arena_candidates"]
+                .as_array()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -4838,6 +5385,22 @@ AGENTMUX_RESULT:
         let root =
             std::env::temp_dir().join(format!("agentmux-worktree-ipc-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("temporary worktree root is created");
+        test_git(&root, ["init", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        test_git(&root, ["add", "README.md"]);
+        test_git(
+            &root,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        test_git(&root, ["branch", "agentmux/task-impl"]);
         let runtime = DaemonRuntime::new(16);
         let attached_agent = runtime
             .register_agent("worktree-observer".to_string())
@@ -4854,6 +5417,7 @@ AGENTMUX_RESULT:
             created_at: DateTimeUtc::UNIX_EPOCH,
         };
         let worktree_id = worktree.id.to_string();
+        let parsed_worktree_id = worktree.id.clone();
         runtime.register_worktree(worktree).await;
 
         let (client_stream, server_stream) = UnixStream::pair().unwrap();
@@ -4907,6 +5471,8 @@ AGENTMUX_RESULT:
         let (test_response, artifact_event) = read_response_and_event(&mut reader).await;
         assert!(test_response.ok);
         assert_eq!(artifact_event.kind, IpcEventKind::ArtifactCreated);
+        let test_event: DaemonEvent = reader.read().await.unwrap().unwrap();
+        assert_eq!(test_event.kind, IpcEventKind::WorktreeTestCompleted);
         let test_payload = test_response.payload.unwrap();
         assert_eq!(test_payload["worktree"]["status"], "review_ready");
         assert_eq!(test_payload["test"]["status"], "passed");
@@ -4915,6 +5481,13 @@ AGENTMUX_RESULT:
                 .unwrap()
                 .contains("test-ok")
         );
+        mark_arena_candidate(
+            &runtime,
+            parsed_worktree_id.clone(),
+            Some("README.md | 0".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
 
         writer
             .write(&ClientRequest::new(
@@ -4926,7 +5499,21 @@ AGENTMUX_RESULT:
             .unwrap();
         let promote_response: DaemonResponse = reader.read().await.unwrap().unwrap();
         assert!(promote_response.ok);
-        assert_eq!(promote_response.payload.unwrap()["status"], "promoted");
+        let promote_payload = promote_response.payload.unwrap();
+        assert_eq!(promote_payload["status"], "pending");
+        assert_eq!(promote_payload["worktree_id"], worktree_id);
+        assert_eq!(
+            runtime
+                .worktree_by_id(&parsed_worktree_id)
+                .await
+                .unwrap()
+                .status,
+            WorktreeStatus::ReviewReady
+        );
+        let approval_event: DaemonEvent = reader.read().await.unwrap().unwrap();
+        assert_eq!(approval_event.kind, IpcEventKind::ApprovalCreated);
+        let adopt_event: DaemonEvent = reader.read().await.unwrap().unwrap();
+        assert_eq!(adopt_event.kind, IpcEventKind::WorktreeAdoptRequested);
 
         writer
             .write(&ClientRequest::new(
@@ -4971,6 +5558,501 @@ AGENTMUX_RESULT:
         assert_eq!(response.error.unwrap().code, "WORKTREE_DIFF_FAILED");
 
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn worktree_adopt_requires_approval_and_reject_archives() {
+        let runtime = DaemonRuntime::new(16);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: std::env::temp_dir(),
+            branch_name: "agentmux/task-impl".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::ReviewReady,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.clone();
+        runtime.register_worktree(worktree).await;
+        mark_arena_candidate(
+            &runtime,
+            worktree_id.clone(),
+            Some("README.md | 0".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+
+        let approval = runtime
+            .request_worktree_adoption(worktree_id.clone())
+            .await
+            .expect("adoption approval is queued");
+
+        assert_eq!(approval.worktree_id, Some(worktree_id.clone()));
+        assert_eq!(
+            runtime.worktree_by_id(&worktree_id).await.unwrap().status,
+            WorktreeStatus::ReviewReady
+        );
+
+        runtime
+            .reject_approval(&approval.id)
+            .await
+            .expect("approval is rejected");
+        wait_for_worktree_status(&runtime, &worktree_id, WorktreeStatus::Archived).await;
+    }
+
+    #[tokio::test]
+    async fn ipc_worktree_promote_without_approval_queues_request_and_does_not_merge() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-unapproved-promote-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary worktree root is created");
+        test_git(&root, ["init", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        test_git(&root, ["add", "README.md"]);
+        test_git(
+            &root,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        test_git(&root, ["checkout", "-b", "agentmux/task-impl"]);
+        std::fs::write(root.join("feature.txt"), "candidate\n").unwrap();
+        test_git(&root, ["add", "feature.txt"]);
+        test_git(
+            &root,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "candidate",
+            ],
+        );
+        test_git(&root, ["checkout", "main"]);
+        let runtime = DaemonRuntime::new(16);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: root.clone(),
+            branch_name: "agentmux/task-impl".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::ReviewReady,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.clone();
+        runtime
+            .register_worktree_with_repo_root(worktree, root.clone())
+            .await;
+        mark_arena_candidate(
+            &runtime,
+            worktree_id.clone(),
+            Some("feature.txt | 1".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_promote",
+                IpcCommand::WorktreePromote,
+                json!({ "worktree_id": worktree_id.to_string() }),
+            ))
+            .await
+            .unwrap();
+        let promote_response: DaemonResponse = reader.read().await.unwrap().unwrap();
+
+        assert!(promote_response.ok);
+        let promote_payload = promote_response.payload.unwrap();
+        assert_eq!(promote_payload["status"], "pending");
+        assert_eq!(
+            runtime.worktree_by_id(&worktree_id).await.unwrap().status,
+            WorktreeStatus::ReviewReady
+        );
+        assert!(runtime.list_approvals().await.len() == 1);
+        assert_eq!(git_stdout(&root, ["branch", "--show-current"]), "main\n");
+        assert!(!root.join("feature.txt").exists());
+        assert!(git_stdout(&root, ["branch", "--list", "agentmux/integration"]).is_empty());
+
+        server.abort();
+        std::fs::remove_dir_all(root).expect("temporary worktree root is removed");
+    }
+
+    #[tokio::test]
+    async fn worktree_adopt_unknown_worktree_does_not_queue_approval() {
+        let runtime = DaemonRuntime::new(16);
+        let unknown_id = WorktreeId::new();
+
+        let error = runtime
+            .request_worktree_adoption(unknown_id.clone())
+            .await
+            .expect_err("unknown worktree adoption is rejected");
+
+        assert!(error.to_string().contains(&unknown_id.to_string()));
+        assert!(runtime.list_approvals().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worktree_adopt_before_diff_capture_is_rejected() {
+        let runtime = DaemonRuntime::new(16);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: std::env::temp_dir(),
+            branch_name: "agentmux/task-impl".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::ReviewReady,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.clone();
+        runtime.register_worktree(worktree).await;
+        mark_arena_candidate(
+            &runtime,
+            worktree_id.clone(),
+            None,
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+
+        let error = runtime
+            .request_worktree_adoption(worktree_id)
+            .await
+            .expect_err("adoption before diff capture is rejected");
+
+        assert!(error.to_string().contains("captured diff"));
+        assert!(runtime.list_approvals().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worktree_adopt_after_test_failure_is_rejected() {
+        let runtime = DaemonRuntime::new(16);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: std::env::temp_dir(),
+            branch_name: "agentmux/task-impl".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::Failed,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.clone();
+        runtime.register_worktree(worktree).await;
+        mark_arena_candidate(
+            &runtime,
+            worktree_id.clone(),
+            Some("README.md | 1".to_string()),
+            Some(TestRunStatus::Failed),
+        )
+        .await;
+
+        let error = runtime
+            .request_worktree_adoption(worktree_id)
+            .await
+            .expect_err("adoption after failed tests is rejected");
+
+        assert!(error.to_string().contains("passed tests"));
+        assert!(runtime.list_approvals().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn worktree_adopt_rejects_second_pending_approval() {
+        let runtime = DaemonRuntime::new(16);
+        let first = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: std::env::temp_dir(),
+            branch_name: "agentmux/task-first".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::ReviewReady,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let second = Worktree {
+            id: WorktreeId::new(),
+            branch_name: "agentmux/task-second".to_string(),
+            ..first.clone()
+        };
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        runtime.register_worktree(first).await;
+        runtime.register_worktree(second).await;
+        mark_arena_candidate(
+            &runtime,
+            first_id.clone(),
+            Some("first".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+        mark_arena_candidate(
+            &runtime,
+            second_id.clone(),
+            Some("second".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+
+        let first_approval = runtime
+            .request_worktree_adoption(first_id.clone())
+            .await
+            .expect("first adoption approval is queued");
+        let second_error = runtime
+            .request_worktree_adoption(second_id.clone())
+            .await
+            .expect_err("second pending adoption is rejected");
+
+        assert!(second_error.to_string().contains("already pending"));
+        assert_eq!(runtime.list_approvals().await.len(), 1);
+
+        runtime
+            .reject_approval(&first_approval.id)
+            .await
+            .expect("first approval is rejected");
+        wait_for_worktree_status(&runtime, &first_id, WorktreeStatus::Archived).await;
+
+        let second_approval = runtime
+            .request_worktree_adoption(second_id.clone())
+            .await
+            .expect("adoption is allowed after pending approval is decided");
+        assert_eq!(second_approval.worktree_id, Some(second_id));
+    }
+
+    #[tokio::test]
+    async fn rejecting_one_worktree_adoption_keeps_other_candidate_ready() {
+        let runtime = DaemonRuntime::new(16);
+        let first = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: std::env::temp_dir(),
+            branch_name: "agentmux/task-first".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::ReviewReady,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let second = Worktree {
+            id: WorktreeId::new(),
+            branch_name: "agentmux/task-second".to_string(),
+            ..first.clone()
+        };
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        runtime.register_worktree(first).await;
+        runtime.register_worktree(second).await;
+        mark_arena_candidate(
+            &runtime,
+            first_id.clone(),
+            Some("first".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+        mark_arena_candidate(
+            &runtime,
+            second_id.clone(),
+            Some("second".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+
+        let approval = runtime
+            .request_worktree_adoption(first_id.clone())
+            .await
+            .expect("adoption approval is queued");
+        runtime
+            .reject_approval(&approval.id)
+            .await
+            .expect("approval is rejected");
+
+        wait_for_worktree_status(&runtime, &first_id, WorktreeStatus::Archived).await;
+        assert_eq!(
+            runtime.worktree_by_id(&second_id).await.unwrap().status,
+            WorktreeStatus::ReviewReady
+        );
+    }
+
+    #[tokio::test]
+    async fn approving_adoption_for_missing_repo_reports_error_without_status_change() {
+        let runtime = DaemonRuntime::new(16);
+        let mut events = runtime.subscribe();
+        let root =
+            std::env::temp_dir().join(format!("agentmux-missing-promote-{}", ulid::Ulid::new()));
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: root.join("worktree"),
+            branch_name: "agentmux/task-missing".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::ReviewReady,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.clone();
+        runtime
+            .register_worktree_with_repo_root(worktree, root.join("repo"))
+            .await;
+        mark_arena_candidate(
+            &runtime,
+            worktree_id.clone(),
+            Some("missing".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+
+        let approval = runtime
+            .request_worktree_adoption(worktree_id.clone())
+            .await
+            .expect("adoption approval is queued");
+        runtime
+            .approve_approval(&approval.id)
+            .await
+            .expect("approval decision is accepted");
+
+        for _ in 0..20 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("daemon emits promote failure")
+                .expect("event is available");
+            if event.kind == IpcEventKind::Error
+                && event.payload["signal"] == "worktree_promote_failed"
+            {
+                assert_eq!(event.payload["worktree_id"], worktree_id.to_string());
+                assert_eq!(
+                    runtime.worktree_by_id(&worktree_id).await.unwrap().status,
+                    WorktreeStatus::ReviewReady
+                );
+                return;
+            }
+        }
+        panic!("promote failure event was not emitted");
+    }
+
+    #[tokio::test]
+    async fn approving_worktree_adopt_promotes_via_merge() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-worktree-adopt-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary worktree root is created");
+        test_git(&root, ["init", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        test_git(&root, ["add", "README.md"]);
+        test_git(
+            &root,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        test_git(&root, ["branch", "agentmux/task-impl"]);
+        let runtime = DaemonRuntime::new(16);
+        let worktree = Worktree {
+            id: WorktreeId::new(),
+            project_id: ProjectId::new(),
+            task_id: TaskId::new(),
+            owner_agent_id: None,
+            path: root.clone(),
+            branch_name: "agentmux/task-impl".to_string(),
+            base_branch: "main".to_string(),
+            status: WorktreeStatus::ReviewReady,
+            created_at: DateTimeUtc::UNIX_EPOCH,
+        };
+        let worktree_id = worktree.id.clone();
+        runtime
+            .register_worktree_with_repo_root(worktree, root.clone())
+            .await;
+        mark_arena_candidate(
+            &runtime,
+            worktree_id.clone(),
+            Some("README.md | 0".to_string()),
+            Some(TestRunStatus::Passed),
+        )
+        .await;
+
+        let approval = runtime
+            .request_worktree_adoption(worktree_id.clone())
+            .await
+            .expect("adoption approval is queued");
+        runtime
+            .approve_approval(&approval.id)
+            .await
+            .expect("approval is accepted");
+
+        wait_for_worktree_status(&runtime, &worktree_id, WorktreeStatus::Promoted).await;
+        std::fs::remove_dir_all(root).expect("temporary worktree root is removed");
+    }
+
+    #[tokio::test]
+    async fn arena_run_rejects_duplicate_provider_labels_before_side_effects() {
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-arena-duplicate-provider-{}",
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&root).expect("temporary repo root is created");
+        test_git(&root, ["init", "-b", "main"]);
+        std::fs::write(root.join("README.md"), "hello\n").unwrap();
+        test_git(&root, ["add", "README.md"]);
+        test_git(
+            &root,
+            [
+                "-c",
+                "user.name=Agentmux Test",
+                "-c",
+                "user.email=agentmux@example.invalid",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+        let runtime = DaemonRuntime::new(16);
+
+        let error = runtime
+            .run_task_with_arena(
+                "compare duplicate providers".to_string(),
+                vec!["claude".to_string(), "claude".to_string()],
+                root.clone(),
+                "main".to_string(),
+            )
+            .await
+            .expect_err("duplicate providers are rejected");
+
+        assert!(error.to_string().contains("duplicated"));
+        assert!(runtime.list_worktrees().await.is_empty());
+        assert_eq!(runtime.status_payload().await["agent_count"], 0);
+        assert_eq!(
+            git_stdout(&root, ["worktree", "list", "--porcelain"])
+                .matches("worktree ")
+                .count(),
+            1
+        );
+
+        std::fs::remove_dir_all(root).expect("temporary repo root is removed");
     }
 
     #[tokio::test]
@@ -5528,6 +6610,74 @@ AGENTMUX_RESULT:
             "expected response frame, got {frame:?}"
         );
         serde_json::from_value(frame).expect("response frame is valid")
+    }
+
+    fn test_git<const N: usize>(repo: &Path, args: [&str; N]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn git_stdout<const N: usize>(repo: &Path, args: [&str; N]) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+
+    async fn mark_arena_candidate(
+        runtime: &DaemonRuntime,
+        worktree_id: WorktreeId,
+        diff_stat: Option<String>,
+        test_status: Option<TestRunStatus>,
+    ) {
+        let mut state = runtime.state.write().await;
+        state.arena_candidates.insert(
+            worktree_id.clone(),
+            ArenaCandidate {
+                worktree_id,
+                agent_id: AgentSessionId::new(),
+                provider: "test".to_string(),
+                diff_stat,
+                test_status,
+            },
+        );
+    }
+
+    async fn wait_for_worktree_status(
+        runtime: &DaemonRuntime,
+        worktree_id: &WorktreeId,
+        expected: WorktreeStatus,
+    ) {
+        for _ in 0..20 {
+            let worktree = runtime.worktree_by_id(worktree_id).await.unwrap();
+            if worktree.status == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let worktree = runtime.worktree_by_id(worktree_id).await.unwrap();
+        assert_eq!(worktree.status, expected);
     }
 
     async fn assert_no_frame<R>(reader: &mut JsonlReader<R>)
