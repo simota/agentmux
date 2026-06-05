@@ -2360,7 +2360,9 @@ mod tests {
         let pane = state.pane("agent_001").expect("pane");
         assert_eq!(pane.grid().line_text(0).as_deref(), Some("A変"));
         assert_eq!(pane.grid().cursor().row, 0);
-        assert_eq!(pane.grid().cursor().col, 3);
+        // The wide glyph fills up to the right margin; the cursor parks on the
+        // last column (wrap pending) instead of going past the grid.
+        assert_eq!(pane.grid().cursor().col, 2);
     }
 
     #[test]

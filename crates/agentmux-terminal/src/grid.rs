@@ -124,6 +124,11 @@ pub struct ScreenGrid {
     cols: u16,
     cells: Vec<Cell>,
     cursor: CursorState,
+    /// xterm-style wrap-pending: a printable just landed in the last column,
+    /// the cursor visually stays there, and the NEXT printable wraps. The
+    /// cursor column never exceeds `cols - 1`, so erase/move operations issued
+    /// in this state behave like a real terminal instead of going off-grid.
+    wrap_pending: bool,
     scroll_top: u16,
     scroll_bottom: u16,
     scrollback: VecDeque<Line>,
@@ -143,6 +148,7 @@ impl ScreenGrid {
             cols,
             cells: vec![Cell::blank(); len],
             cursor: CursorState::default(),
+            wrap_pending: false,
             scroll_top: 0,
             scroll_bottom: rows.saturating_sub(1),
             scrollback: VecDeque::new(),
@@ -202,6 +208,7 @@ impl ScreenGrid {
     pub fn set_cursor(&mut self, row: u16, col: u16) {
         self.cursor.row = row.min(self.rows.saturating_sub(1));
         self.cursor.col = col.min(self.cols.saturating_sub(1));
+        self.wrap_pending = false;
     }
 
     pub fn move_cursor(&mut self, row_delta: i16, col_delta: i16) {
@@ -255,11 +262,13 @@ impl ScreenGrid {
 
         if ch == '\r' {
             self.cursor.col = 0;
+            self.wrap_pending = false;
             return;
         }
 
         if ch == '\x08' {
             self.cursor.col = self.cursor.col.saturating_sub(1);
+            self.wrap_pending = false;
             return;
         }
 
@@ -269,7 +278,7 @@ impl ScreenGrid {
         }
         let width = if width > 1 { 2 } else { 1 };
 
-        if self.cursor.col >= self.cols {
+        if self.wrap_pending {
             self.newline();
         }
 
@@ -310,9 +319,13 @@ impl ScreenGrid {
         let dirty_start = cleared.map_or(col, |(start, _)| start.min(col));
         let dirty_end = cleared.map_or(col + width, |(_, end)| end.max(col + width));
         self.mark_dirty(row, dirty_start, 1, dirty_end.saturating_sub(dirty_start));
-        self.cursor.col += width;
-        if self.cursor.col >= self.cols {
-            self.cursor.col = self.cols;
+        if col + width >= self.cols {
+            // The glyph landed in the last column: the cursor stays at the
+            // right margin and the next printable wraps (xterm semantics).
+            self.cursor.col = self.cols - 1;
+            self.wrap_pending = true;
+        } else {
+            self.cursor.col = col + width;
         }
     }
 
@@ -587,6 +600,7 @@ impl ScreenGrid {
 
     fn newline(&mut self) {
         self.cursor.col = 0;
+        self.wrap_pending = false;
         if self.cursor.row == self.scroll_bottom {
             self.scroll_up_region(self.scroll_top, self.scroll_bottom, 1);
         } else if self.cursor.row + 1 >= self.rows {

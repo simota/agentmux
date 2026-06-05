@@ -269,11 +269,12 @@ impl vte::Perform for GridPerformer<'_> {
         match byte {
             b'\n' | b'\r' | 0x08 => self.grid().write_char(byte as char, CellStyle::default()),
             b'\t' => {
-                let next_tab = ((self.grid().cursor().col / 8) + 1) * 8;
-                let spaces = next_tab.saturating_sub(self.grid().cursor().col).max(1);
-                for _ in 0..spaces {
-                    self.print(' ');
-                }
+                // Move to the next tab stop without erasing cells (a real
+                // terminal's TAB repositions the cursor; it never prints).
+                let cursor = self.grid().cursor();
+                let next_tab = ((cursor.col / 8) + 1) * 8;
+                let col = next_tab.min(self.grid().cols().saturating_sub(1));
+                self.grid().set_cursor(cursor.row, col);
             }
             _ => {}
         }
@@ -416,8 +417,50 @@ mod tests {
 
         parser.advance(b"ab\tc\rZ\nxy");
 
-        assert_eq!(parser.grid().line_text(0).as_deref(), Some("Z       "));
+        // TAB moves the cursor to the next tab stop (clamped to the right
+        // margin) without erasing `ab`; `c` then prints at the last column.
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("Zb     c"));
         assert_eq!(parser.grid().line_text(1).as_deref(), Some("xy      "));
+    }
+
+    #[test]
+    fn tab_moves_cursor_without_erasing_cells() {
+        let mut parser = TerminalParser::new(1, 16);
+
+        parser.advance(b"abcdef\r\t!");
+
+        assert_eq!(
+            parser.grid().line_text(0).as_deref(),
+            Some("abcdef  !       ")
+        );
+    }
+
+    #[test]
+    fn erase_and_backspace_at_right_margin_use_the_last_column() {
+        // Print up to the last column: the cursor must stay at the right
+        // margin (wrap pending) instead of going off-grid, so EL erases the
+        // last cell and BS steps back from it (xterm semantics).
+        let mut parser = TerminalParser::new(2, 4);
+
+        parser.advance(b"abcd");
+        assert_eq!(parser.grid().cursor().col, 3, "cursor parks at the margin");
+
+        parser.advance(b"\x1b[K");
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("abc "));
+
+        let mut parser = TerminalParser::new(2, 4);
+        parser.advance(b"abcd\x08X");
+        assert_eq!(
+            parser.grid().line_text(0).as_deref(),
+            Some("abXd"),
+            "BS from the margin lands on the second-to-last column"
+        );
+
+        // The next printable after a full row still wraps.
+        let mut parser = TerminalParser::new(2, 4);
+        parser.advance(b"abcde");
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("abcd"));
+        assert_eq!(parser.grid().line_text(1).as_deref(), Some("e   "));
     }
 
     #[test]

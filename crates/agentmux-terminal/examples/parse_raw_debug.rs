@@ -50,6 +50,11 @@ fn main() {
     println!(
         "non-blank cells: {printed} | underline: {underline} | dim: {dim} | bold: {bold} | italic: {italic} | reverse: {reverse}"
     );
+    let cursor = grid.cursor();
+    println!(
+        "cursor: row {} col {} visible {}",
+        cursor.row, cursor.col, cursor.visible
+    );
     println!("--- screen ---");
     for row in 0..rows {
         if let Some(line) = grid.line_text(row) {
