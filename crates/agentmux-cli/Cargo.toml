@@ -9,6 +9,7 @@ description = "agentmux CLI — user-facing command-line interface and TUI clien
 
 [features]
 activity-feed = ["agentmux-tui/activity-feed"]
+arena = ["agentmux-tui/arena"]
 
 [[bin]]
 name = "agentmux"
