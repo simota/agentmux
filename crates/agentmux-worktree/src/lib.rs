@@ -12,6 +12,6 @@
 pub mod worktree;
 
 pub use worktree::{
-    Artifact, CaptureDiff, CapturedDiff, CreateWorktree, GitWorktree, TestCommand, TestRunArtifact,
-    TestRunStatus, Worktree, WorktreeManager, agentmux_branch_name,
+    Artifact, CaptureDiff, CapturedDiff, CreateWorktree, GitWorktree, MergeOutcome, TestCommand,
+    TestRunArtifact, TestRunStatus, Worktree, WorktreeManager, agentmux_branch_name,
 };

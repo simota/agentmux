@@ -97,6 +97,7 @@ pub enum WorktreeStatus {
     ReviewReady,
     Promoted,
     Archived,
+    Conflicted,
     Failed,
 }
 
