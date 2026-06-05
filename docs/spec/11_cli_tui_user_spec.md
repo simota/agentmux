@@ -17,6 +17,7 @@ agentmux project init|open|status|install-result-protocol
 agentmux task run|status|pause|resume|cancel|summary
 agentmux agent ls|spawn|stop|send|inject|focus|interrupt
 agentmux message list|history|show|send|inject
+agentmux meeting open|close|list
 agentmux context add|list|show|search|attach|inject|export
 agentmux worktree list|diff|test|promote|adopt|archive
 agentmux approval list|approve|reject
@@ -151,11 +152,28 @@ agentmux message history --limit 20
 agentmux message history --agent impl-codex
 agentmux message history --task task_123 --status delivered
 agentmux message history --kind handoff
+agentmux message history --thread thread_01HX...
 ```
 
 `message list` はdaemon payloadをJSONで表示する。`message history` は履歴確認用に
 `created_at`, `delivery_status`, `kind`, `from`, `to`, `message_id`, `body`
 を人間向けの表で表示する。
+
+### 3.8 meeting(マルチパーティ会議)
+
+```bash
+agentmux meeting open "X の設計方針" --participants claude-a,codex-b,agy-c
+agentmux meeting open "障害の原因切り分け" --participants claude-a,codex-b --max-turns 3
+agentmux message send --thread thread_01HX... --kind Finding "私の見解は..."
+agentmux meeting list
+agentmux meeting close thread_01HX...
+```
+
+`meeting open` は `MessageThread`(ADR-0006)を作成し、議題 kickoff message を
+参加者全員へ inject する。`--thread` 付きの message send は参加者全員
+(送信者を除く)へ fan-out 配送される。1 参加者あたりの発言数は
+`--max-turns`(既定 5)で制限され、上限到達後の投稿は拒否される。
+詳細は `06_message_bus_context_broker.md §3.6`。
 
 ## 4. TUI画面構成
 

@@ -235,6 +235,7 @@ enum WorktreeStatus {
 struct AgentMessage {
     id: MessageId,
     task_id: Option<TaskId>,
+    thread_id: Option<ThreadId>,   // 所属する会議スレッド(任意)
     from: MessageSource,
     to: MessageTarget,
     kind: MessageKind,
@@ -267,7 +268,27 @@ enum MessageTarget {
     Role(AgentRole),
     Task(TaskId),
     Team(String),
+    Thread(ThreadId),   // 会議スレッド参加者全員(送信者を除く)
     Broadcast,
+}
+```
+
+### 8.1 MessageThread(マルチパーティ会議)
+
+3 者以上の agent が同一議題を議論するための会話スレッド。ID prefix は `thread_`。
+`to: Thread(id)` のメッセージは参加者全員(送信者を除く)へ fan-out 配送される。
+詳細仕様は `06_message_bus_context_broker.md §3.6` と ADR-0006 を参照。
+
+```rust
+struct MessageThread {
+    id: ThreadId,
+    topic: String,                        // 議題(injected prompt に含まれる)
+    participants: Vec<AgentSessionId>,
+    opened_by: MessageSource,
+    status: ThreadStatus,                 // Open | Closed
+    max_messages_per_participant: u32,    // 発言上限(ループガード、既定 5)
+    created_at: DateTimeUtc,
+    closed_at: Option<DateTimeUtc>,
 }
 ```
 

@@ -7,9 +7,13 @@
 
 pub mod bus;
 pub mod message;
+pub mod thread;
 
 pub use bus::{
     AgentDescriptor, DeliveryWait, DeliveryWaitReason, IdleDelivery, Inbox, MessageBus,
     PreparedInjection, PromptContext, PromptContextItem, initial_delivery_status, render_prompt,
 };
 pub use message::{AgentMessage, MessageKind, MessageSource, MessageTarget, NewAgentMessage};
+pub use thread::{
+    DEFAULT_MAX_MESSAGES_PER_PARTICIPANT, MessageThread, NewMessageThread, ThreadStatus,
+};

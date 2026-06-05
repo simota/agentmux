@@ -199,3 +199,17 @@ Deferred:
 Deferred:
 
 - Rust crate 分割公開、package manager 配布、商標レビューは v0.1 の利用者フィードバック後に release checklist として扱う。
+
+## 14. Meeting thread の永続化と進行制御
+
+**v0.1 decision:** マルチパーティ会議(`MessageThread`、ADR-0006)は messages と同じく in-memory + event log(`thread.opened`/`thread.closed`)で管理し、SQLite には永続化しない。発言順序の調停(turn-taking)は実装せず、`max_messages_per_participant`(既定 5)の発言上限のみ daemon が強制する。
+
+理由:
+
+- messages 本体が v0.1 で SQLite 非永続のため、thread だけ永続化しても再起動後に整合しない。
+- 進行制御は opener(人間 or facilitator agent)が `kind: Question` で指名する運用で十分に始められる。
+
+Deferred:
+
+- thread/messages の SQLite 永続化は同時に設計する。
+- 発言順序の調停(ラウンドロビン、指名制の強制)は実運用での会議ログを見てから判断する。

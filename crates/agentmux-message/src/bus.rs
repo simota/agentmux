@@ -8,10 +8,12 @@ use std::path::PathBuf;
 
 use agentmux_core::{
     AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ContextItemId,
-    DateTimeUtc, DeliveryMode, DeliveryStatus, MessageId, Priority, TaskId, error::Result,
+    DateTimeUtc, DeliveryMode, DeliveryStatus, MessageId, Priority, TaskId, ThreadId,
+    error::Result,
 };
 
 use crate::message::{AgentMessage, MessageKind, MessageSource, MessageTarget, NewAgentMessage};
+use crate::thread::{MessageThread, NewMessageThread, ThreadStatus};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentDescriptor {
@@ -107,6 +109,7 @@ pub struct MessageBus {
     messages: BTreeMap<MessageId, AgentMessage>,
     agents: BTreeMap<AgentSessionId, AgentDescriptor>,
     inboxes: BTreeMap<AgentSessionId, Inbox>,
+    threads: BTreeMap<ThreadId, MessageThread>,
 }
 
 impl MessageBus {
@@ -144,6 +147,8 @@ impl MessageBus {
             .messages
             .values()
             .filter(|message| backfill_eligible_status(&message.delivery_status))
+            // A sender never claims its own fan-out message back (echo guard).
+            .filter(|message| message.from != MessageSource::Agent(agent_id.clone()))
             .filter(|message| {
                 self.resolve_target(&message.to)
                     .map(|ids| ids.iter().any(|id| id == agent_id))
@@ -177,7 +182,14 @@ impl MessageBus {
             ));
         }
 
-        let recipients = self.resolve_target(&input.to)?;
+        let input = self.normalize_thread_message(input)?;
+        let recipients = self.delivery_recipients(&input)?;
+        if recipients.is_empty() {
+            return Err(AgentmuxError::UserError(format!(
+                "message target '{}' resolved to no agents other than the sender",
+                target_label(&input.to)
+            )));
+        }
         let message = AgentMessage::new(input);
         for agent_id in recipients {
             self.inboxes
@@ -215,7 +227,8 @@ impl MessageBus {
         // Resolve recipients; empty is acceptable — the message is stored
         // without any inbox entry and is backfilled when a matching agent
         // registers later (see `backfill_inbox_for_registered_agent`).
-        let recipients = match self.resolve_target(&input.to) {
+        let input = self.normalize_thread_message(input)?;
+        let recipients = match self.delivery_recipients(&input) {
             Ok(ids) => ids,
             Err(AgentmuxError::UserError(ref msg)) if msg.contains("resolved to no agents") => {
                 vec![]
@@ -327,7 +340,11 @@ impl MessageBus {
             .messages
             .get(&message_id)
             .ok_or_else(|| unknown_message(&message_id))?;
-        let prompt = render_prompt(message, provider, context);
+        let thread = message
+            .thread_id
+            .as_ref()
+            .and_then(|thread_id| self.threads.get(thread_id));
+        let prompt = render_prompt(message, provider, context, thread);
         self.update_delivery_status(&message_id, DeliveryStatus::Injecting, now)?;
 
         Ok(IdleDelivery::Ready(PreparedInjection {
@@ -347,8 +364,20 @@ impl MessageBus {
         Ok(self.messages.get(&message_id))
     }
 
-    pub fn mark_message_injected(&mut self, id: &MessageId, now: DateTimeUtc) -> Result<()> {
-        self.update_delivery_status(id, DeliveryStatus::Delivered, now)
+    /// Record a completed injection into `agent_id`. The aggregate status
+    /// becomes `Delivered` (= at least one recipient), while `delivered_to`
+    /// tracks per-recipient progress so fan-out targets (role/team/thread/
+    /// broadcast) still inject into the remaining recipients.
+    pub fn mark_message_injected(
+        &mut self,
+        id: &MessageId,
+        agent_id: &AgentSessionId,
+        now: DateTimeUtc,
+    ) -> Result<()> {
+        let message = self.message_mut(id)?;
+        message.delivered_to.insert(agent_id.clone());
+        message.set_delivery_status(DeliveryStatus::Delivered, now);
+        Ok(())
     }
 
     pub fn mark_message_injection_failed(
@@ -392,6 +421,18 @@ impl MessageBus {
                 .filter(|agent| agent.teams.contains(team))
                 .map(|agent| agent.id.clone())
                 .collect(),
+            MessageTarget::Thread(thread_id) => self
+                .threads
+                .get(thread_id)
+                .map(|thread| {
+                    thread
+                        .participants
+                        .iter()
+                        .filter(|id| self.agents.contains_key(*id))
+                        .cloned()
+                        .collect()
+                })
+                .unwrap_or_default(),
             MessageTarget::Broadcast => self.agents.keys().cloned().collect(),
         };
 
@@ -402,6 +443,108 @@ impl MessageBus {
             )));
         }
         Ok(recipients)
+    }
+
+    /// Open a multi-party conversation thread (meeting).
+    pub fn open_thread(&mut self, input: NewMessageThread) -> Result<MessageThread> {
+        if input.topic.trim().is_empty() {
+            return Err(AgentmuxError::UserError(
+                "thread topic must not be empty".to_string(),
+            ));
+        }
+        if input.participants.len() < 2 {
+            return Err(AgentmuxError::UserError(
+                "a thread needs at least 2 participants".to_string(),
+            ));
+        }
+        for participant in &input.participants {
+            if !self.agents.contains_key(participant) {
+                return Err(unknown_agent(participant));
+            }
+        }
+        let thread = MessageThread::new(input);
+        self.threads.insert(thread.id.clone(), thread.clone());
+        Ok(thread)
+    }
+
+    pub fn close_thread(&mut self, id: &ThreadId, now: DateTimeUtc) -> Result<MessageThread> {
+        let thread = self.threads.get_mut(id).ok_or_else(|| unknown_thread(id))?;
+        thread.close(now);
+        Ok(thread.clone())
+    }
+
+    pub fn get_thread(&self, id: &ThreadId) -> Option<&MessageThread> {
+        self.threads.get(id)
+    }
+
+    pub fn list_threads(&self) -> Vec<&MessageThread> {
+        self.threads.values().collect()
+    }
+
+    /// Number of stored messages that belong to `thread_id`.
+    pub fn thread_message_count(&self, thread_id: &ThreadId) -> usize {
+        self.messages
+            .values()
+            .filter(|message| message.thread_id.as_ref() == Some(thread_id))
+            .count()
+    }
+
+    /// Validate thread membership/limits and tag the message with its thread.
+    ///
+    /// - `to: Thread(id)` implies `thread_id = id`.
+    /// - Messages into a thread require the thread to exist and be open.
+    /// - An agent sender must be a participant and under the per-participant
+    ///   message limit (loop guard); the limit error tells the agent to
+    ///   summarize and ask the human instead of continuing.
+    fn normalize_thread_message(&self, mut input: NewAgentMessage) -> Result<NewAgentMessage> {
+        if let MessageTarget::Thread(thread_id) = &input.to {
+            input.thread_id = Some(thread_id.clone());
+        }
+        let Some(thread_id) = input.thread_id.clone() else {
+            return Ok(input);
+        };
+        let thread = self
+            .threads
+            .get(&thread_id)
+            .ok_or_else(|| unknown_thread(&thread_id))?;
+        if thread.status == ThreadStatus::Closed {
+            return Err(AgentmuxError::UserError(format!(
+                "thread '{thread_id}' is closed"
+            )));
+        }
+        if let MessageSource::Agent(sender) = &input.from {
+            if !thread.is_participant(sender) {
+                return Err(AgentmuxError::UserError(format!(
+                    "agent '{sender}' is not a participant of thread '{thread_id}'"
+                )));
+            }
+            let sent = self
+                .messages
+                .values()
+                .filter(|message| message.thread_id.as_ref() == Some(&thread_id))
+                .filter(|message| message.from == input.from)
+                .count();
+            if sent >= thread.max_messages_per_participant as usize {
+                return Err(AgentmuxError::UserError(format!(
+                    "thread '{thread_id}' message limit reached ({} per participant): \
+                     summarize your conclusion and ask the human for a decision \
+                     (kind: Question, outside the thread) instead of continuing",
+                    thread.max_messages_per_participant
+                )));
+            }
+        }
+        Ok(input)
+    }
+
+    /// Resolve the target and drop the sender from fan-out recipients so an
+    /// agent never receives its own role/team/thread/broadcast message back.
+    fn delivery_recipients(&self, input: &NewAgentMessage) -> Result<Vec<AgentSessionId>> {
+        let recipients = self.resolve_target(&input.to)?;
+        Ok(exclude_sender_from_fan_out(
+            recipients,
+            &input.from,
+            &input.to,
+        ))
     }
 
     fn message_mut(&mut self, id: &MessageId) -> Result<&mut AgentMessage> {
@@ -419,12 +562,17 @@ impl MessageBus {
 
         Ok(inbox.message_ids.iter().find_map(|message_id| {
             let message = self.messages.get(message_id)?;
+            // `Delivered` stays eligible for recipients the message has not
+            // reached yet (fan-out targets inject once per recipient);
+            // `delivered_to` prevents re-injecting into the same session.
             if message.delivery_mode == DeliveryMode::InjectWhenIdle
+                && !message.delivered_to.contains(agent_id)
                 && matches!(
                     message.delivery_status,
                     DeliveryStatus::Queued
                         | DeliveryStatus::Rendered
                         | DeliveryStatus::WaitingForAgent
+                        | DeliveryStatus::Delivered
                 )
             {
                 Some(message_id.clone())
@@ -439,15 +587,22 @@ pub fn render_prompt(
     message: &AgentMessage,
     provider: AgentProvider,
     context: &PromptContext,
+    thread: Option<&MessageThread>,
 ) -> String {
     let mut rendered = format!(
-        "[agentmux handoff]\nfrom: {}\nkind: {}\npriority: {}\nmessage_id: {}\n\nmessage:\n{}\n\nattached context:\n",
+        "[agentmux handoff]\nfrom: {}\nkind: {}\npriority: {}\nmessage_id: {}\n",
         source_label(&message.from),
         kind_label(&message.kind),
         priority_label(&message.priority),
         message.id,
-        message.body
     );
+    if let Some(thread) = thread {
+        rendered.push_str(&format!("thread: {}\ntopic: {}\n", thread.id, thread.topic));
+    }
+    rendered.push_str(&format!(
+        "\nmessage:\n{}\n\nattached context:\n",
+        message.body
+    ));
 
     if context.inline_items.is_empty() && context.mailbox_paths.is_empty() {
         rendered.push_str("- none\n");
@@ -463,6 +618,16 @@ pub fn render_prompt(
     rendered.push_str("\nrequired:\n");
     if !context.mailbox_paths.is_empty() {
         rendered.push_str("- attached context の path を必要に応じて読んでください\n");
+    }
+    if let Some(thread) = thread {
+        rendered.push_str(&format!(
+            "- この会議スレッドへの返信は `agentmux message send --thread {} --kind <Kind> \"<body>\"` を使ってください(自分以外の参加者全員に届きます)\n",
+            thread.id
+        ));
+        rendered.push_str(&format!(
+            "- 発言上限は 1 参加者あたり {} 通です。上限に達したら結論を要約し、スレッド外で人間に判断を仰いでください\n",
+            thread.max_messages_per_participant
+        ));
     }
     rendered.push_str("- 内容を読んで必要なら作業してください\n");
     rendered.push_str("- 通常の返信や進捗共有では送信前に人間確認を求めないでください\n");
@@ -481,8 +646,30 @@ pub fn render_prompt(
     rendered
 }
 
+/// Drop the sender from fan-out recipients. Explicitly addressed targets
+/// (`Agent` / `AgentName`) are kept as-is — only one-to-many targets
+/// (role/task/team/thread/broadcast) exclude the sender, so an agent never
+/// gets its own meeting statement injected back (echo loop guard).
+fn exclude_sender_from_fan_out(
+    recipients: Vec<AgentSessionId>,
+    from: &MessageSource,
+    to: &MessageTarget,
+) -> Vec<AgentSessionId> {
+    let MessageSource::Agent(sender) = from else {
+        return recipients;
+    };
+    if matches!(to, MessageTarget::Agent(_) | MessageTarget::AgentName(_)) {
+        return recipients;
+    }
+    recipients.into_iter().filter(|id| id != sender).collect()
+}
+
 fn unknown_agent(agent_id: &AgentSessionId) -> AgentmuxError {
     AgentmuxError::UserError(format!("unknown agent session '{agent_id}'"))
+}
+
+fn unknown_thread(thread_id: &ThreadId) -> AgentmuxError {
+    AgentmuxError::UserError(format!("unknown thread '{thread_id}'"))
 }
 
 fn unknown_message(message_id: &MessageId) -> AgentmuxError {
@@ -507,6 +694,7 @@ fn target_label(target: &MessageTarget) -> String {
         MessageTarget::Role(role) => format!("role:{role:?}"),
         MessageTarget::Task(id) => format!("task:{id}"),
         MessageTarget::Team(team) => format!("team:{team}"),
+        MessageTarget::Thread(id) => format!("thread:{id}"),
         MessageTarget::Broadcast => "broadcast".to_string(),
     }
 }
@@ -586,6 +774,7 @@ mod tests {
     fn message_input(to: MessageTarget, delivery_mode: DeliveryMode) -> NewAgentMessage {
         NewAgentMessage {
             task_id: None,
+            thread_id: None,
             from: MessageSource::User(ClientId::new()),
             to,
             kind: MessageKind::Handoff,
@@ -896,13 +1085,13 @@ mod tests {
             .expect("message is created");
         let failed = bus
             .create_message(message_input(
-                MessageTarget::Agent(agent_id),
+                MessageTarget::Agent(agent_id.clone()),
                 DeliveryMode::InjectWhenIdle,
             ))
             .expect("message is created");
         let now = DateTimeUtc::UNIX_EPOCH;
 
-        bus.mark_message_injected(&delivered.id, now)
+        bus.mark_message_injected(&delivered.id, &agent_id, now)
             .expect("delivered status is recorded");
         bus.mark_message_injection_failed(&failed.id, now)
             .expect("failed status is recorded");
@@ -978,7 +1167,7 @@ mod tests {
             mailbox_paths: vec![PathBuf::from(".agentmux/inbox/impl-codex/msg-00042.md")],
         };
 
-        let prompt = render_prompt(&message, AgentProvider::Codex, &context);
+        let prompt = render_prompt(&message, AgentProvider::Codex, &context, None);
 
         assert!(prompt.contains("[agentmux handoff]"));
         assert!(prompt.contains("kind: Handoff"));
@@ -990,6 +1179,266 @@ mod tests {
         assert!(prompt.contains("送信前に人間確認を求めない"));
         assert!(!prompt.contains("内容を確認してください"));
         assert!(prompt.contains("workspace 内の path"));
+    }
+
+    fn three_party_bus() -> (MessageBus, AgentSessionId, AgentSessionId, AgentSessionId) {
+        let mut bus = MessageBus::new();
+        let claude = AgentSessionId::new();
+        let codex = AgentSessionId::new();
+        let agy = AgentSessionId::new();
+        bus.register_agent(
+            AgentDescriptor::new(claude.clone(), AgentRole::Implementer).with_name("claude-a"),
+        );
+        bus.register_agent(
+            AgentDescriptor::new(codex.clone(), AgentRole::Reviewer).with_name("codex-b"),
+        );
+        bus.register_agent(AgentDescriptor::new(agy.clone(), AgentRole::Tester).with_name("agy-c"));
+        (bus, claude, codex, agy)
+    }
+
+    fn thread_input(
+        participants: Vec<AgentSessionId>,
+        max_messages_per_participant: Option<u32>,
+    ) -> NewMessageThread {
+        NewMessageThread {
+            topic: "X の設計方針".to_string(),
+            participants,
+            opened_by: MessageSource::User(ClientId::new()),
+            max_messages_per_participant,
+        }
+    }
+
+    #[test]
+    fn thread_message_fans_out_to_all_participants_except_sender() {
+        let (mut bus, claude, codex, agy) = three_party_bus();
+        let thread = bus
+            .open_thread(thread_input(
+                vec![claude.clone(), codex.clone(), agy.clone()],
+                None,
+            ))
+            .expect("thread opens");
+
+        let mut input = message_input(
+            MessageTarget::Thread(thread.id.clone()),
+            DeliveryMode::InjectWhenIdle,
+        );
+        input.from = MessageSource::Agent(claude.clone());
+        let message = bus.create_message(input).expect("thread message accepted");
+
+        assert_eq!(message.thread_id, Some(thread.id.clone()));
+        assert!(
+            bus.inbox(&claude).unwrap().is_empty(),
+            "sender must not receive its own thread message"
+        );
+        assert_eq!(bus.inbox(&codex).unwrap()[0].id, message.id);
+        assert_eq!(bus.inbox(&agy).unwrap()[0].id, message.id);
+        assert_eq!(bus.thread_message_count(&thread.id), 1);
+    }
+
+    #[test]
+    fn broadcast_and_role_fan_out_exclude_the_sending_agent() {
+        let (mut bus, claude, codex, agy) = three_party_bus();
+
+        let mut input = message_input(MessageTarget::Broadcast, DeliveryMode::InjectWhenIdle);
+        input.from = MessageSource::Agent(claude.clone());
+        bus.create_message(input).expect("broadcast accepted");
+
+        assert!(bus.inbox(&claude).unwrap().is_empty());
+        assert_eq!(bus.inbox(&codex).unwrap().len(), 1);
+        assert_eq!(bus.inbox(&agy).unwrap().len(), 1);
+
+        // A role target that resolves only to the sender is an error instead
+        // of a silent self-delivery.
+        let mut input = message_input(
+            MessageTarget::Role(AgentRole::Implementer),
+            DeliveryMode::InjectWhenIdle,
+        );
+        input.from = MessageSource::Agent(claude.clone());
+        let error = bus.create_message(input).expect_err("self-only fan-out");
+        assert!(error.to_string().contains("other than the sender"));
+    }
+
+    #[test]
+    fn thread_enforces_participants_limit_and_close() {
+        let (mut bus, claude, codex, agy) = three_party_bus();
+        let thread = bus
+            .open_thread(thread_input(vec![claude.clone(), codex.clone()], Some(1)))
+            .expect("thread opens");
+
+        // Non-participant agents cannot post.
+        let mut outsider = message_input(
+            MessageTarget::Thread(thread.id.clone()),
+            DeliveryMode::InjectWhenIdle,
+        );
+        outsider.from = MessageSource::Agent(agy.clone());
+        assert!(
+            bus.create_message(outsider)
+                .expect_err("outsider rejected")
+                .to_string()
+                .contains("not a participant")
+        );
+
+        // First message is fine; the second hits the per-participant limit.
+        let mut first = message_input(
+            MessageTarget::Thread(thread.id.clone()),
+            DeliveryMode::InjectWhenIdle,
+        );
+        first.from = MessageSource::Agent(claude.clone());
+        bus.create_message(first).expect("first message accepted");
+
+        let mut second = message_input(
+            MessageTarget::Thread(thread.id.clone()),
+            DeliveryMode::InjectWhenIdle,
+        );
+        second.from = MessageSource::Agent(claude.clone());
+        let error = bus.create_message(second).expect_err("limit reached");
+        assert!(error.to_string().contains("message limit reached"));
+
+        // The user is not turn-limited (moderator can keep steering) …
+        bus.create_message(message_input(
+            MessageTarget::Thread(thread.id.clone()),
+            DeliveryMode::InjectWhenIdle,
+        ))
+        .expect("user message accepted");
+
+        // … and a closed thread rejects everything.
+        bus.close_thread(&thread.id, DateTimeUtc::UNIX_EPOCH)
+            .expect("thread closes");
+        let error = bus
+            .create_message(message_input(
+                MessageTarget::Thread(thread.id.clone()),
+                DeliveryMode::InjectWhenIdle,
+            ))
+            .expect_err("closed thread rejects");
+        assert!(error.to_string().contains("is closed"));
+    }
+
+    #[test]
+    fn open_thread_validates_topic_and_participants() {
+        let (mut bus, claude, _codex, _agy) = three_party_bus();
+
+        let mut empty_topic = thread_input(vec![claude.clone(), AgentSessionId::new()], None);
+        empty_topic.topic = "  ".to_string();
+        assert!(bus.open_thread(empty_topic).is_err());
+
+        assert!(
+            bus.open_thread(thread_input(vec![claude.clone()], None))
+                .expect_err("single participant rejected")
+                .to_string()
+                .contains("at least 2 participants")
+        );
+
+        assert!(
+            bus.open_thread(thread_input(vec![claude, AgentSessionId::new()], None))
+                .expect_err("unknown participant rejected")
+                .to_string()
+                .contains("unknown agent session")
+        );
+    }
+
+    #[test]
+    fn fan_out_message_is_injected_once_per_recipient() {
+        let (mut bus, claude, codex, agy) = three_party_bus();
+        let thread = bus
+            .open_thread(thread_input(
+                vec![claude.clone(), codex.clone(), agy.clone()],
+                None,
+            ))
+            .expect("thread opens");
+
+        let mut input = message_input(
+            MessageTarget::Thread(thread.id.clone()),
+            DeliveryMode::InjectWhenIdle,
+        );
+        input.from = MessageSource::Agent(claude.clone());
+        let message = bus.create_message(input).expect("thread message accepted");
+        let now = DateTimeUtc::UNIX_EPOCH;
+
+        // First recipient injects and the message becomes Delivered …
+        let first = bus
+            .prepare_next_inject_when_idle(
+                &codex,
+                &AgentStatus::AwaitingInput,
+                AgentProvider::Codex,
+                &PromptContext::empty(),
+                now,
+            )
+            .expect("first delivery prepared");
+        assert!(matches!(first, IdleDelivery::Ready(_)));
+        bus.mark_message_injected(&message.id, &codex, now)
+            .expect("first injection recorded");
+
+        // … but the second recipient must still receive its own injection.
+        let second = bus
+            .prepare_next_inject_when_idle(
+                &agy,
+                &AgentStatus::AwaitingInput,
+                AgentProvider::Codex,
+                &PromptContext::empty(),
+                now,
+            )
+            .expect("second delivery prepared");
+        match second {
+            IdleDelivery::Ready(prepared) => assert_eq!(prepared.message_id, message.id),
+            IdleDelivery::Waiting(wait) => {
+                panic!("second recipient must get the fan-out message, got {wait:?}")
+            }
+        }
+        bus.mark_message_injected(&message.id, &agy, now)
+            .expect("second injection recorded");
+
+        // Already-served recipients are not re-injected.
+        let again = bus
+            .prepare_next_inject_when_idle(
+                &codex,
+                &AgentStatus::AwaitingInput,
+                AgentProvider::Codex,
+                &PromptContext::empty(),
+                now,
+            )
+            .expect("no duplicate delivery");
+        assert_eq!(
+            again,
+            IdleDelivery::Waiting(DeliveryWait {
+                agent_id: codex.clone(),
+                reason: DeliveryWaitReason::NoInjectWhenIdleMessage,
+            })
+        );
+    }
+
+    #[test]
+    fn thread_prompt_includes_topic_and_reply_instruction() {
+        let (mut bus, claude, codex, _agy) = three_party_bus();
+        let thread = bus
+            .open_thread(thread_input(vec![claude.clone(), codex.clone()], None))
+            .expect("thread opens");
+
+        let mut input = message_input(
+            MessageTarget::Thread(thread.id.clone()),
+            DeliveryMode::InjectWhenIdle,
+        );
+        input.from = MessageSource::Agent(claude.clone());
+        bus.create_message(input).expect("thread message accepted");
+
+        let delivery = bus
+            .prepare_next_inject_when_idle(
+                &codex,
+                &AgentStatus::AwaitingInput,
+                AgentProvider::Codex,
+                &PromptContext::empty(),
+                DateTimeUtc::UNIX_EPOCH,
+            )
+            .expect("delivery prepared");
+
+        match delivery {
+            IdleDelivery::Ready(prepared) => {
+                assert!(prepared.prompt.contains(&format!("thread: {}", thread.id)));
+                assert!(prepared.prompt.contains("topic: X の設計方針"));
+                assert!(prepared.prompt.contains(&format!("--thread {}", thread.id)));
+                assert!(prepared.prompt.contains("発言上限"));
+            }
+            IdleDelivery::Waiting(wait) => panic!("expected ready delivery, got {wait:?}"),
+        }
     }
 
     #[test]

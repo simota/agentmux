@@ -32,7 +32,7 @@ mod spec_tests {
             .count();
         let decisions = OPEN_QUESTIONS.matches("**v0.1 decision:**").count();
 
-        assert_eq!(question_headings, 13);
+        assert_eq!(question_headings, 14);
         assert_eq!(decisions, question_headings);
     }
 

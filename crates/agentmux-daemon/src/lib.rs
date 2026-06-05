@@ -24,7 +24,7 @@ use agentmux_context::{
 use agentmux_core::{
     AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ApprovalId, ClientId,
     ClientSessionId, ContextItemId, ContextKind, ContextScope, ContextSource, DateTimeUtc,
-    DeliveryMode, DeliveryStatus, InputScriptId, MessageId, Priority, ProjectId, TaskId,
+    DeliveryMode, DeliveryStatus, InputScriptId, MessageId, Priority, ProjectId, TaskId, ThreadId,
     Visibility, WorktreeId, WorktreeStatus, error::Result,
 };
 use agentmux_ipc::{
@@ -33,7 +33,8 @@ use agentmux_ipc::{
 };
 use agentmux_message::{
     AgentDescriptor, AgentMessage, IdleDelivery, MessageBus, MessageKind, MessageSource,
-    MessageTarget, NewAgentMessage, PreparedInjection, PromptContext, PromptContextItem,
+    MessageTarget, MessageThread, NewAgentMessage, NewMessageThread, PreparedInjection,
+    PromptContext, PromptContextItem,
 };
 use agentmux_policy::{ApprovalEvent, ApprovalQueue, ApprovalQueueError, ApprovalRequest};
 use agentmux_pty::{CTRL_C, PtyHandle, PtyReadEvent, PtySpawnSpec};
@@ -588,6 +589,95 @@ impl DaemonRuntime {
         Ok(message)
     }
 
+    /// Open a multi-party meeting thread and inject the agenda to every
+    /// participant. Returns the thread plus the kickoff message.
+    pub async fn open_meeting(
+        &self,
+        input: OpenMeetingInput,
+    ) -> Result<(MessageThread, AgentMessage)> {
+        let mut state = self.state.write().await;
+        let participants = input
+            .participants
+            .iter()
+            .map(|raw| resolve_participant(&state.messages, raw))
+            .collect::<Result<Vec<_>>>()?;
+        let thread = state.messages.open_thread(NewMessageThread {
+            topic: input.topic.clone(),
+            participants,
+            opened_by: input.opened_by.clone(),
+            max_messages_per_participant: input.max_messages_per_participant,
+        })?;
+        drop(state);
+
+        self.append_thread_event(agentmux_store::EVENT_THREAD_OPENED, &thread)?;
+        self.publish(DaemonEvent::new(
+            IpcEventKind::ThreadOpened,
+            thread_payload(&thread, 0),
+        ));
+
+        let body = input.body.unwrap_or_else(|| {
+            format!(
+                "会議を開始します。\n議題: {}\n\nまず各自の見解をこのスレッドに共有してください。",
+                input.topic
+            )
+        });
+        let kickoff = self
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: Some(thread.id.clone()),
+                from: input.opened_by,
+                to: MessageTarget::Thread(thread.id.clone()),
+                kind: input.kind,
+                priority: input.priority,
+                body,
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: true,
+            })
+            .await?;
+        self.trigger_idle_delivery_for_messages(std::slice::from_ref(&kickoff))
+            .await;
+        Ok((thread, kickoff))
+    }
+
+    pub async fn close_meeting(&self, thread_id: &ThreadId) -> Result<MessageThread> {
+        let mut state = self.state.write().await;
+        let thread = state
+            .messages
+            .close_thread(thread_id, DateTimeUtc::now_utc())?;
+        let message_count = state.messages.thread_message_count(thread_id);
+        drop(state);
+
+        self.append_thread_event(agentmux_store::EVENT_THREAD_CLOSED, &thread)?;
+        self.publish(DaemonEvent::new(
+            IpcEventKind::ThreadClosed,
+            thread_payload(&thread, message_count),
+        ));
+        Ok(thread)
+    }
+
+    pub async fn list_meetings(&self) -> Vec<(MessageThread, usize)> {
+        let state = self.state.read().await;
+        state
+            .messages
+            .list_threads()
+            .into_iter()
+            .map(|thread| {
+                let count = state.messages.thread_message_count(&thread.id);
+                (thread.clone(), count)
+            })
+            .collect()
+    }
+
+    fn append_thread_event(&self, kind: &str, thread: &MessageThread) -> Result<()> {
+        let Some(event_log) = &self.event_log else {
+            return Ok(());
+        };
+        let entry = EventLogEntry::new(kind, DateTimeUtc::now_utc(), thread_payload(thread, 0))?;
+        event_log.append(&entry)
+    }
+
     /// Like `create_message` but stores the message even when no agents are
     /// currently registered for the target (used from automated
     /// `persist_live_agent_result` paths where the target may not yet be
@@ -628,8 +718,13 @@ impl DaemonRuntime {
         let prepared = self.prepare_manual_message_injection(id, now).await?;
         tokio::time::sleep(message_inject_send_delay()).await;
         let write_result = self.write_prepared_message_injection(&prepared).await;
-        self.finish_and_emit_message_injection(&prepared.message_id, now, write_result)
-            .await
+        self.finish_and_emit_message_injection(
+            &prepared.message_id,
+            &prepared.agent_id,
+            now,
+            write_result,
+        )
+        .await
     }
 
     pub async fn inject_message_to_agent(
@@ -643,17 +738,25 @@ impl DaemonRuntime {
             .await?;
         tokio::time::sleep(message_inject_send_delay()).await;
         let write_result = self.write_prepared_message_injection(&prepared).await;
-        self.finish_and_emit_message_injection(&prepared.message_id, now, write_result)
-            .await
+        self.finish_and_emit_message_injection(
+            &prepared.message_id,
+            &prepared.agent_id,
+            now,
+            write_result,
+        )
+        .await
     }
 
     async fn finish_and_emit_message_injection(
         &self,
         id: &MessageId,
+        agent_id: &AgentSessionId,
         now: DateTimeUtc,
         write_result: Result<()>,
     ) -> Result<AgentMessage> {
-        let finished = self.finish_message_injection(id, now, write_result).await;
+        let finished = self
+            .finish_message_injection(id, agent_id, now, write_result)
+            .await;
         match finished {
             Ok(message) => {
                 self.append_message_event(agentmux_store::EVENT_MESSAGE_INJECTED, &message)?;
@@ -706,7 +809,12 @@ impl DaemonRuntime {
 
         let write_result = self.write_prepared_message_injection(&prepared).await;
         let message = self
-            .finish_and_emit_message_injection(&prepared.message_id, now, write_result)
+            .finish_and_emit_message_injection(
+                &prepared.message_id,
+                &prepared.agent_id,
+                now,
+                write_result,
+            )
             .await?;
         Ok(Some(message))
     }
@@ -766,7 +874,12 @@ impl DaemonRuntime {
             )));
         };
         let (provider, context) = delivery_render_inputs(&state, agent_id, &message)?;
-        let prompt = agentmux_message::render_prompt(&message, provider, &context);
+        let thread = message
+            .thread_id
+            .as_ref()
+            .and_then(|thread_id| state.messages.get_thread(thread_id))
+            .cloned();
+        let prompt = agentmux_message::render_prompt(&message, provider, &context, thread.as_ref());
         state
             .messages
             .update_delivery_status(id, DeliveryStatus::Injecting, now)?;
@@ -796,7 +909,12 @@ impl DaemonRuntime {
             )));
         }
         let (provider, context) = delivery_render_inputs(&state, agent_id, &message)?;
-        let prompt = agentmux_message::render_prompt(&message, provider, &context);
+        let thread = message
+            .thread_id
+            .as_ref()
+            .and_then(|thread_id| state.messages.get_thread(thread_id))
+            .cloned();
+        let prompt = agentmux_message::render_prompt(&message, provider, &context, thread.as_ref());
         state
             .messages
             .update_delivery_status(id, DeliveryStatus::Injecting, now)?;
@@ -856,12 +974,13 @@ impl DaemonRuntime {
     async fn finish_message_injection(
         &self,
         id: &MessageId,
+        agent_id: &AgentSessionId,
         now: DateTimeUtc,
         write_result: Result<()>,
     ) -> Result<AgentMessage> {
         let mut state = self.state.write().await;
         match write_result {
-            Ok(()) => state.messages.mark_message_injected(id, now)?,
+            Ok(()) => state.messages.mark_message_injected(id, agent_id, now)?,
             Err(error) => {
                 state.messages.mark_message_injection_failed(id, now)?;
                 return Err(error);
@@ -1653,6 +1772,7 @@ impl DaemonRuntime {
     ) -> Result<AgentMessage> {
         self.create_message(NewAgentMessage {
             task_id: message.task_id.clone(),
+            thread_id: None,
             from: message.from.clone(),
             to: message.to.clone(),
             kind: message.kind.clone(),
@@ -1676,6 +1796,7 @@ impl DaemonRuntime {
     ) -> Result<AgentMessage> {
         self.create_message_allow_no_recipients(NewAgentMessage {
             task_id: message.task_id.clone(),
+            thread_id: None,
             from: message.from.clone(),
             to: message.to.clone(),
             kind: message.kind.clone(),
@@ -2361,6 +2482,8 @@ fn event_kind_label(kind: &IpcEventKind) -> &'static str {
         IpcEventKind::InputInjected => "input.injected",
         IpcEventKind::MessageCreated => "message.created",
         IpcEventKind::MessageDelivered => "message.delivered",
+        IpcEventKind::ThreadOpened => "thread.opened",
+        IpcEventKind::ThreadClosed => "thread.closed",
         IpcEventKind::ContextCreated => "context.created",
         IpcEventKind::ContextInjected => "context.injected",
         IpcEventKind::MailboxWritten => "mailbox.written",
@@ -2714,6 +2837,133 @@ async fn handle_request(
                     ErrorBody::new("INPUT_SCRIPT_FAILED", error.to_string()),
                 ),
             }
+        }
+        IpcCommand::MeetingOpen => {
+            let Some(topic) = payload_string_field(&request.payload, "topic")
+                .filter(|topic| !topic.trim().is_empty())
+            else {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("INVALID_MEETING_TOPIC", "meeting.open requires topic"),
+                );
+            };
+            let participants: Vec<String> = request
+                .payload
+                .get("participants")
+                .and_then(|value| value.as_array())
+                .map(|values| {
+                    values
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .map(ToOwned::to_owned)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let kind = match request
+                .payload
+                .get("kind")
+                .and_then(|value| value.as_str())
+                .map(parse_message_kind)
+                .transpose()
+            {
+                Ok(kind) => kind.unwrap_or(MessageKind::Question),
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_MESSAGE_KIND", error.to_string()),
+                    );
+                }
+            };
+            let priority = match request
+                .payload
+                .get("priority")
+                .and_then(|value| value.as_str())
+                .map(parse_priority)
+                .transpose()
+            {
+                Ok(priority) => priority.unwrap_or(Priority::Normal),
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_PRIORITY", error.to_string()),
+                    );
+                }
+            };
+            let opened_by = request
+                .payload
+                .get("from_agent_id")
+                .and_then(|value| value.as_str())
+                .and_then(|raw| raw.trim().parse::<AgentSessionId>().ok())
+                .map(MessageSource::Agent)
+                .unwrap_or_else(|| MessageSource::User(ClientId::new()));
+            let input = OpenMeetingInput {
+                topic,
+                participants,
+                opened_by,
+                max_messages_per_participant: request
+                    .payload
+                    .get("max_messages_per_participant")
+                    .and_then(|value| value.as_u64())
+                    .map(|value| value as u32),
+                kind,
+                priority,
+                body: payload_string_field(&request.payload, "body"),
+            };
+            match runtime.open_meeting(input).await {
+                Ok((thread, kickoff)) => DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "thread": thread_payload(&thread, 1),
+                        "kickoff_message": message_payload(&kickoff),
+                    }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("MEETING_OPEN_FAILED", error.to_string())
+                        .with_hint("check participants with `agentmux sessions`"),
+                ),
+            }
+        }
+        IpcCommand::MeetingClose => {
+            let Some(thread_id) = request
+                .payload
+                .get("thread_id")
+                .and_then(|value| value.as_str())
+                .and_then(|raw| raw.trim().parse::<ThreadId>().ok())
+            else {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("INVALID_THREAD_ID", "meeting.close requires thread_id"),
+                );
+            };
+            match runtime.close_meeting(&thread_id).await {
+                Ok(thread) => {
+                    let count = runtime
+                        .list_meetings()
+                        .await
+                        .iter()
+                        .find(|(t, _)| t.id == thread.id)
+                        .map(|(_, count)| *count)
+                        .unwrap_or(0);
+                    DaemonResponse::ok(request.id, thread_payload(&thread, count))
+                }
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("MEETING_CLOSE_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::MeetingList => {
+            let threads = runtime.list_meetings().await;
+            DaemonResponse::ok(
+                request.id,
+                json!({
+                    "threads": threads
+                        .iter()
+                        .map(|(thread, count)| thread_payload(thread, *count))
+                        .collect::<Vec<_>>(),
+                }),
+            )
         }
         IpcCommand::MessageCreate => {
             let input = match message_create_payload(&request.payload) {
@@ -3592,8 +3842,19 @@ fn message_create_payload(payload: &serde_json::Value) -> Result<NewAgentMessage
         .map(MessageSource::Agent)
         .unwrap_or_else(|| MessageSource::User(ClientId::new()));
 
+    let thread_id = payload
+        .get("thread_id")
+        .and_then(|value| value.as_str())
+        .map(|raw| {
+            raw.trim()
+                .parse::<ThreadId>()
+                .map_err(|error| AgentmuxError::UserError(format!("invalid thread_id: {error}")))
+        })
+        .transpose()?;
+
     Ok(NewAgentMessage {
         task_id: None,
+        thread_id,
         from,
         to,
         kind,
@@ -3618,6 +3879,27 @@ fn parse_message_target(raw: &str) -> Result<MessageTarget> {
     }
     if let Some(role) = raw.strip_prefix("role:") {
         return Ok(MessageTarget::Role(parse_agent_role(role)?));
+    }
+    if let Some(team) = raw.strip_prefix("team:") {
+        let team = team.trim();
+        if team.is_empty() {
+            return Err(AgentmuxError::UserError(
+                "team message target must not be empty".to_string(),
+            ));
+        }
+        return Ok(MessageTarget::Team(team.to_string()));
+    }
+    if let Some(thread) = raw.strip_prefix("thread:") {
+        let thread_id = thread.trim().parse::<ThreadId>().map_err(|error| {
+            AgentmuxError::UserError(format!("invalid thread message target: {error}"))
+        })?;
+        return Ok(MessageTarget::Thread(thread_id));
+    }
+    if raw.starts_with(ThreadId::prefix()) {
+        let thread_id = raw.parse::<ThreadId>().map_err(|error| {
+            AgentmuxError::UserError(format!("invalid thread message target: {error}"))
+        })?;
+        return Ok(MessageTarget::Thread(thread_id));
     }
     if let Some(agent) = raw.strip_prefix("agent:") {
         let agent = agent.trim();
@@ -3676,10 +3958,56 @@ fn parse_delivery_mode(raw: &str) -> Result<DeliveryMode> {
     })
 }
 
+/// Input for `meeting.open`: topic + participant session names/ids.
+pub struct OpenMeetingInput {
+    pub topic: String,
+    pub participants: Vec<String>,
+    pub opened_by: MessageSource,
+    pub max_messages_per_participant: Option<u32>,
+    pub kind: MessageKind,
+    pub priority: Priority,
+    pub body: Option<String>,
+}
+
+/// Resolve one `meeting.open` participant entry (session id or unique name).
+fn resolve_participant(bus: &MessageBus, raw: &str) -> Result<AgentSessionId> {
+    let raw = raw.trim();
+    if let Ok(agent_id) = raw.parse::<AgentSessionId>() {
+        return Ok(agent_id);
+    }
+    let resolved = bus.resolve_target(&MessageTarget::AgentName(raw.to_string()))?;
+    match resolved.as_slice() {
+        [agent_id] => Ok(agent_id.clone()),
+        _ => Err(AgentmuxError::UserError(format!(
+            "meeting participant '{raw}' resolved to {} sessions; use a unique session name or id",
+            resolved.len()
+        ))),
+    }
+}
+
+fn thread_payload(thread: &MessageThread, message_count: usize) -> serde_json::Value {
+    json!({
+        "thread_id": thread.id.to_string(),
+        "topic": thread.topic,
+        "participants": thread
+            .participants
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        "opened_by": thread.opened_by,
+        "status": thread.status,
+        "max_messages_per_participant": thread.max_messages_per_participant,
+        "message_count": message_count,
+        "created_at": thread.created_at.to_string(),
+        "closed_at": thread.closed_at.map(|ts| ts.to_string()),
+    })
+}
+
 fn message_payload(message: &AgentMessage) -> serde_json::Value {
     json!({
         "message_id": message.id.to_string(),
         "task_id": message.task_id.as_ref().map(ToString::to_string),
+        "thread_id": message.thread_id.as_ref().map(ToString::to_string),
         "from": message.from,
         "to": message.to,
         "kind": message.kind,
@@ -4433,6 +4761,7 @@ mod tests {
         let message = runtime
             .create_message(NewAgentMessage {
                 task_id: None,
+                thread_id: None,
                 from: MessageSource::Orchestrator,
                 to: MessageTarget::Role(AgentRole::Tester),
                 kind: MessageKind::TestResult,
@@ -5841,12 +6170,80 @@ AGENTMUX_RESULT:
     }
 
     #[tokio::test]
+    async fn meeting_open_fans_out_kickoff_to_participants_except_opener() {
+        let runtime = DaemonRuntime::new(16);
+        let opener = runtime.register_agent("claude-a".to_string()).await;
+        let second = runtime.register_agent("codex-b".to_string()).await;
+        let third = runtime.register_agent("agy-c".to_string()).await;
+
+        let (thread, kickoff) = runtime
+            .open_meeting(OpenMeetingInput {
+                topic: "X の設計方針".to_string(),
+                // Mixed name/id participant references must both resolve.
+                participants: vec![
+                    "claude-a".to_string(),
+                    second.id.to_string(),
+                    "agy-c".to_string(),
+                ],
+                opened_by: MessageSource::Agent(opener.id.clone()),
+                max_messages_per_participant: Some(2),
+                kind: MessageKind::Question,
+                priority: Priority::Normal,
+                body: None,
+            })
+            .await
+            .expect("meeting opens");
+
+        assert_eq!(thread.participants.len(), 3);
+        assert_eq!(thread.max_messages_per_participant, 2);
+        assert_eq!(kickoff.thread_id, Some(thread.id.clone()));
+        assert!(kickoff.body.contains("X の設計方針"));
+
+        {
+            let state = runtime.state.read().await;
+            assert!(
+                state.messages.inbox(&opener.id).unwrap().is_empty(),
+                "opener must not receive its own kickoff"
+            );
+            assert_eq!(state.messages.inbox(&second.id).unwrap().len(), 1);
+            assert_eq!(state.messages.inbox(&third.id).unwrap().len(), 1);
+        }
+
+        let listed = runtime.list_meetings().await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].1, 1, "kickoff counts as a thread message");
+
+        runtime
+            .close_meeting(&thread.id)
+            .await
+            .expect("meeting closes");
+        let error = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: None,
+                from: MessageSource::Agent(second.id.clone()),
+                to: MessageTarget::Thread(thread.id.clone()),
+                kind: MessageKind::Finding,
+                priority: Priority::Normal,
+                body: "too late".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect_err("closed thread rejects messages");
+        assert!(error.to_string().contains("is closed"));
+    }
+
+    #[tokio::test]
     async fn manual_message_inject_fails_without_live_pty() {
         let runtime = DaemonRuntime::new(16);
         let agent = runtime.register_agent("metadata-only".to_string()).await;
         let message = runtime
             .create_message(NewAgentMessage {
                 task_id: None,
+                thread_id: None,
                 from: MessageSource::System,
                 to: MessageTarget::Agent(agent.id.clone()),
                 kind: MessageKind::Handoff,
@@ -5923,6 +6320,7 @@ AGENTMUX_RESULT:
         let message = runtime
             .create_message(NewAgentMessage {
                 task_id: None,
+                thread_id: None,
                 from: MessageSource::System,
                 to: MessageTarget::Role(AgentRole::Tester),
                 kind: MessageKind::Handoff,
@@ -6024,6 +6422,7 @@ AGENTMUX_RESULT:
         let message = runtime
             .create_message(NewAgentMessage {
                 task_id: None,
+                thread_id: None,
                 from: MessageSource::System,
                 to: MessageTarget::Agent(agent.id.clone()),
                 kind: MessageKind::Handoff,
@@ -6099,6 +6498,7 @@ AGENTMUX_RESULT:
         let message = runtime
             .create_message(NewAgentMessage {
                 task_id: None,
+                thread_id: None,
                 from: MessageSource::System,
                 to: MessageTarget::Agent(agent.id.clone()),
                 kind: MessageKind::Handoff,

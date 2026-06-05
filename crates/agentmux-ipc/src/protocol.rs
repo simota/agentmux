@@ -241,6 +241,12 @@ pub enum IpcCommand {
     AgentSendInputScript,
     #[serde(rename = "agent.snapshot")]
     AgentSnapshot,
+    #[serde(rename = "meeting.open")]
+    MeetingOpen,
+    #[serde(rename = "meeting.close")]
+    MeetingClose,
+    #[serde(rename = "meeting.list")]
+    MeetingList,
     #[serde(rename = "message.create")]
     MessageCreate,
     #[serde(rename = "message.inject")]
@@ -317,6 +323,10 @@ pub enum IpcEventKind {
     MessageCreated,
     #[serde(rename = "message.delivered")]
     MessageDelivered,
+    #[serde(rename = "thread.opened")]
+    ThreadOpened,
+    #[serde(rename = "thread.closed")]
+    ThreadClosed,
     #[serde(rename = "context.created")]
     ContextCreated,
     #[serde(rename = "context.injected")]

@@ -1555,6 +1555,7 @@ pub struct MessageListItem {
     pub created_at: String,
     pub delivery_status: String,
     pub kind: String,
+    pub thread_id: Option<String>,
     pub from: String,
     pub to: String,
     pub body: String,
@@ -1569,6 +1570,7 @@ impl MessageListItem {
             delivery_status: string_field(payload, "delivery_status")
                 .unwrap_or_else(|| "-".to_string()),
             kind: string_field(payload, "kind").unwrap_or_else(|| "-".to_string()),
+            thread_id: string_field(payload, "thread_id"),
             from: endpoint_label(payload.get("from")),
             to: endpoint_label(payload.get("to")),
             body: string_field(payload, "body").unwrap_or_default(),

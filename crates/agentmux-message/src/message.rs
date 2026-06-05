@@ -2,9 +2,11 @@
 //!
 //! See `docs/spec/03_domain_model.md §8`.
 
+use std::collections::BTreeSet;
+
 use agentmux_core::{
     AgentRole, AgentSessionId, ArtifactId, ClientId, ContextItemId, DateTimeUtc, DeliveryMode,
-    DeliveryStatus, MessageId, Priority, TaskId,
+    DeliveryStatus, MessageId, Priority, TaskId, ThreadId,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,6 +15,9 @@ use serde::{Deserialize, Serialize};
 pub struct AgentMessage {
     pub id: MessageId,
     pub task_id: Option<TaskId>,
+    /// Multi-party conversation this message belongs to, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<ThreadId>,
     pub from: MessageSource,
     pub to: MessageTarget,
     pub kind: MessageKind,
@@ -22,7 +27,13 @@ pub struct AgentMessage {
     pub context_refs: Vec<ContextItemId>,
     pub artifact_refs: Vec<ArtifactId>,
     pub delivery_mode: DeliveryMode,
+    /// Aggregate status (`Delivered` = injected to at least one recipient).
+    /// Per-recipient progress for fan-out targets lives in `delivered_to`.
     pub delivery_status: DeliveryStatus,
+    /// Sessions this message has already been injected into. Fan-out targets
+    /// (role/team/thread/broadcast) deliver once per recipient.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub delivered_to: BTreeSet<AgentSessionId>,
     pub requires_response: bool,
     pub created_at: DateTimeUtc,
     pub delivered_at: Option<DateTimeUtc>,
@@ -42,6 +53,7 @@ impl AgentMessage {
         Self {
             id: MessageId::new(),
             task_id: input.task_id,
+            thread_id: input.thread_id,
             from: input.from,
             to: input.to,
             kind: input.kind,
@@ -51,6 +63,7 @@ impl AgentMessage {
             artifact_refs: input.artifact_refs,
             delivery_mode: input.delivery_mode,
             delivery_status,
+            delivered_to: BTreeSet::new(),
             requires_response: input.requires_response,
             created_at: DateTimeUtc::now_utc(),
             delivered_at: None,
@@ -74,6 +87,7 @@ impl AgentMessage {
 #[derive(Debug, Clone)]
 pub struct NewAgentMessage {
     pub task_id: Option<TaskId>,
+    pub thread_id: Option<ThreadId>,
     pub from: MessageSource,
     pub to: MessageTarget,
     pub kind: MessageKind,
@@ -106,6 +120,8 @@ pub enum MessageTarget {
     Role(AgentRole),
     Task(TaskId),
     Team(String),
+    /// All participants of a conversation thread (minus the sender).
+    Thread(ThreadId),
     Broadcast,
 }
 

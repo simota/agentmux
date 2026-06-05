@@ -809,6 +809,7 @@ impl OrchestratorMessage {
     pub fn into_new_agent_message(self) -> NewAgentMessage {
         NewAgentMessage {
             task_id: self.task_id,
+            thread_id: None,
             from: self.from,
             to: self.to,
             kind: self.kind,

@@ -84,6 +84,47 @@ enum DeliveryStatus {
 }
 ```
 
+### 3.5 配送時の送信者除外
+
+fan-out 宛先(`Role` / `Task` / `Team` / `Thread` / `Broadcast`)の解決結果からは
+**送信 agent 自身を必ず除外する**。除外の結果宛先が空になる場合はエラーとする
+(自分しか居ない role への送信等)。明示的な単一宛先(`Agent` / `AgentName`)は
+除外しない。これにより agent が自分の発言を自分の pane に再注入される
+エコーループを仕様レベルで禁止する。
+
+### 3.6 MessageThread(マルチパーティ会議)
+
+3 者以上の agent による議論は `MessageThread` で行う(ADR-0006)。
+
+```rust
+struct MessageThread {
+    id: ThreadId,                         // prefix: thread_
+    topic: String,
+    participants: Vec<AgentSessionId>,
+    opened_by: MessageSource,
+    status: ThreadStatus,                 // Open | Closed
+    max_messages_per_participant: u32,    // 既定 5
+    created_at: DateTimeUtc,
+    closed_at: Option<DateTimeUtc>,
+}
+```
+
+不変条件:
+
+- `to: Thread(id)` のメッセージは `thread_id = id` が自動付与され、参加者全員
+  (送信者を除く)へ通常の idle delivery 機構で配送される。
+- 参加者でない agent からの投稿は拒否する(User / System / Orchestrator は常に可)。
+- agent 1 参加者あたりの発言数が `max_messages_per_participant` に達したら
+  以降の投稿を拒否し、「結論を要約してスレッド外で人間に判断を仰ぐ」よう
+  エラーメッセージで誘導する(agent-to-agent 無限ループの防止)。
+- `Closed` スレッドへの投稿は全て拒否する。
+- thread の開閉は `thread.opened` / `thread.closed` として event log に記録する。
+
+IPC コマンド: `meeting.open`(thread 作成+議題 kickoff を参加者へ inject)/
+`meeting.close` / `meeting.list`。CLI は `agentmux meeting open|close|list` と
+`agentmux message send --thread <id>`。messages と同様に v0.1 では SQLite には
+永続化せず、daemon の in-memory bus + event log で管理する。
+
 ## 4. Prompt Renderer
 
 Messageはagent provider別にpromptへ変換する。
@@ -96,6 +137,8 @@ from: {from}
 kind: {kind}
 priority: {priority}
 message_id: {message_id}
+thread: {thread_id}        # thread 所属時のみ
+topic: {thread_topic}      # thread 所属時のみ
 
 message:
 {body}
@@ -108,6 +151,9 @@ required:
 - 必要なら作業してください
 - 完了時は必ず AGENTMUX_RESULT JSON を出力してください
 ```
+
+thread 所属 message の required には、`agentmux message send --thread <id>` での
+返信方法と発言上限(上限到達時は要約して人間へ)を追記する。
 
 ### 4.2 Claude/Codex差分
 

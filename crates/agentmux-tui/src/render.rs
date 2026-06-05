@@ -737,7 +737,10 @@ fn message_compact_lines(message: &MessageListItem, content_width: usize) -> Vec
         message.message_id,
         compact_timestamp(&message.created_at)
     );
-    let route = format!("{} -> {}", message.from, message.to);
+    let mut route = format!("{} -> {}", message.from, message.to);
+    if let Some(thread_id) = &message.thread_id {
+        route.push_str(&format!(" [{}]", short_thread_label(thread_id)));
+    }
     vec![
         truncate_cell(&meta, content_width),
         truncate_cell(&route, content_width),
@@ -746,8 +749,22 @@ fn message_compact_lines(message: &MessageListItem, content_width: usize) -> Vec
     ]
 }
 
+/// Compact `thread_01ABCDEF…` to `thread:…CDEF` so the conversation list can
+/// show which meeting a message belongs to without consuming a whole column.
+fn short_thread_label(thread_id: &str) -> String {
+    let tail: String = thread_id
+        .chars()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("thread:…{tail}")
+}
+
 fn message_detail_lines(message: &MessageListItem, content_width: usize) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         truncate_cell(
             &format!("{} / {}", message.delivery_status, message.kind),
             content_width,
@@ -759,9 +776,19 @@ fn message_detail_lines(message: &MessageListItem, content_width: usize) -> Vec<
         ),
         truncate_cell(&format!("from: {}", message.from), content_width),
         truncate_cell(&format!("to: {}", message.to), content_width),
-        truncate_cell(&format!("body: {}", message.body), content_width),
-        "".to_string(),
-    ]
+    ];
+    if let Some(thread_id) = &message.thread_id {
+        lines.push(truncate_cell(
+            &format!("thread: {thread_id}"),
+            content_width,
+        ));
+    }
+    lines.push(truncate_cell(
+        &format!("body: {}", message.body),
+        content_width,
+    ));
+    lines.push("".to_string());
+    lines
 }
 
 fn render_keybinding_help(area: Rect, buffer: &mut Buffer) {

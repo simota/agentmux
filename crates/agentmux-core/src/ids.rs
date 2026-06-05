@@ -64,6 +64,7 @@ define_id!(TaskId, "task_");
 define_id!(AgentSessionId, "agent_");
 define_id!(PaneId, "pane_");
 define_id!(MessageId, "msg_");
+define_id!(ThreadId, "thread_");
 define_id!(ContextItemId, "ctx_");
 define_id!(ArtifactId, "art_");
 define_id!(ApprovalId, "appr_");

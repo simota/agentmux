@@ -88,6 +88,8 @@ Avoid unbounded agent-to-agent loops. This applies to both `agentmux message sen
 
 Allowed message kind values (for both `--kind` and `messages[].kind`) are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind is rejected and the message is not stored.
 
+Multi-party meetings: when three or more sessions must discuss one topic, use a meeting thread instead of pairwise messages. Open with `agentmux meeting open "<topic>" --participants <name1>,<name2>,<name3>` (session names via `agentmux sessions`); the daemon injects the agenda into every participant. Post with `agentmux message send --thread <thread_id> --kind <Kind> "<body>"` — it is delivered to all participants except you, so never re-send your own statement. Each participant has a per-thread message limit (default 5, set with `--max-turns`); when you hit the limit, summarize your conclusion and ask the human for a decision with `kind: Question` outside the thread. Inspect with `agentmux message history --thread <thread_id>` and `agentmux meeting list`; close with `agentmux meeting close <thread_id>`.
+
 Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
 
 Each live session receives its own identity through environment variables: `AGENTMUX_AGENT_NAME`, `AGENTMUX_AGENT_ROLE`, and `AGENTMUX_AGENT_ID`. Use `AGENTMUX_AGENT_NAME` when another session needs to reply to exactly this session.
@@ -199,6 +201,9 @@ enum Commands {
 
     /// Manage messages (list / show / send / inject).
     Message(MessageArgs),
+
+    /// Manage multi-party meeting threads (open / close / list).
+    Meeting(MeetingArgs),
 
     /// Manage shared context items (add / list / show / search / attach / inject / export).
     Context(ContextArgs),
@@ -377,6 +382,9 @@ enum MessageAction {
         /// Filter by task ID.
         #[arg(long)]
         task: Option<String>,
+        /// Filter by meeting thread ID.
+        #[arg(long)]
+        thread: Option<String>,
         /// Filter by source or target agent/session/role label.
         #[arg(long)]
         agent: Option<String>,
@@ -397,8 +405,13 @@ enum MessageAction {
         /// Create the message without immediately injecting it.
         #[arg(long = "no-inject", conflicts_with = "inject")]
         no_inject: bool,
+        /// Target (agent:<name>, role:<role>, team:<team>, thread:<id>, broadcast).
+        /// Optional when --thread is given (the thread becomes the target).
+        #[arg(long, required_unless_present = "thread")]
+        to: Option<String>,
+        /// Meeting thread to post into (delivers to all participants except you).
         #[arg(long)]
-        to: String,
+        thread: Option<String>,
         /// Message kind. One of: TaskAssignment, Question, Finding, PatchProposal,
         /// ReviewComment, TestResult, FailureReport, Decision, Handoff,
         /// ApprovalRequest, ContextUpdate, StatusProbe. Defaults to Handoff.
@@ -411,6 +424,41 @@ enum MessageAction {
     },
     /// Inject a message, bypassing delivery policy.
     Inject { message_id: String },
+}
+
+#[derive(Parser)]
+struct MeetingArgs {
+    #[command(subcommand)]
+    action: MeetingAction,
+}
+
+#[derive(Subcommand)]
+enum MeetingAction {
+    /// Open a meeting thread and inject the agenda to every participant.
+    Open {
+        /// Agenda of the meeting (becomes the kickoff message).
+        topic: String,
+        /// Comma-separated participant session names or ids
+        /// (e.g. "claude-a,codex-b,agy-c"; check with `agentmux sessions`).
+        #[arg(long)]
+        participants: String,
+        /// Per-participant message limit (loop guard). Defaults to 5.
+        #[arg(long = "max-turns")]
+        max_turns: Option<u32>,
+        /// Kickoff message kind. Defaults to Question.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Kickoff message priority: low, normal, high, or urgent. Defaults to normal.
+        #[arg(long)]
+        priority: Option<String>,
+        /// Custom kickoff body. Defaults to a standard agenda prompt.
+        #[arg(long)]
+        body: Option<String>,
+    },
+    /// Close a meeting thread (further messages are rejected).
+    Close { thread_id: String },
+    /// List meeting threads.
+    List,
 }
 
 #[derive(Parser)]
@@ -694,6 +742,7 @@ async fn main() -> Result<()> {
             MessageAction::History {
                 limit,
                 task,
+                thread,
                 agent,
                 kind,
                 status,
@@ -704,6 +753,7 @@ async fn main() -> Result<()> {
                     &MessageHistoryFilter {
                         limit,
                         task,
+                        thread,
                         agent,
                         kind,
                         status,
@@ -719,15 +769,27 @@ async fn main() -> Result<()> {
                 inject,
                 no_inject,
                 to,
+                thread,
                 kind,
                 priority,
                 body,
             } => {
+                // `--thread <id>` targets the thread itself when no explicit
+                // --to is given; fan-out delivery is handled by the daemon's
+                // idle-delivery machinery, so skip the single-target manual
+                // inject step for thread posts.
+                let to = to
+                    .unwrap_or_else(|| format!("thread:{}", thread.as_deref().unwrap_or_default()));
+                let mut request = message_send_request(to, body, kind, priority)?;
+                let is_thread_post = thread.is_some();
+                if let Some(thread) = thread {
+                    request.payload["thread_id"] = json!(thread);
+                }
                 send_message_and_maybe_inject(
                     &socket_path,
                     "message",
-                    message_send_request(to, body, kind, priority)?,
-                    should_inject_message(inject, no_inject),
+                    request,
+                    should_inject_message(inject, no_inject) && !is_thread_post,
                 )
                 .await?;
             }
@@ -735,6 +797,30 @@ async fn main() -> Result<()> {
                 let response =
                     send_daemon_request(&socket_path, message_inject_request(message_id)).await?;
                 print_response("message", response)?;
+            }
+        },
+        Commands::Meeting(args) => match args.action {
+            MeetingAction::Open {
+                topic,
+                participants,
+                max_turns,
+                kind,
+                priority,
+                body,
+            } => {
+                let request =
+                    meeting_open_request(topic, participants, max_turns, kind, priority, body)?;
+                let response = send_daemon_request(&socket_path, request).await?;
+                print_response("meeting", response)?;
+            }
+            MeetingAction::Close { thread_id } => {
+                let response =
+                    send_daemon_request(&socket_path, meeting_close_request(thread_id)).await?;
+                print_response("meeting", response)?;
+            }
+            MeetingAction::List => {
+                let response = send_daemon_request(&socket_path, meeting_list_request()).await?;
+                print_response("meeting", response)?;
             }
         },
         Commands::Context(args) => match args.action {
@@ -1300,6 +1386,78 @@ fn message_send_request(
         IpcCommand::MessageCreate,
         payload,
     ))
+}
+
+fn meeting_open_request(
+    topic: String,
+    participants: String,
+    max_turns: Option<u32>,
+    kind: Option<String>,
+    priority: Option<String>,
+    body: Option<String>,
+) -> Result<ClientRequest> {
+    if topic.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "meeting topic must not be empty".to_string(),
+        ));
+    }
+    let participants: Vec<String> = participants
+        .split(',')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+    if participants.len() < 2 {
+        return Err(AgentmuxError::UserError(
+            "meeting requires at least 2 participants (comma-separated session names or ids)"
+                .to_string(),
+        ));
+    }
+    let kind = match kind {
+        Some(raw) => normalize_message_kind(&raw)?,
+        None => "question".to_string(),
+    };
+    let priority = match priority {
+        Some(raw) => normalize_priority(&raw)?,
+        None => "normal".to_string(),
+    };
+
+    let mut payload = json!({
+        "topic": topic,
+        "participants": participants,
+        "kind": kind,
+        "priority": priority,
+    });
+    if let Some(max_turns) = max_turns {
+        payload["max_messages_per_participant"] = json!(max_turns);
+    }
+    if let Some(body) = body {
+        payload["body"] = json!(body);
+    }
+    // Attribute the meeting (and its kickoff) to the opening agent session.
+    if let Ok(agent_id) = std::env::var("AGENTMUX_AGENT_ID")
+        && !agent_id.trim().is_empty()
+    {
+        payload["from_agent_id"] = json!(agent_id);
+    }
+
+    Ok(ClientRequest::new(
+        "req_meeting_open",
+        IpcCommand::MeetingOpen,
+        payload,
+    ))
+}
+
+fn meeting_close_request(thread_id: String) -> ClientRequest {
+    ClientRequest::new(
+        "req_meeting_close",
+        IpcCommand::MeetingClose,
+        json!({ "thread_id": thread_id }),
+    )
+}
+
+fn meeting_list_request() -> ClientRequest {
+    ClientRequest::new("req_meeting_list", IpcCommand::MeetingList, json!({}))
 }
 
 /// Map a user-supplied `--kind` value (the protocol's PascalCase names, accepted
@@ -2955,6 +3113,7 @@ fn print_sessions_response(response: DaemonResponse) -> Result<()> {
 struct MessageHistoryFilter {
     limit: usize,
     task: Option<String>,
+    thread: Option<String>,
     agent: Option<String>,
     kind: Option<String>,
     status: Option<String>,
@@ -3075,6 +3234,12 @@ fn format_message_history_payload(payload: &Value, filter: &MessageHistoryFilter
 fn message_matches_history_filter(message: &Value, filter: &MessageHistoryFilter) -> bool {
     if let Some(task) = filter.task.as_deref() {
         if message_string_field(message, "task_id") != task {
+            return false;
+        }
+    }
+
+    if let Some(thread) = filter.thread.as_deref() {
+        if message_string_field(message, "thread_id") != thread {
             return false;
         }
     }
@@ -3954,13 +4119,78 @@ mod tests {
         else {
             panic!("expected message send action");
         };
-        assert_eq!(to, "role:tester");
+        assert_eq!(to.as_deref(), Some("role:tester"));
         assert_eq!(kind.as_deref(), Some("Question"));
         assert_eq!(priority.as_deref(), Some("high"));
 
-        let request = message_send_request(to, body, kind, priority).unwrap();
+        let request = message_send_request(to.unwrap(), body, kind, priority).unwrap();
         assert_eq!(request.payload["kind"], "question");
         assert_eq!(request.payload["priority"], "high");
+    }
+
+    #[test]
+    fn message_send_accepts_thread_flag_without_to() {
+        let cli = Cli::try_parse_from([
+            "agentmux",
+            "message",
+            "send",
+            "--thread",
+            "thread_01HXAMPLE0000000000000000",
+            "--kind",
+            "Finding",
+            "私の意見です",
+        ])
+        .unwrap();
+        let Some(Commands::Message(args)) = cli.command else {
+            panic!("expected message command");
+        };
+        let MessageAction::Send { to, thread, .. } = args.action else {
+            panic!("expected message send action");
+        };
+        assert_eq!(to, None);
+        assert_eq!(thread.as_deref(), Some("thread_01HXAMPLE0000000000000000"));
+
+        // --to も --thread も無い場合はパースエラー。
+        assert!(
+            Cli::try_parse_from(["agentmux", "message", "send", "orphan body"]).is_err(),
+            "send without --to/--thread must be rejected"
+        );
+    }
+
+    #[test]
+    fn meeting_open_request_builds_participants_and_limits() {
+        let request = meeting_open_request(
+            "X の設計方針".to_string(),
+            "claude-a, codex-b ,agy-c".to_string(),
+            Some(3),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(request.command, IpcCommand::MeetingOpen);
+        assert_eq!(request.payload["topic"], "X の設計方針");
+        assert_eq!(
+            request.payload["participants"],
+            json!(["claude-a", "codex-b", "agy-c"])
+        );
+        assert_eq!(request.payload["max_messages_per_participant"], 3);
+        assert_eq!(request.payload["kind"], "question");
+        assert_eq!(request.payload["priority"], "normal");
+
+        // 参加者 2 名未満は拒否。
+        assert!(
+            meeting_open_request(
+                "topic".to_string(),
+                "solo-agent".to_string(),
+                None,
+                None,
+                None,
+                None,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -4117,6 +4347,7 @@ mod tests {
             &MessageHistoryFilter {
                 limit: 1,
                 task: None,
+                thread: None,
                 agent: Some("impl-codex".to_string()),
                 kind: Some("handoff".to_string()),
                 status: Some("queued".to_string()),

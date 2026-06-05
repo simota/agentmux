@@ -16,7 +16,7 @@ pub mod store;
 pub use event_log::{
     EVENT_AGENT_RESULT, EVENT_CONTEXT_CREATED, EVENT_INPUT_SCRIPT_CREATED,
     EVENT_INPUT_SCRIPT_INJECTED, EVENT_MAILBOX_WRITTEN, EVENT_MESSAGE_CREATED,
-    EVENT_MESSAGE_DELIVERED, EVENT_MESSAGE_INJECTED, EventLog, EventLogEntry, EventLogRotation,
-    MessageEventPayload,
+    EVENT_MESSAGE_DELIVERED, EVENT_MESSAGE_INJECTED, EVENT_THREAD_CLOSED, EVENT_THREAD_OPENED,
+    EventLog, EventLogEntry, EventLogRotation, MessageEventPayload,
 };
 pub use store::{AgentSessionRecord, ProjectRecord, Store, TaskRecord};
