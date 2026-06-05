@@ -1718,8 +1718,7 @@ impl DaemonRuntime {
         let messages = self
             .persist_agent_result_messages(&agent, task_id, &team, result)
             .await?;
-        self.trigger_idle_delivery_for_result_messages(&messages)
-            .await;
+        self.trigger_idle_delivery_for_messages(&messages).await;
         if completed
             && let Some(worktree_id) = self.resolve_agent_worktree(agent_id, agent_name).await
             && self.is_arena_candidate(&worktree_id).await
@@ -1729,13 +1728,21 @@ impl DaemonRuntime {
         Ok(true)
     }
 
-    /// Resolve message targets from a just-persisted result and trigger idle
-    /// delivery for each target agent that is currently registered.
+    /// Resolve message targets for a set of just-persisted messages and trigger
+    /// idle delivery for each target agent that is currently registered.
+    ///
+    /// Used by every persist path that wants the queued message to reach an
+    /// idle target PTY without a separate manual `inject` step (live
+    /// `AGENTMUX_RESULT` routing and the `message create`/`send` command).
+    ///
+    /// Eligibility (delivery_mode, agent status) is delegated to the existing
+    /// `deliver_idle_messages_for_agent` machinery — no extra gating is added
+    /// here, so `InboxOnly` / `RequireHumanApproval` semantics are preserved.
     ///
     /// Unknown targets (agents not yet registered) are silently skipped and
     /// their messages remain queued so they can be picked up when the target
     /// agent eventually calls `deliver_idle_messages_for_agent`.
-    async fn trigger_idle_delivery_for_result_messages(&self, messages: &[AgentMessage]) {
+    async fn trigger_idle_delivery_for_messages(&self, messages: &[AgentMessage]) {
         // Collect unique target agent IDs from the message bus.
         let target_ids: BTreeSet<AgentSessionId> = {
             let state = self.state.read().await;
@@ -1752,7 +1759,9 @@ impl DaemonRuntime {
         for target_id in target_ids {
             // Fetch the current status for this agent; fall back to
             // InteractiveReady so that an agent without an explicit status is
-            // still considered eligible for idle delivery.
+            // still considered eligible for idle delivery.  Eligibility of the
+            // status itself (idle vs running) is delegated to
+            // `deliver_idle_messages_for_agent`.
             let status = {
                 let state = self.state.read().await;
                 state
@@ -2692,7 +2701,16 @@ async fn handle_request(
                 }
             };
             match runtime.create_message(input).await {
-                Ok(message) => DaemonResponse::ok(request.id, message_payload(&message)),
+                Ok(message) => {
+                    // Deliver to an idle target PTY immediately so `message
+                    // send` no longer requires a separate manual `inject`.
+                    // Eligibility is delegated to the existing idle-delivery
+                    // machinery (delivery_mode + agent status).
+                    runtime
+                        .trigger_idle_delivery_for_messages(std::slice::from_ref(&message))
+                        .await;
+                    DaemonResponse::ok(request.id, message_payload(&message))
+                }
                 Err(error) => DaemonResponse::error(
                     request.id,
                     ErrorBody::new("MESSAGE_CREATE_FAILED", error.to_string()),
@@ -4505,6 +4523,94 @@ AGENTMUX_RESULT:
         std::fs::remove_dir_all(root).expect("temporary root is removed");
     }
 
+    /// `message send` (the `MessageCreate` IPC command) must inject the message
+    /// into an idle target PTY without a separate manual `message inject` step.
+    /// Spawns a tester PTY, marks it idle (AwaitingInput), then creates an
+    /// `inject_when_idle` message through the IPC dispatch arm and asserts the
+    /// handoff prompt reaches the PTY and the message becomes Delivered.
+    #[tokio::test]
+    async fn message_create_auto_injects_into_idle_pty_agent() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-msg-create-deliver-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("tester-output.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        let tester = runtime
+            .spawn_agent_with_role(
+                "send-tester".to_string(),
+                AgentRole::Tester,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("tester agent is spawned");
+
+        // Mark the tester idle so it is eligible for immediate injection.
+        {
+            let mut state = runtime.state.write().await;
+            if let Some(live) = state.agents.get_mut(&tester.id) {
+                live.metadata.status = Some(AgentStatus::AwaitingInput);
+            }
+        }
+
+        // Drive the message through the real IPC `MessageCreate` dispatch arm.
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_message_send",
+                IpcCommand::MessageCreate,
+                json!({
+                    "to": tester.id.to_string(),
+                    "body": "message-send-auto-inject-body",
+                    "kind": "handoff",
+                    "priority": "normal",
+                    "delivery_mode": "inject_when_idle",
+                }),
+            ))
+            .await
+            .unwrap();
+        let create_response = read_response(&mut reader).await;
+        assert!(
+            create_response.ok,
+            "message.create response was {create_response:?}"
+        );
+
+        // No manual `message inject` is issued; delivery must happen on its own.
+        let output = wait_for_file_contains(&output_path, "message-send-auto-inject-body")
+            .await
+            .expect("handoff prompt reached tester PTY without manual inject");
+        assert!(output.contains("message-send-auto-inject-body"));
+
+        let messages_after = runtime.list_messages().await;
+        assert_eq!(messages_after.len(), 1);
+        assert_eq!(
+            messages_after[0].delivery_status,
+            DeliveryStatus::Delivered,
+            "message must be Delivered after auto-injection"
+        );
+
+        terminate_agent_process(&runtime, &tester.id.to_string()).await;
+        server.abort();
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
     /// When the output tail contains an AGENTMUX_RESULT block with invalid
     /// JSON, parse_agent_result_marker returns NeedsStatusProbe.  The daemon
     /// must not silently drop this — it must emit an Error event so the caller
@@ -5353,6 +5459,19 @@ AGENTMUX_RESULT:
         assert!(attach_response.ok);
         assert_eq!(attach_event.kind, IpcEventKind::ClientAttached);
 
+        // This test exercises the *manual* `message inject` command path.
+        // Mark the agent as RunningTurn so the auto idle-delivery triggered by
+        // `message create` is a no-op here and delivery happens only via the
+        // explicit inject below (the auto-delivery path is covered by
+        // `message_create_auto_injects_into_idle_pty_agent`).
+        {
+            let parsed = parse_agent_session_id(&agent_id).unwrap();
+            let mut state = runtime.state.write().await;
+            if let Some(live) = state.agents.get_mut(&parsed) {
+                live.metadata.status = Some(AgentStatus::RunningTurn);
+            }
+        }
+
         writer
             .write(&ClientRequest::new(
                 "req_message_create",
@@ -5851,6 +5970,18 @@ AGENTMUX_RESULT:
         let (attach_response, attach_event) = read_response_and_event(&mut reader).await;
         assert!(attach_response.ok);
         assert_eq!(attach_event.kind, IpcEventKind::ClientAttached);
+
+        // This test focuses on context attach/inject, not message delivery.
+        // Mark the agent RunningTurn so the auto idle-delivery triggered by the
+        // `message create` below is a no-op and does not emit extra events that
+        // would desync the response/event frame sequencing here.
+        {
+            let parsed = parse_agent_session_id(&agent_id).unwrap();
+            let mut state = runtime.state.write().await;
+            if let Some(live) = state.agents.get_mut(&parsed) {
+                live.metadata.status = Some(AgentStatus::RunningTurn);
+            }
+        }
 
         writer
             .write(&ClientRequest::new(
