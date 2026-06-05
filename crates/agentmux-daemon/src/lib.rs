@@ -3584,6 +3584,7 @@ fn message_input_script(prepared: &PreparedInjection) -> InputScript {
         preconditions: Vec::new(),
         actions: vec![
             InputAction::PasteText(prepared.prompt.clone()),
+            InputAction::Wait(message_paste_enter_delay()),
             InputAction::PressEnter,
         ],
         safety: InputSafety::Safe,
@@ -3598,6 +3599,20 @@ fn message_inject_send_delay() -> Duration {
 
 #[cfg(test)]
 fn message_inject_send_delay() -> Duration {
+    Duration::ZERO
+}
+
+/// Delay inserted between PasteText and PressEnter inside `message_input_script`
+/// to ensure the two byte sequences land in separate PTY read chunks.  Without
+/// this gap, Codex's crossterm bracketed-paste handler coalesces the trailing
+/// `\r` into the paste buffer instead of treating it as a submit keypress.
+#[cfg(not(test))]
+fn message_paste_enter_delay() -> Duration {
+    Duration::from_millis(120)
+}
+
+#[cfg(test)]
+fn message_paste_enter_delay() -> Duration {
     Duration::ZERO
 }
 
@@ -4430,6 +4445,37 @@ mod tests {
                 .await?;
             Ok(matches!(outcome, LiveResultOutcome::Persisted))
         }
+    }
+
+    #[test]
+    fn message_input_script_has_wait_between_paste_and_enter() {
+        // Regression: without a Wait, PasteText and PressEnter bytes arrive in
+        // the same PTY read chunk. Codex's crossterm event parser coalesces the
+        // trailing `\r` into the bracketed-paste buffer instead of treating it
+        // as a submit keypress, causing intermittent injection failures.
+        let prepared = PreparedInjection {
+            message_id: MessageId::new(),
+            agent_id: AgentSessionId::new(),
+            prompt: "hello world".to_string(),
+        };
+        let script = message_input_script(&prepared);
+        assert_eq!(
+            script.actions.len(),
+            3,
+            "script must have exactly three actions: PasteText, Wait, PressEnter"
+        );
+        assert!(
+            matches!(script.actions[0], InputAction::PasteText(_)),
+            "first action must be PasteText"
+        );
+        assert!(
+            matches!(script.actions[1], InputAction::Wait(_)),
+            "second action must be a Wait to split PTY read chunks"
+        );
+        assert!(
+            matches!(script.actions[2], InputAction::PressEnter),
+            "third action must be PressEnter"
+        );
     }
 
     #[test]
