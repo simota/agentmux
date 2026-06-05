@@ -18,7 +18,7 @@ agentmux task run|status|pause|resume|cancel|summary
 agentmux agent ls|spawn|stop|send|inject|focus|interrupt
 agentmux message list|history|show|send|inject
 agentmux context add|list|show|search|attach|inject|export
-agentmux worktree list|diff|test|promote|archive
+agentmux worktree list|diff|test|promote|adopt|archive
 agentmux approval list|approve|reject
 agentmux layout save|load|list
 ```
@@ -83,6 +83,26 @@ agentmux task run "refresh token bugを修正し、テストも追加して" --t
 - taskを作成する。
 - TUIをattachする。
 - team templateに従ってpane/agent/worktreeを作成する。
+
+**Arena modeオプション（Cargo feature `arena` が必要）:**
+
+```bash
+agentmux task run "機能Xを実装して" --arena claude,codex
+agentmux task run "機能Xを実装して" --arena claude,codex --base-branch main
+```
+
+- `--arena <p1>,<p2>,...`: 指定した provider ごとに専用 worktree を作成して agent を spawn する（runner=arena）。
+- `--base-branch <branch>`: arena worktree の base branch を指定する（省略時は daemon の project base branch）。
+- provider が重複している場合は副作用の発生前にエラーで終了する。
+- 実行前に daemon が `ARENA_PROTOCOL_VERSION`（3）以上をサポートするか確認する。サポートしていない場合はエラーメッセージを表示して終了する。
+
+### 3.2.1 worktree adopt
+
+```bash
+agentmux worktree adopt <worktree_id>
+```
+
+指定した arena candidate worktree の adoption approval を queue する。成功した場合は `approval_id` を表示する。`agentmux approval approve <approval_id>` で承認すると integration branch への merge が実行される。
 
 ### 3.3 attach
 
@@ -168,6 +188,8 @@ agentmux message history --kind handoff
 | AgentList | agent状態一覧 |
 | ActivityFeed | live activity feed（sitrep header + event tail）。Cargofeature `activity-feed` が必要。 |
 
+**Arena overlay:** arena candidate を一覧表示するcentered popup。pane ではなくoverlay として実装されており、`Ctrl-g a` でトグルする（Cargo feature `arena` が必要）。
+
 ## 6. Keymap
 
 prefix key初期値: `Ctrl-g`
@@ -185,6 +207,7 @@ Ctrl-g m        message bus
 Ctrl-g c        context board
 Ctrl-g A        approval queue
 Ctrl-g f        activity feed toggle（feature: activity-feed）
+Ctrl-g a        arena overlay toggle（feature: arena）
 ```
 
 ### 6.2 Pane操作
@@ -251,6 +274,27 @@ Activity Feed paneの構成:
 - **tail追従**: 末尾のentryを選択しているときのみ自動追従する。
 
 daemon側のprotocol versionが`EVENT_SUBSCRIBE_PROTOCOL_VERSION`未満の場合、`event.subscribe`は送らず "Activity Feed unsupported by this daemon" をnoticeとして表示し、TUIは落とさない。
+
+## 6.5 Arena Overlay操作（feature: arena）
+
+`Ctrl-g a` でArena overlay（centered popup）をトグルする。daemon の `protocol_version` が `ARENA_PROTOCOL_VERSION`（3）未満の場合は "Arena unsupported by this daemon" をnoticeとして表示し、overlayは開かない。
+
+```text
+j / Down    次のcandidate を選択
+k / Up      前のcandidate を選択
+a / Enter   選択中の candidate を adopt（worktree.adopt を送信し、approval_id をstatus barに表示）
+Esc / q     overlayを閉じる
+```
+
+Arena overlay の各 candidate panel に表示する情報:
+
+- provider 名
+- diff stat（追加/削除行数）
+- test status（色分け: 緑=passed / 赤=failed / 黄=pending）
+- summary（AGENTMUX_RESULT の `summary` フィールド）
+- worktree_id
+
+選択中の candidate は反転ハイライトで表示する。
 
 ## 7. Command palette
 

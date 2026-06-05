@@ -68,6 +68,7 @@ enum WorktreeStatus {
     ReviewReady,
     Promoted,
     Archived,
+    Conflicted, // arenaでのmerge conflict発生後、abort済みの状態
     Failed,
 }
 ```
@@ -147,7 +148,30 @@ summary:
 - 0 failed
 ```
 
+## 8a. Arena Run（Cargo feature `arena`）
+
+`task run --arena <p1>,<p2>` を指定すると、runner が `arena` モードで動作する。
+
+**起動時の処理:**
+
+1. provider リストの重複を確認し、重複があれば副作用の発生前に拒否する。
+2. provider ごとに専用 worktree を `WorktreeManager` で実作成する（branch: `agentmux/{task_slug}-{provider}`）。
+3. 各 agent を worktree の cwd で spawn し、`worktree_id` を session metadata へリンクする。
+4. `--base-branch <branch>` が指定された場合はそのブランチを base とする（省略時は daemon のプロジェクト base branch）。
+
+**完了後の自動 capture:**
+
+- AGENTMUX_RESULT の `status=completed` を検出した arena agent に対して、diff と test を自動 capture する。
+- `WorktreeTestCompleted` event を publish して TUI に通知する。
+- capture 完了後、その candidate が readiness 条件（diff captured + tests passed）を満たせば adopt 操作が可能になる。
+
+**daemon capability gate:**
+
+- `ARENA_PROTOCOL_VERSION = 3`。client は `daemon.status` の `protocol_version` が 3 以上であることを確認してから `--arena` フラグを送る。protocol version が不足している場合は user-readable なエラーで終了する。
+
 ## 9. Promote flow
+
+### 9.1 worktree promote（通常 promote）
 
 ```bash
 agentmux worktree promote task-123-codex
@@ -163,6 +187,37 @@ agentmux worktree promote task-123-codex
 6. mergeまたはpatch apply
 7. conflictがあれば停止
 8. final summary更新
+
+### 9.2 Arena adopt flow（実装済み）
+
+Arena runnerで起動した task では、`promote` は直接 merge を行わず、adoption approval を approval queue へ積む。approve 後に以下の手順で merge が実行される。
+
+**前提条件（`request_worktree_adoption` で検証）:**
+
+1. diff capture 済みであること。
+2. test が passed であること。
+3. 同一 task で pending adoption が 1 件以下であること（重複防止）。
+
+**approve 後の merge 手順（`merge_to_integration_branch`）:**
+
+1. repo root が clean であることを確認する（dirty なら事前拒否）。
+2. integration branch を base branch へ `reset --hard` で refresh する（既存 integration branch がある場合も同様）。
+3. `git merge --no-commit --no-ff <candidate-branch>` を実行する。
+4. 結果に応じて `MergeOutcome` を返す。
+   - `Clean`: 差分なし（no-op merge）。
+   - `Dirty`: merge 成功、uncommitted changes あり → commit する。
+   - `Conflict`: unresolved conflicts 検出 → `git merge --abort` を即座に実行し、MERGE_HEAD 残存を確認して repo root を元 branch へ復元する。
+5. 全パスで repo root を元の branch へ checkout して復元する。
+
+conflict 発生時は `WorktreeStatus::Conflicted` へ遷移し、error event を publish する。reject 時は `Archived` へ遷移する。
+
+**CLI:**
+
+```bash
+agentmux worktree adopt <worktree_id>   # adoption approval を queue して approval_id を表示
+```
+
+**TUI:** Arena overlay（`Ctrl-g a`）から `a` または Enter で adopt を実行できる。
 
 ## 10. Cleanup
 
