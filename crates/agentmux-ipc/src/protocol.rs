@@ -269,6 +269,8 @@ pub enum IpcCommand {
     WorktreePromote,
     #[serde(rename = "worktree.archive")]
     WorktreeArchive,
+    #[serde(rename = "worktree.adopt")]
+    WorktreeAdopt,
     #[serde(rename = "approval.list")]
     ApprovalList,
     #[serde(rename = "approval.approve")]
@@ -331,6 +333,10 @@ pub enum IpcEventKind {
     WorktreeCreated,
     #[serde(rename = "worktree.diff_captured")]
     WorktreeDiffCaptured,
+    #[serde(rename = "worktree.adopt_requested")]
+    WorktreeAdoptRequested,
+    #[serde(rename = "worktree.test_completed")]
+    WorktreeTestCompleted,
     #[serde(rename = "policy.denied")]
     PolicyDenied,
     #[serde(rename = "error")]
