@@ -4,13 +4,14 @@ use agentmux_agent::{
     InputAction, InputScript,
     adapter::{InputPrecondition, InputSafety},
 };
-use agentmux_core::{DateTimeUtc, InputScriptId};
+use agentmux_core::{DateTimeUtc, InputScriptId, WorktreeId, WorktreeStatus};
 use agentmux_daemon::{DaemonRuntime, handle_client};
 use agentmux_ipc::{
     ClientHello, ClientRequest, DaemonEvent, DaemonResponse, IpcCommand, IpcEventKind, JsonlReader,
     JsonlWriter,
 };
 use agentmux_store::EventLog;
+use agentmux_worktree::TestCommand;
 use serde_json::json;
 use tokio::io::BufReader;
 use tokio::net::{UnixListener, UnixStream};
@@ -107,6 +108,243 @@ async fn task_run_shell_stub_handoffs_planner_to_implementer_tester_and_reviewer
 
     server.abort();
     std::fs::remove_dir_all(root).expect("temporary project root is removed");
+}
+
+#[tokio::test]
+async fn arena_task_run_adopt_approval_promotes_candidate_without_conflict() {
+    let root = std::env::temp_dir().join(format!("agentmux-arena-clean-{}", ulid::Ulid::new()));
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("temporary repo root is created");
+    init_arena_repo(&repo);
+    let provider = write_arena_provider_script(&root, "2");
+    let runtime = DaemonRuntime::new(32);
+
+    let (client_stream, server_stream) = UnixStream::pair().expect("test IPC pair is created");
+    let server = tokio::spawn(handle_client(server_stream, runtime.clone()));
+    let (reader, writer) = client_stream.into_split();
+    let mut reader = JsonlReader::new(BufReader::new(reader));
+    let mut writer = JsonlWriter::new(writer);
+
+    writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+    writer
+        .write(&ClientRequest::new(
+            "req_arena",
+            IpcCommand::TaskRun,
+            json!({
+                "body": "compare candidates",
+                "team": "claude-codex",
+                "project_path": repo,
+                "runner": "arena",
+                "providers": [provider.display().to_string()],
+                "base_branch": "main",
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let response = read_response(&mut reader).await;
+    assert!(response.ok, "arena task.run response was {response:?}");
+    let payload = response.payload.expect("arena payload");
+    let worktree_id = payload["candidates"][0]["worktree"]["worktree_id"]
+        .as_str()
+        .expect("candidate worktree id")
+        .parse::<WorktreeId>()
+        .expect("worktree id parses");
+
+    let worktree_path = std::path::PathBuf::from(
+        payload["candidates"][0]["worktree"]["path"]
+            .as_str()
+            .expect("candidate worktree path"),
+    );
+    commit_arena_candidate_change(&worktree_path, "2");
+    runtime
+        .capture_worktree_diff(&worktree_id)
+        .await
+        .expect("diff capture succeeds");
+    runtime
+        .run_worktree_test(
+            &worktree_id,
+            TestCommand {
+                name: "cargo-test".to_string(),
+                command: "cargo test".to_string(),
+            },
+        )
+        .await
+        .expect("test capture succeeds");
+    wait_for_worktree_status(&runtime, &worktree_id, WorktreeStatus::ReviewReady).await;
+
+    writer
+        .write(&ClientRequest::new(
+            "req_adopt",
+            IpcCommand::WorktreeAdopt,
+            json!({ "worktree_id": worktree_id.to_string() }),
+        ))
+        .await
+        .unwrap();
+    let adopt_response = read_response(&mut reader).await;
+    assert!(adopt_response.ok, "adopt response was {adopt_response:?}");
+    let approval_id = adopt_response.payload.unwrap()["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    writer
+        .write(&ClientRequest::new(
+            "req_approve",
+            IpcCommand::ApprovalApprove,
+            json!({ "approval_id": approval_id }),
+        ))
+        .await
+        .unwrap();
+    let approve_response = read_response(&mut reader).await;
+    assert!(
+        approve_response.ok,
+        "approve response was {approve_response:?}"
+    );
+    wait_for_worktree_status(&runtime, &worktree_id, WorktreeStatus::Promoted).await;
+
+    assert_eq!(git_stdout(&repo, ["branch", "--show-current"]), "main\n");
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 { 1 }\n"
+    );
+    assert_eq!(git_stdout(&repo, ["diff", "--cached", "--name-only"]), "");
+    assert_eq!(git_stdout(&repo, ["diff", "--name-only"]), "");
+    assert_eq!(
+        git_stdout(&repo, ["diff", "--name-only", "--diff-filter=U"]),
+        ""
+    );
+    test_git(&repo, ["checkout", "agentmux/integration"]);
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 { 2 }\n"
+    );
+    assert!(git_stdout(&repo, ["log", "-1", "--pretty=%s"]).contains("Promote worktree"));
+
+    server.abort();
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
+#[tokio::test]
+async fn arena_adopt_conflict_aborts_and_leaves_base_clean() {
+    let root = std::env::temp_dir().join(format!("agentmux-arena-conflict-{}", ulid::Ulid::new()));
+    let repo = root.join("repo");
+    std::fs::create_dir_all(&repo).expect("temporary repo root is created");
+    init_arena_repo(&repo);
+    let provider = write_arena_provider_script(&root, "2");
+    let runtime = DaemonRuntime::new(32);
+
+    let (client_stream, server_stream) = UnixStream::pair().expect("test IPC pair is created");
+    let server = tokio::spawn(handle_client(server_stream, runtime.clone()));
+    let (reader, writer) = client_stream.into_split();
+    let mut reader = JsonlReader::new(BufReader::new(reader));
+    let mut writer = JsonlWriter::new(writer);
+
+    writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+    writer
+        .write(&ClientRequest::new(
+            "req_arena_conflict",
+            IpcCommand::TaskRun,
+            json!({
+                "body": "conflicting candidate",
+                "team": "claude-codex",
+                "project_path": repo,
+                "runner": "arena",
+                "providers": [provider.display().to_string()],
+                "base_branch": "main",
+            }),
+        ))
+        .await
+        .unwrap();
+
+    let response = read_response(&mut reader).await;
+    assert!(response.ok, "arena task.run response was {response:?}");
+    let payload = response.payload.expect("arena payload");
+    let worktree_id = payload["candidates"][0]["worktree"]["worktree_id"]
+        .as_str()
+        .expect("candidate worktree id")
+        .parse::<WorktreeId>()
+        .expect("worktree id parses");
+
+    let worktree_path = std::path::PathBuf::from(
+        payload["candidates"][0]["worktree"]["path"]
+            .as_str()
+            .expect("candidate worktree path"),
+    );
+    commit_arena_candidate_change(&worktree_path, "2");
+    runtime
+        .capture_worktree_diff(&worktree_id)
+        .await
+        .expect("diff capture succeeds");
+    runtime
+        .run_worktree_test(
+            &worktree_id,
+            TestCommand {
+                name: "cargo-test".to_string(),
+                command: "cargo test".to_string(),
+            },
+        )
+        .await
+        .expect("test capture succeeds");
+    wait_for_worktree_status(&runtime, &worktree_id, WorktreeStatus::ReviewReady).await;
+
+    std::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u32 { 99 }\n").unwrap();
+    test_git(&repo, ["add", "src/lib.rs"]);
+    test_git(
+        &repo,
+        [
+            "-c",
+            "user.name=Agentmux Test",
+            "-c",
+            "user.email=agentmux@example.invalid",
+            "commit",
+            "-m",
+            "conflicting main change",
+        ],
+    );
+
+    writer
+        .write(&ClientRequest::new(
+            "req_adopt_conflict",
+            IpcCommand::WorktreeAdopt,
+            json!({ "worktree_id": worktree_id.to_string() }),
+        ))
+        .await
+        .unwrap();
+    let adopt_response = read_response(&mut reader).await;
+    assert!(adopt_response.ok, "adopt response was {adopt_response:?}");
+    let approval_id = adopt_response.payload.unwrap()["approval_id"]
+        .as_str()
+        .expect("approval id")
+        .to_string();
+
+    writer
+        .write(&ClientRequest::new(
+            "req_approve_conflict",
+            IpcCommand::ApprovalApprove,
+            json!({ "approval_id": approval_id }),
+        ))
+        .await
+        .unwrap();
+    let approve_response = read_response(&mut reader).await;
+    assert!(
+        approve_response.ok,
+        "approve response was {approve_response:?}"
+    );
+    wait_for_worktree_status(&runtime, &worktree_id, WorktreeStatus::Conflicted).await;
+
+    assert_eq!(
+        std::fs::read_to_string(repo.join("src/lib.rs")).unwrap(),
+        "pub fn value() -> u32 { 99 }\n"
+    );
+    assert_eq!(git_stdout(&repo, ["diff", "--name-only"]), "");
+    assert_eq!(
+        git_stdout(&repo, ["diff", "--name-only", "--diff-filter=U"]),
+        ""
+    );
+
+    server.abort();
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
 }
 
 #[tokio::test]
@@ -481,4 +719,139 @@ async fn assert_file_contains(path: &std::path::Path, needle: &str) {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     panic!("{} did not contain {needle:?}", path.display());
+}
+
+fn init_arena_repo(repo: &std::path::Path) {
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"arena-fixture\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[lib]\npath = \"src/lib.rs\"\n",
+    )
+    .unwrap();
+    std::fs::write(repo.join("src/lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+    test_git(repo, ["init", "-b", "main"]);
+    test_git(repo, ["add", "Cargo.toml", "src/lib.rs"]);
+    test_git(
+        repo,
+        [
+            "-c",
+            "user.name=Agentmux Test",
+            "-c",
+            "user.email=agentmux@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+}
+
+fn write_arena_provider_script(root: &std::path::Path, value: &str) -> std::path::PathBuf {
+    let script = root.join(format!("arena-provider-{value}.sh"));
+    std::fs::write(
+        &script,
+        format!(
+            r#"#!/bin/sh
+set -eu
+printf 'pub fn value() -> u32 {{ {value} }}\n' > src/lib.rs
+git add src/lib.rs
+git -c user.name='Agentmux Test' -c user.email='agentmux@example.invalid' commit -m arena-candidate
+cat <<'AGENTMUX_RESULT_EOF'
+AGENTMUX_RESULT:
+{{
+  "status": "completed",
+  "summary": "arena candidate ready",
+  "changed_files": ["src/lib.rs"],
+  "messages": [],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}}
+AGENTMUX_RESULT_EOF
+"#
+        ),
+    )
+    .unwrap();
+    let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+    use std::os::unix::fs::PermissionsExt;
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&script, permissions).unwrap();
+    script
+}
+
+fn commit_arena_candidate_change(worktree_path: &std::path::Path, value: &str) {
+    std::fs::write(
+        worktree_path.join("src/lib.rs"),
+        format!("pub fn value() -> u32 {{ {value} }}\n"),
+    )
+    .unwrap();
+    test_git(worktree_path, ["add", "src/lib.rs"]);
+    test_git(
+        worktree_path,
+        [
+            "-c",
+            "user.name=Agentmux Test",
+            "-c",
+            "user.email=agentmux@example.invalid",
+            "commit",
+            "-m",
+            "arena candidate",
+        ],
+    );
+}
+
+async fn wait_for_worktree_status(
+    runtime: &DaemonRuntime,
+    worktree_id: &WorktreeId,
+    expected: WorktreeStatus,
+) {
+    for _ in 0..120 {
+        let worktrees = runtime.list_worktrees().await;
+        if worktrees
+            .iter()
+            .any(|worktree| worktree.id == *worktree_id && worktree.status == expected)
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let worktree = runtime
+        .list_worktrees()
+        .await
+        .into_iter()
+        .find(|worktree| worktree.id == *worktree_id)
+        .expect("worktree is registered");
+    assert_eq!(worktree.status, expected);
+}
+
+fn test_git<const N: usize>(repo: &std::path::Path, args: [&str; N]) {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn git_stdout<const N: usize>(repo: &std::path::Path, args: [&str; N]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git command failed: {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap()
 }
