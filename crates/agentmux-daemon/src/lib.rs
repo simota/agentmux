@@ -567,6 +567,26 @@ impl DaemonRuntime {
         Ok(message)
     }
 
+    /// Like `create_message` but stores the message even when no agents are
+    /// currently registered for the target (used from automated
+    /// `persist_live_agent_result` paths where the target may not yet be
+    /// spawned).
+    async fn create_message_allow_no_recipients(
+        &self,
+        input: NewAgentMessage,
+    ) -> Result<AgentMessage> {
+        let mut state = self.state.write().await;
+        let message = state.messages.create_message_allow_no_recipients(input)?;
+        drop(state);
+
+        self.append_message_event(agentmux_store::EVENT_MESSAGE_CREATED, &message)?;
+        self.publish(DaemonEvent::new(
+            IpcEventKind::MessageCreated,
+            message_payload(&message),
+        ));
+        Ok(message)
+    }
+
     pub async fn list_messages(&self) -> Vec<AgentMessage> {
         let state = self.state.read().await;
         state
@@ -1625,6 +1645,29 @@ impl DaemonRuntime {
         .await
     }
 
+    /// Like `persist_orchestrator_message` but stores the message even when no
+    /// agents are currently registered for the target (used from
+    /// `persist_agent_result_messages` so that messages produced by a
+    /// just-completed turn are kept even when the target has not yet spawned).
+    async fn persist_orchestrator_message_allow_no_recipients(
+        &self,
+        message: &agentmux_agent::OrchestratorMessage,
+    ) -> Result<AgentMessage> {
+        self.create_message_allow_no_recipients(NewAgentMessage {
+            task_id: message.task_id.clone(),
+            from: message.from.clone(),
+            to: message.to.clone(),
+            kind: message.kind.clone(),
+            priority: message.priority.clone(),
+            body: message.body.clone(),
+            context_refs: message.context_refs.clone(),
+            artifact_refs: message.artifact_refs.clone(),
+            delivery_mode: message.delivery_mode.clone(),
+            requires_response: message.requires_response,
+        })
+        .await
+    }
+
     pub async fn persist_agent_result_messages(
         &self,
         agent: &AgentRouteIdentity,
@@ -1635,7 +1678,10 @@ impl DaemonRuntime {
         let routed = route_agent_result(agent, task_id, team, result)?;
         let mut messages = Vec::with_capacity(routed.outgoing.len());
         for outgoing in &routed.outgoing {
-            messages.push(self.persist_orchestrator_message(outgoing).await?);
+            messages.push(
+                self.persist_orchestrator_message_allow_no_recipients(outgoing)
+                    .await?,
+            );
         }
         Ok(messages)
     }
@@ -1648,7 +1694,17 @@ impl DaemonRuntime {
     ) -> Result<bool> {
         let result = match parse_agent_result_marker(output_tail) {
             AgentResultParse::Found(parsed) => parsed.result,
-            AgentResultParse::NotFound | AgentResultParse::NeedsStatusProbe(_) => {
+            AgentResultParse::NotFound => return Ok(false),
+            AgentResultParse::NeedsStatusProbe(probe) => {
+                self.publish(DaemonEvent::new(
+                    IpcEventKind::Error,
+                    json!({
+                        "agent_name": agent_name,
+                        "agent_id": agent_id.map(|id| id.to_string()),
+                        "signal": "agent_result_needs_status_probe",
+                        "reason": probe.reason,
+                    }),
+                ));
                 return Ok(false);
             }
         };
@@ -1659,8 +1715,11 @@ impl DaemonRuntime {
             name: agent_name.to_string(),
             role: inferred_agent_role(agent_name),
         };
-        self.persist_agent_result_messages(&agent, task_id, &team, result)
+        let messages = self
+            .persist_agent_result_messages(&agent, task_id, &team, result)
             .await?;
+        self.trigger_idle_delivery_for_result_messages(&messages)
+            .await;
         if completed
             && let Some(worktree_id) = self.resolve_agent_worktree(agent_id, agent_name).await
             && self.is_arena_candidate(&worktree_id).await
@@ -1668,6 +1727,54 @@ impl DaemonRuntime {
             self.capture_and_test_arena_candidate(worktree_id);
         }
         Ok(true)
+    }
+
+    /// Resolve message targets from a just-persisted result and trigger idle
+    /// delivery for each target agent that is currently registered.
+    ///
+    /// Unknown targets (agents not yet registered) are silently skipped and
+    /// their messages remain queued so they can be picked up when the target
+    /// agent eventually calls `deliver_idle_messages_for_agent`.
+    async fn trigger_idle_delivery_for_result_messages(&self, messages: &[AgentMessage]) {
+        // Collect unique target agent IDs from the message bus.
+        let target_ids: BTreeSet<AgentSessionId> = {
+            let state = self.state.read().await;
+            messages
+                .iter()
+                .flat_map(|msg| state.messages.resolve_target(&msg.to).unwrap_or_default())
+                .collect()
+        };
+
+        if target_ids.is_empty() {
+            return;
+        }
+
+        for target_id in target_ids {
+            // Fetch the current status for this agent; fall back to
+            // InteractiveReady so that an agent without an explicit status is
+            // still considered eligible for idle delivery.
+            let status = {
+                let state = self.state.read().await;
+                state
+                    .agents
+                    .get(&target_id)
+                    .and_then(|a| a.metadata.status.clone())
+                    .unwrap_or(AgentStatus::InteractiveReady)
+            };
+            if let Err(error) = self
+                .deliver_idle_messages_for_agent(&target_id, status)
+                .await
+            {
+                self.publish(DaemonEvent::new(
+                    IpcEventKind::Error,
+                    json!({
+                        "agent_id": target_id.to_string(),
+                        "signal": "idle_delivery_failed_after_result",
+                        "error": error.to_string(),
+                    }),
+                ));
+            }
+        }
     }
 
     async fn resolve_agent_worktree(
@@ -4299,6 +4406,560 @@ AGENTMUX_RESULT:
             MessageTarget::AgentName("tester-a1b2c3".to_string())
         );
         assert_eq!(messages[0].body, "Run only the named tester session.");
+    }
+
+    /// When agent A emits AGENTMUX_RESULT with a messages[] entry targeting
+    /// agent B by role, and agent B is idle (AwaitingInput), the handoff
+    /// prompt must be injected into agent B's PTY automatically — without any
+    /// explicit `apply_agent_status_signal` or `deliver_idle_messages_for_agent`
+    /// call from outside.
+    #[tokio::test]
+    async fn live_agent_result_auto_delivers_to_idle_pty_agent() {
+        let root = std::env::temp_dir().join(format!(
+            "agentmux-result-auto-deliver-{}",
+            ulid::Ulid::new()
+        ));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("tester-output.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        // Agent B: a live PTY tester that writes received input to a file.
+        let tester = runtime
+            .spawn_agent_with_role(
+                "auto-tester".to_string(),
+                AgentRole::Tester,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("tester agent is spawned");
+
+        // Pre-set tester status to AwaitingInput so it is eligible for idle
+        // delivery.  Write directly to state to avoid triggering delivery
+        // before the message exists.
+        {
+            let mut state = runtime.state.write().await;
+            if let Some(live) = state.agents.get_mut(&tester.id) {
+                live.metadata.status = Some(AgentStatus::AwaitingInput);
+            }
+        }
+
+        // Agent A: a logical implementer with no PTY (as if it just finished
+        // its turn and scrolled AGENTMUX_RESULT through its terminal output).
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Implementation complete, handing off to tester.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "auto-deliver-handoff-body",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+
+        let persisted = runtime
+            .persist_live_agent_result(None, "auto-impl", output)
+            .await
+            .expect("live result persists");
+        assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
+
+        // The message should have been created …
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 1, "one message is created");
+
+        // … and delivered to the idle tester PTY automatically.
+        let output = wait_for_file_contains(&output_path, "auto-deliver-handoff-body")
+            .await
+            .expect("handoff prompt reached tester PTY");
+        assert!(
+            output.contains("auto-deliver-handoff-body"),
+            "tester PTY must contain the handoff body"
+        );
+
+        let messages_after = runtime.list_messages().await;
+        assert_eq!(
+            messages_after[0].delivery_status,
+            DeliveryStatus::Delivered,
+            "message delivery_status must be Delivered"
+        );
+
+        terminate_agent_process(&runtime, &tester.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// When the output tail contains an AGENTMUX_RESULT block with invalid
+    /// JSON, parse_agent_result_marker returns NeedsStatusProbe.  The daemon
+    /// must not silently drop this — it must emit an Error event so the caller
+    /// can observe the failure via the event stream.
+    #[tokio::test]
+    async fn live_agent_result_needs_status_probe_emits_error_event() {
+        let runtime = DaemonRuntime::new(8);
+        let mut events = runtime.subscribe();
+
+        // A valid AGENTMUX_RESULT: marker followed by malformed JSON triggers
+        // NeedsStatusProbe.
+        let output = "AGENTMUX_RESULT:\n{ invalid json }\n";
+
+        let persisted = runtime
+            .persist_live_agent_result(None, "probe-agent", output)
+            .await
+            .expect("persist call itself must not fail");
+        assert!(
+            !persisted,
+            "NeedsStatusProbe must return false (not yet persisted)"
+        );
+
+        // The daemon must have published exactly one Error event describing
+        // the needs-probe condition.
+        let event = tokio::time::timeout(Duration::from_millis(100), events.recv())
+            .await
+            .expect("error event should be published promptly")
+            .expect("event channel must be open");
+        assert_eq!(event.kind, IpcEventKind::Error);
+        let payload = event.payload;
+        assert_eq!(
+            payload["signal"], "agent_result_needs_status_probe",
+            "signal field must identify the needs-probe condition"
+        );
+        assert_eq!(
+            payload["agent_name"], "probe-agent",
+            "agent_name must be included in the error payload"
+        );
+    }
+
+    /// Regression: when the message target's agent has status RunningTurn (not
+    /// eligible per agent_accepts_idle_injection), the message must stay Queued
+    /// and must NOT cause a panic or an error — the daemon silently defers until
+    /// the agent becomes idle.
+    #[tokio::test]
+    async fn live_agent_result_target_running_turn_stays_queued_no_panic() {
+        let runtime = DaemonRuntime::new(8);
+
+        // Register a tester without a PTY so no actual PTY write can happen.
+        let tester = runtime
+            .register_agent_with_role("busy-tester".to_string(), AgentRole::Tester)
+            .await;
+
+        // Mark the tester as RunningTurn — not eligible for idle injection.
+        {
+            let mut state = runtime.state.write().await;
+            if let Some(live) = state.agents.get_mut(&tester.id) {
+                live.metadata.status = Some(AgentStatus::RunningTurn);
+            }
+        }
+
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Impl done.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "busy-tester-body",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+        // Must not panic or return Err.
+        let persisted = runtime
+            .persist_live_agent_result(None, "impl-agent", output)
+            .await
+            .expect("persist must not fail even with a busy target");
+        assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
+
+        // The message must exist and remain Queued — not Delivered.
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 1, "one message is created");
+        assert_ne!(
+            messages[0].delivery_status,
+            DeliveryStatus::Delivered,
+            "message to a RunningTurn target must not be delivered yet"
+        );
+        // Acceptable queued states: Queued or WaitingForAgent.
+        assert!(
+            matches!(
+                messages[0].delivery_status,
+                DeliveryStatus::Queued | DeliveryStatus::WaitingForAgent
+            ),
+            "message delivery_status must be a waiting state, got {:?}",
+            messages[0].delivery_status,
+        );
+    }
+
+    /// Regression: when no session is registered for the target role
+    /// (e.g. "role:tester" resolves to 0 sessions), persist_live_agent_result
+    /// must still succeed and the message must remain Queued — not lost or
+    /// errored.
+    #[tokio::test]
+    async fn live_agent_result_unregistered_target_stays_queued() {
+        let runtime = DaemonRuntime::new(8);
+        // Intentionally do NOT register any tester session.
+
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Impl done, no tester available yet.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "orphan-message-body",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+        let persisted = runtime
+            .persist_live_agent_result(None, "impl-agent", output)
+            .await
+            .expect("persist must succeed even without a registered target");
+        assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
+
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 1, "message must be stored");
+        assert_ne!(
+            messages[0].delivery_status,
+            DeliveryStatus::Delivered,
+            "unroutable message must not be marked Delivered"
+        );
+    }
+
+    /// Regression: when AGENTMUX_RESULT contains multiple messages targeting
+    /// different agents, each eligible agent must receive its own message
+    /// and its delivery_status must become Delivered.
+    #[tokio::test]
+    async fn live_agent_result_multiple_messages_each_delivered_to_eligible_target() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-multi-deliver-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let tester_out = root.join("tester-out.txt");
+        let reviewer_out = root.join("reviewer-out.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        // Spawn tester PTY.
+        let tester = runtime
+            .spawn_agent_with_role(
+                "multi-tester".to_string(),
+                AgentRole::Tester,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        tester_out.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("tester agent is spawned");
+
+        // Spawn reviewer PTY.
+        let reviewer = runtime
+            .spawn_agent_with_role(
+                "multi-reviewer".to_string(),
+                AgentRole::Reviewer,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        reviewer_out.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("reviewer agent is spawned");
+
+        // Set both to AwaitingInput.
+        {
+            let mut state = runtime.state.write().await;
+            for id in [&tester.id, &reviewer.id] {
+                if let Some(live) = state.agents.get_mut(id) {
+                    live.metadata.status = Some(AgentStatus::AwaitingInput);
+                }
+            }
+        }
+
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Implementation done, notify tester and reviewer.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "multi-tester-body",
+      "priority": "normal"
+    },
+    {
+      "to": "role:reviewer",
+      "kind": "ReviewComment",
+      "body": "multi-reviewer-body",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+        let persisted = runtime
+            .persist_live_agent_result(None, "multi-impl", output)
+            .await
+            .expect("persist must succeed");
+        assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
+
+        let messages = runtime.list_messages().await;
+        assert_eq!(messages.len(), 2, "two messages must be created");
+
+        // Tester receives its message.
+        let tester_content = wait_for_file_contains(&tester_out, "multi-tester-body")
+            .await
+            .expect("tester PTY must receive its message");
+        assert!(tester_content.contains("multi-tester-body"));
+
+        // Reviewer receives its message.
+        let reviewer_content = wait_for_file_contains(&reviewer_out, "multi-reviewer-body")
+            .await
+            .expect("reviewer PTY must receive its message");
+        assert!(reviewer_content.contains("multi-reviewer-body"));
+
+        // Both messages must be Delivered.
+        let messages_after = runtime.list_messages().await;
+        for msg in &messages_after {
+            assert_eq!(
+                msg.delivery_status,
+                DeliveryStatus::Delivered,
+                "message {:?} must be Delivered, body={}",
+                msg.id,
+                msg.body,
+            );
+        }
+
+        terminate_agent_process(&runtime, &tester.id.to_string()).await;
+        terminate_agent_process(&runtime, &reviewer.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// Regression: an agent whose status is None (not yet reported) must be
+    /// treated as InteractiveReady (the fallback in
+    /// trigger_idle_delivery_for_result_messages) and must therefore receive
+    /// idle-injected messages from a just-persisted AGENTMUX_RESULT.
+    #[tokio::test]
+    async fn live_agent_result_status_none_fallback_delivers_as_interactive_ready() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-none-fallback-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("none-tester-out.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        // Spawn a tester PTY but deliberately leave its status as None
+        // (no explicit status signal received yet).
+        let tester = runtime
+            .spawn_agent_with_role(
+                "none-tester".to_string(),
+                AgentRole::Tester,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("tester agent is spawned");
+
+        // Confirm status is None (spawn does not set an explicit status).
+        {
+            let state = runtime.state.read().await;
+            let live = state.agents.get(&tester.id).expect("agent is registered");
+            assert!(
+                live.metadata.status.is_none(),
+                "status must be None before any status signal"
+            );
+        }
+
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Impl done, fallback tester.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "none-fallback-body",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+        let persisted = runtime
+            .persist_live_agent_result(None, "fallback-impl", output)
+            .await
+            .expect("persist must succeed");
+        assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
+
+        // The message must be delivered even though the tester's status was None.
+        let content = wait_for_file_contains(&output_path, "none-fallback-body")
+            .await
+            .expect("tester PTY must receive the message via InteractiveReady fallback");
+        assert!(content.contains("none-fallback-body"));
+
+        let messages = runtime.list_messages().await;
+        assert_eq!(
+            messages[0].delivery_status,
+            DeliveryStatus::Delivered,
+            "message must be Delivered (status-None fallback to InteractiveReady)"
+        );
+
+        terminate_agent_process(&runtime, &tester.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// End-to-end spawn-order race: agent A emits an AGENTMUX_RESULT targeting
+    /// role:tester *before* any tester session exists.  The message must be
+    /// stored (not lost).  When a tester is spawned later, the message is
+    /// backfilled into its inbox, and the first idle status signal injects the
+    /// handoff prompt into the tester PTY.  This is the regression guard for
+    /// the spawn-order race that backfill closes.
+    #[tokio::test]
+    async fn live_agent_result_backfills_to_tester_spawned_after_result() {
+        let root =
+            std::env::temp_dir().join(format!("agentmux-backfill-e2e-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("late-tester-out.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        // Agent A finishes its turn and emits a handoff to role:tester while
+        // NO tester session is registered yet.
+        let output = r#"
+AGENTMUX_RESULT:
+{
+  "status": "completed",
+  "summary": "Impl done, tester not spawned yet.",
+  "changed_files": [],
+  "messages": [
+    {
+      "to": "role:tester",
+      "kind": "TestResult",
+      "body": "backfill-late-tester-body",
+      "priority": "normal"
+    }
+  ],
+  "context_updates": [],
+  "needs": [],
+  "next": null
+}
+"#;
+        let persisted = runtime
+            .persist_live_agent_result(None, "impl-agent", output)
+            .await
+            .expect("persist must succeed even with no tester");
+        assert!(persisted, "AGENTMUX_RESULT must be parsed and persisted");
+
+        // The message exists but is not yet delivered.
+        let messages = runtime.list_messages().await;
+        assert_eq!(
+            messages.len(),
+            1,
+            "message must be stored before tester exists"
+        );
+        assert_ne!(
+            messages[0].delivery_status,
+            DeliveryStatus::Delivered,
+            "message must not be delivered while tester is absent"
+        );
+
+        // The tester is spawned later — register_agent backfills the message
+        // into its inbox.
+        let tester = runtime
+            .spawn_agent_with_role(
+                "late-tester".to_string(),
+                AgentRole::Tester,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("tester agent is spawned");
+
+        // First idle status signal triggers delivery of the backfilled message.
+        runtime
+            .apply_agent_status_signal(&tester.id, AgentStatus::AwaitingInput, "test")
+            .await
+            .expect("status signal applies and delivers idle messages");
+
+        // The handoff prompt reaches the tester PTY.
+        let content = wait_for_file_contains(&output_path, "backfill-late-tester-body")
+            .await
+            .expect("backfilled message must reach the late-spawned tester PTY");
+        assert!(content.contains("backfill-late-tester-body"));
+
+        let messages_after = runtime.list_messages().await;
+        assert_eq!(
+            messages_after[0].delivery_status,
+            DeliveryStatus::Delivered,
+            "backfilled message must be Delivered after the tester goes idle"
+        );
+
+        terminate_agent_process(&runtime, &tester.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
     }
 
     #[tokio::test]

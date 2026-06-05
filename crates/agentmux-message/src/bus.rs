@@ -115,13 +115,59 @@ impl MessageBus {
     }
 
     pub fn register_agent(&mut self, agent: AgentDescriptor) {
+        let agent_id = agent.id.clone();
         self.inboxes
-            .entry(agent.id.clone())
+            .entry(agent_id.clone())
             .or_insert_with(|| Inbox {
-                agent_id: agent.id.clone(),
+                agent_id: agent_id.clone(),
                 message_ids: Vec::new(),
             });
-        self.agents.insert(agent.id.clone(), agent);
+        // Insert the descriptor first so that `resolve_target` (used by the
+        // backfill below) can see the freshly registered agent when matching
+        // Role/Task/Team/AgentName/Agent targets.
+        self.agents.insert(agent_id.clone(), agent);
+        self.backfill_inbox_for_registered_agent(&agent_id);
+    }
+
+    /// When an agent registers, claim any previously stored messages whose
+    /// target now resolves to this agent but which were saved with no inbox
+    /// entry (e.g. via `create_message_allow_no_recipients` while the target
+    /// session had not yet spawned).
+    ///
+    /// Only messages that are still pending delivery are backfilled; messages
+    /// that already reached a terminal/handled state (`Delivered`, `Failed`,
+    /// `Cancelled`) are left untouched. Target matching reuses the same
+    /// `resolve_target` rules (Agent/AgentName/Role/Task/Team/Broadcast) so no
+    /// new matching logic is introduced.
+    fn backfill_inbox_for_registered_agent(&mut self, agent_id: &AgentSessionId) {
+        let claimable: Vec<MessageId> = self
+            .messages
+            .values()
+            .filter(|message| backfill_eligible_status(&message.delivery_status))
+            .filter(|message| {
+                self.resolve_target(&message.to)
+                    .map(|ids| ids.iter().any(|id| id == agent_id))
+                    .unwrap_or(false)
+            })
+            .map(|message| message.id.clone())
+            .collect();
+
+        if claimable.is_empty() {
+            return;
+        }
+
+        let inbox = self
+            .inboxes
+            .entry(agent_id.clone())
+            .or_insert_with(|| Inbox {
+                agent_id: agent_id.clone(),
+                message_ids: Vec::new(),
+            });
+        for message_id in claimable {
+            if !inbox.message_ids.contains(&message_id) {
+                inbox.message_ids.push(message_id);
+            }
+        }
     }
 
     pub fn create_message(&mut self, input: NewAgentMessage) -> Result<AgentMessage> {
@@ -132,6 +178,50 @@ impl MessageBus {
         }
 
         let recipients = self.resolve_target(&input.to)?;
+        let message = AgentMessage::new(input);
+        for agent_id in recipients {
+            self.inboxes
+                .entry(agent_id.clone())
+                .or_insert_with(|| Inbox {
+                    agent_id,
+                    message_ids: Vec::new(),
+                })
+                .message_ids
+                .push(message.id.clone());
+        }
+        self.messages.insert(message.id.clone(), message.clone());
+        Ok(message)
+    }
+
+    /// Like `create_message` but stores the message even when no agents are
+    /// currently registered for the target. The message is persisted with no
+    /// inbox entry; when a matching agent later registers,
+    /// `register_agent` backfills the message into that agent's inbox so it
+    /// can then be delivered (see `backfill_inbox_for_registered_agent`).
+    ///
+    /// Use this variant from automated/orchestrator paths where a target agent
+    /// may not yet exist at the time the message is produced (e.g. when
+    /// `persist_live_agent_result` runs before the target session is spawned).
+    pub fn create_message_allow_no_recipients(
+        &mut self,
+        input: NewAgentMessage,
+    ) -> Result<AgentMessage> {
+        if input.body.trim().is_empty() {
+            return Err(AgentmuxError::UserError(
+                "message body must not be empty".to_string(),
+            ));
+        }
+
+        // Resolve recipients; empty is acceptable — the message is stored
+        // without any inbox entry and is backfilled when a matching agent
+        // registers later (see `backfill_inbox_for_registered_agent`).
+        let recipients = match self.resolve_target(&input.to) {
+            Ok(ids) => ids,
+            Err(AgentmuxError::UserError(ref msg)) if msg.contains("resolved to no agents") => {
+                vec![]
+            }
+            Err(other) => return Err(other),
+        };
         let message = AgentMessage::new(input);
         for agent_id in recipients {
             self.inboxes
@@ -447,6 +537,22 @@ fn priority_label(priority: &Priority) -> &'static str {
     }
 }
 
+/// A message is eligible for inbox backfill (when its target agent registers
+/// later) only while it is still pending delivery. Terminal/handled states are
+/// excluded so a delivered or cancelled message is never re-queued.
+fn backfill_eligible_status(status: &DeliveryStatus) -> bool {
+    match status {
+        DeliveryStatus::Queued
+        | DeliveryStatus::Rendered
+        | DeliveryStatus::WaitingForAgent
+        | DeliveryStatus::WaitingForApproval => true,
+        DeliveryStatus::Injecting
+        | DeliveryStatus::Delivered
+        | DeliveryStatus::Failed
+        | DeliveryStatus::Cancelled => false,
+    }
+}
+
 fn agent_accepts_idle_injection(status: &AgentStatus) -> bool {
     matches!(
         status,
@@ -514,6 +620,80 @@ mod tests {
         assert_eq!(bus.inbox(&implementer).unwrap()[0].id, message.id);
         assert!(bus.inbox(&reviewer).unwrap().is_empty());
         assert_eq!(bus.get_message(&message.id).unwrap().body, message.body);
+    }
+
+    #[test]
+    fn registering_agent_backfills_messages_stored_before_it_existed() {
+        let mut bus = MessageBus::new();
+
+        // A message addressed to role:tester is created before any tester
+        // session exists — stored with no inbox entry.
+        let message = bus
+            .create_message_allow_no_recipients(message_input(
+                MessageTarget::Role(AgentRole::Tester),
+                DeliveryMode::InjectWhenIdle,
+            ))
+            .expect("message is stored even with no recipient");
+        assert_eq!(
+            message.delivery_status,
+            DeliveryStatus::Queued,
+            "an unroutable message starts Queued"
+        );
+
+        // No tester inbox yet, so the message lives only in the store.
+        assert_eq!(bus.list_messages().len(), 1);
+
+        // The tester registers later …
+        let tester = AgentSessionId::new();
+        bus.register_agent(AgentDescriptor::new(tester.clone(), AgentRole::Tester));
+
+        // … and the previously-stored message is backfilled into its inbox.
+        let inbox = bus.inbox(&tester).expect("tester has an inbox");
+        assert_eq!(inbox.len(), 1, "queued message is backfilled on register");
+        assert_eq!(inbox[0].id, message.id);
+
+        // Registering again (or a second matching agent) must not duplicate the
+        // backfilled message in the same inbox.
+        bus.register_agent(AgentDescriptor::new(tester.clone(), AgentRole::Tester));
+        assert_eq!(
+            bus.inbox(&tester).unwrap().len(),
+            1,
+            "re-registering must not duplicate the backfilled message"
+        );
+
+        // A non-matching role (reviewer) must not claim the tester message.
+        let reviewer = AgentSessionId::new();
+        bus.register_agent(AgentDescriptor::new(reviewer.clone(), AgentRole::Reviewer));
+        assert!(
+            bus.inbox(&reviewer).unwrap().is_empty(),
+            "a non-matching agent must not receive the backfilled message"
+        );
+    }
+
+    #[test]
+    fn backfill_skips_already_delivered_messages() {
+        let mut bus = MessageBus::new();
+        let now = DateTimeUtc::now_utc();
+
+        let message = bus
+            .create_message_allow_no_recipients(message_input(
+                MessageTarget::Role(AgentRole::Tester),
+                DeliveryMode::InjectWhenIdle,
+            ))
+            .expect("message is stored");
+
+        // Mark it Delivered before the tester ever registers (e.g. it was
+        // delivered to a different matching session earlier).
+        bus.update_delivery_status(&message.id, DeliveryStatus::Delivered, now)
+            .expect("status updates");
+
+        let tester = AgentSessionId::new();
+        bus.register_agent(AgentDescriptor::new(tester.clone(), AgentRole::Tester));
+
+        assert!(
+            bus.inbox(&tester).unwrap().is_empty(),
+            "a Delivered message must not be backfilled"
+        );
     }
 
     #[test]
