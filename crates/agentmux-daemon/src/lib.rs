@@ -3581,9 +3581,20 @@ fn message_create_payload(payload: &serde_json::Value) -> Result<NewAgentMessage
         .transpose()?
         .unwrap_or(DeliveryMode::InjectWhenIdle);
 
+    // Attribute the message to the sending agent session when the client passes
+    // a valid `from_agent_id` (sourced from the `AGENTMUX_AGENT_ID` env inside a
+    // live session). Fall back to an anonymous User source otherwise; a
+    // malformed id is treated as absent rather than an error.
+    let from = payload
+        .get("from_agent_id")
+        .and_then(|value| value.as_str())
+        .and_then(|raw| raw.trim().parse::<AgentSessionId>().ok())
+        .map(MessageSource::Agent)
+        .unwrap_or_else(|| MessageSource::User(ClientId::new()));
+
     Ok(NewAgentMessage {
         task_id: None,
-        from: MessageSource::User(ClientId::new()),
+        from,
         to,
         kind,
         priority,
@@ -4856,6 +4867,42 @@ AGENTMUX_RESULT:
             emitted += 1;
         }
         assert_eq!(emitted, 2);
+    }
+
+    #[test]
+    fn message_create_payload_attributes_agent_from_from_agent_id() {
+        let agent_id = AgentSessionId::new();
+        let payload = json!({
+            "to": "role:tester",
+            "body": "from a live agent session",
+            "kind": "question",
+            "priority": "high",
+            "delivery_mode": "inject_when_idle",
+            "from_agent_id": agent_id.to_string(),
+        });
+
+        let message = message_create_payload(&payload).expect("payload parses");
+        assert_eq!(message.from, MessageSource::Agent(agent_id));
+        assert_eq!(message.kind, MessageKind::Question);
+        assert_eq!(message.priority, Priority::High);
+        assert_eq!(message.to, MessageTarget::Role(AgentRole::Tester));
+    }
+
+    #[test]
+    fn message_create_payload_falls_back_to_user_when_from_agent_id_absent_or_invalid() {
+        // Absent -> User source.
+        let absent = json!({ "to": "role:tester", "body": "no sender id" });
+        let message = message_create_payload(&absent).expect("payload parses");
+        assert!(matches!(message.from, MessageSource::User(_)));
+
+        // Malformed id -> User source (not an error).
+        let invalid = json!({
+            "to": "role:tester",
+            "body": "bad sender id",
+            "from_agent_id": "not-a-valid-ulid-session-id",
+        });
+        let message = message_create_payload(&invalid).expect("payload parses");
+        assert!(matches!(message.from, MessageSource::User(_)));
     }
 
     /// Regression: when the message target's agent has status RunningTurn (not

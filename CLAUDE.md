@@ -131,7 +131,7 @@ team template は `config.toml` の `[team.<name>]` で定義し、各 agent の
 <!-- agentmux-result-protocol:start -->
 ## agentmux result protocol
 
-When working inside an agentmux-managed session, end each completed turn with:
+`AGENTMUX_RESULT` is a **turn-status notification**, not the message channel. End each completed turn by emitting it so the orchestrator can track your state — `status`, `summary`, `changed_files`, `needs`, and `next`. Keep `messages: []` in normal operation:
 
 ```text
 AGENTMUX_RESULT:
@@ -146,15 +146,23 @@ AGENTMUX_RESULT:
 }
 ```
 
-Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
+To send work to another coding agent, the **first choice is the CLI**:
 
-Always send messages with inject delivery. Both `messages[]` entries and `agentmux message send` default to `delivery_mode: inject_when_idle`: the daemon automatically injects the rendered prompt into the target session's PTY as soon as that session is idle. Keep that default — never pass `delivery_mode: inbox_only`, because inbox-only messages are not injected and the target agent will never see them. After sending, do not wait for or request a manual injection; delivery happens automatically.
+```text
+agentmux message send --to <target> --kind <Kind> --priority <low|normal|high|urgent> "<body>"
+```
 
-When an agentmux bus message is injected into your session, always reply through `messages[]` in the next `AGENTMUX_RESULT`. Reply to the sender with `agent:<sender-session-name>` when available, or use the requested `reply_to` / target context if the injected prompt provides one. Do not ask the user for confirmation before sending normal message replies or progress updates. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
+Prefer the CLI over `messages[]` because the CLI does not travel through the PTY display channel: its payload is never corrupted by terminal line-wrapping or control/escape characters (unlike text rendered into a pane), it is auto-injected into an idle target, and — because the command reads your `AGENTMUX_AGENT_ID` environment variable — the message is correctly attributed to your agent session (`from: agent`), so the recipient can reply to exactly you with `agent:<your-session-name>`.
 
-Avoid unbounded agent-to-agent loops. Only if the same pair of agents has exchanged messages for 3 or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user. Configure this threshold before installing the protocol with `AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS`; the default is 3.
+`messages[]` inside `AGENTMUX_RESULT` remains a **fallback for agents that have no shell access** and therefore cannot run `agentmux message send`. When you do use it, the whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed.
 
-Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind prevents the result messages from being stored.
+Always send messages with inject delivery. Both `agentmux message send` and `messages[]` entries default to `delivery_mode: inject_when_idle`: the daemon automatically injects the rendered prompt into the target session's PTY as soon as that session is idle. Keep that default — never pass `delivery_mode: inbox_only`, because inbox-only messages are not injected and the target agent will never see them. After sending, do not wait for or request a manual injection; delivery happens automatically.
+
+When an agentmux bus message is injected into your session, always reply. Prefer the CLI: `agentmux message send --to agent:<sender-session-name> --kind <Kind> "<reply>"` (use the requested `reply_to` / target context if the injected prompt provides one). If you have no shell access, reply through `messages[]` in the next `AGENTMUX_RESULT` instead. Do not ask the user for confirmation before sending normal message replies or progress updates. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
+
+Avoid unbounded agent-to-agent loops. This applies to both `agentmux message send` and `messages[]`. Only if the same pair of agents has exchanged messages for 3 or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user. Configure this threshold before installing the protocol with `AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS`; the default is 3.
+
+Allowed message kind values (for both `--kind` and `messages[].kind`) are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind is rejected and the message is not stored.
 
 Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
 
@@ -178,32 +186,20 @@ Manual injection is a fallback for messages that were not auto-delivered yet (fo
 
 Injection is asynchronous: the daemon records the message first, then waits briefly before writing the rendered message into the target PTY. If the TUI list updates before the text appears in the agent pane, wait a few seconds before retrying.
 
-```json
-{
-  "to": "role:tester",
-  "kind": "TestResult",
-  "body": "Run the focused regression tests.",
-  "priority": "normal"
-}
-```
-
-Two-session exchange example:
+Two-session exchange example (CLI-first):
 
 ```text
-impl finishes work:
+impl finishes work, then notifies the tester via the CLI:
+agentmux message send --to role:tester --kind TestResult --priority normal \
+  "Please verify copy mode: Ctrl-g [, drag inside the focused pane, release to copy, Esc/q to exit."
+
+impl then emits its turn-status notification:
 AGENTMUX_RESULT:
 {
   "status": "completed",
   "summary": "Implemented copy mode.",
   "changed_files": ["crates/agentmux-cli/src/main.rs"],
-  "messages": [
-    {
-      "to": "role:tester",
-      "kind": "TestResult",
-      "body": "Please verify copy mode: Ctrl-g [, drag inside the focused pane, release to copy, Esc/q to exit.",
-      "priority": "normal"
-    }
-  ],
+  "messages": [],
   "context_updates": [],
   "needs": [],
   "next": null
@@ -211,25 +207,24 @@ AGENTMUX_RESULT:
 ```
 
 ```text
-tester replies:
+tester replies to the sender (attributed automatically from AGENTMUX_AGENT_ID):
+agentmux message send --to agent:codex-a1b2c3 --kind Finding \
+  "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal."
+
+then emits its own turn-status notification:
 AGENTMUX_RESULT:
 {
   "status": "completed",
   "summary": "Copy mode verification completed.",
   "changed_files": [],
-  "messages": [
-    {
-      "to": "agent:codex-a1b2c3",
-      "kind": "Finding",
-      "body": "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal.",
-      "priority": "normal"
-    }
-  ],
+  "messages": [],
   "context_updates": [],
   "needs": [],
   "next": null
 }
 ```
+
+A shell-less agent would instead place those `Finding` / `TestResult` entries inside `messages[]` of its `AGENTMUX_RESULT`.
 
 Check delivery with `Ctrl-g m` in the TUI or `agentmux message list`.
 <!-- agentmux-result-protocol:end -->

@@ -55,7 +55,7 @@ const DEFAULT_MESSAGE_CONFIRM_AFTER_TURNS: usize = 3;
 const RESULT_PROTOCOL_BLOCK_TEMPLATE: &str = r#"<!-- agentmux-result-protocol:start -->
 ## agentmux result protocol
 
-When working inside an agentmux-managed session, end each completed turn with:
+`AGENTMUX_RESULT` is a **turn-status notification**, not the message channel. End each completed turn by emitting it so the orchestrator can track your state — `status`, `summary`, `changed_files`, `needs`, and `next`. Keep `messages: []` in normal operation:
 
 ```text
 AGENTMUX_RESULT:
@@ -70,15 +70,23 @@ AGENTMUX_RESULT:
 }
 ```
 
-Use `messages[]` to send work to another coding agent through the agentmux message bus. The whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed. Keep `messages: []` when no cross-agent message is needed.
+To send work to another coding agent, the **first choice is the CLI**:
 
-Always send messages with inject delivery. Both `messages[]` entries and `agentmux message send` default to `delivery_mode: inject_when_idle`: the daemon automatically injects the rendered prompt into the target session's PTY as soon as that session is idle. Keep that default — never pass `delivery_mode: inbox_only`, because inbox-only messages are not injected and the target agent will never see them. After sending, do not wait for or request a manual injection; delivery happens automatically.
+```text
+agentmux message send --to <target> --kind <Kind> --priority <low|normal|high|urgent> "<body>"
+```
 
-When an agentmux bus message is injected into your session, always reply through `messages[]` in the next `AGENTMUX_RESULT`. Reply to the sender with `agent:<sender-session-name>` when available, or use the requested `reply_to` / target context if the injected prompt provides one. Do not ask the user for confirmation before sending normal message replies or progress updates. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
+Prefer the CLI over `messages[]` because the CLI does not travel through the PTY display channel: its payload is never corrupted by terminal line-wrapping or control/escape characters (unlike text rendered into a pane), it is auto-injected into an idle target, and — because the command reads your `AGENTMUX_AGENT_ID` environment variable — the message is correctly attributed to your agent session (`from: agent`), so the recipient can reply to exactly you with `agent:<your-session-name>`.
 
-Avoid unbounded agent-to-agent loops. Only if the same pair of agents has exchanged messages for {message_confirm_after_turns} or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user. Configure this threshold before installing the protocol with `AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS`; the default is 3.
+`messages[]` inside `AGENTMUX_RESULT` remains a **fallback for agents that have no shell access** and therefore cannot run `agentmux message send`. When you do use it, the whole `AGENTMUX_RESULT` block is not stored as a message; only entries inside `messages[]` are routed.
 
-Allowed `messages[].kind` values are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind prevents the result messages from being stored.
+Always send messages with inject delivery. Both `agentmux message send` and `messages[]` entries default to `delivery_mode: inject_when_idle`: the daemon automatically injects the rendered prompt into the target session's PTY as soon as that session is idle. Keep that default — never pass `delivery_mode: inbox_only`, because inbox-only messages are not injected and the target agent will never see them. After sending, do not wait for or request a manual injection; delivery happens automatically.
+
+When an agentmux bus message is injected into your session, always reply. Prefer the CLI: `agentmux message send --to agent:<sender-session-name> --kind <Kind> "<reply>"` (use the requested `reply_to` / target context if the injected prompt provides one). If you have no shell access, reply through `messages[]` in the next `AGENTMUX_RESULT` instead. Do not ask the user for confirmation before sending normal message replies or progress updates. If no substantive answer is ready yet, send a brief `StatusProbe`, `Question`, or `Handoff` that says what is pending instead of staying silent.
+
+Avoid unbounded agent-to-agent loops. This applies to both `agentmux message send` and `messages[]`. Only if the same pair of agents has exchanged messages for {message_confirm_after_turns} or more back-and-forth turns on the same topic, the next reply must ask for human confirmation before continuing. Use `kind: "Question"` and include the current conclusion, the remaining uncertainty, and the exact decision needed from the user. Configure this threshold before installing the protocol with `AGENTMUX_MESSAGE_CONFIRM_AFTER_TURNS`; the default is 3.
+
+Allowed message kind values (for both `--kind` and `messages[].kind`) are: `TaskAssignment`, `Question`, `Finding`, `PatchProposal`, `ReviewComment`, `TestResult`, `FailureReport`, `Decision`, `Handoff`, `ApprovalRequest`, `ContextUpdate`, `StatusProbe`. Do not invent other kinds such as `Greeting`; an invalid kind is rejected and the message is not stored.
 
 Agent sessions register a stable role and a unique session name at startup. Use role targets (`role:tester`, `role:implementer`, `role:reviewer`) when every session with that role should receive the message. Use `agent:<session-name>` or a session id when the message is for exactly one session. Check available sessions with `Ctrl-g s` in the TUI or `agentmux sessions`.
 
@@ -102,32 +110,20 @@ Manual injection is a fallback for messages that were not auto-delivered yet (fo
 
 Injection is asynchronous: the daemon records the message first, then waits briefly before writing the rendered message into the target PTY. If the TUI list updates before the text appears in the agent pane, wait a few seconds before retrying.
 
-```json
-{
-  "to": "role:tester",
-  "kind": "TestResult",
-  "body": "Run the focused regression tests.",
-  "priority": "normal"
-}
-```
-
-Two-session exchange example:
+Two-session exchange example (CLI-first):
 
 ```text
-impl finishes work:
+impl finishes work, then notifies the tester via the CLI:
+agentmux message send --to role:tester --kind TestResult --priority normal \
+  "Please verify copy mode: Ctrl-g [, drag inside the focused pane, release to copy, Esc/q to exit."
+
+impl then emits its turn-status notification:
 AGENTMUX_RESULT:
 {
   "status": "completed",
   "summary": "Implemented copy mode.",
   "changed_files": ["crates/agentmux-cli/src/main.rs"],
-  "messages": [
-    {
-      "to": "role:tester",
-      "kind": "TestResult",
-      "body": "Please verify copy mode: Ctrl-g [, drag inside the focused pane, release to copy, Esc/q to exit.",
-      "priority": "normal"
-    }
-  ],
+  "messages": [],
   "context_updates": [],
   "needs": [],
   "next": null
@@ -135,25 +131,24 @@ AGENTMUX_RESULT:
 ```
 
 ```text
-tester replies:
+tester replies to the sender (attributed automatically from AGENTMUX_AGENT_ID):
+agentmux message send --to agent:codex-a1b2c3 --kind Finding \
+  "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal."
+
+then emits its own turn-status notification:
 AGENTMUX_RESULT:
 {
   "status": "completed",
   "summary": "Copy mode verification completed.",
   "changed_files": [],
-  "messages": [
-    {
-      "to": "agent:codex-a1b2c3",
-      "kind": "Finding",
-      "body": "Focused-pane drag selection worked. OSC52 clipboard support depends on the host terminal.",
-      "priority": "normal"
-    }
-  ],
+  "messages": [],
   "context_updates": [],
   "needs": [],
   "next": null
 }
 ```
+
+A shell-less agent would instead place those `Finding` / `TestResult` entries inside `messages[]` of its `AGENTMUX_RESULT`.
 
 Check delivery with `Ctrl-g m` in the TUI or `agentmux message list`.
 <!-- agentmux-result-protocol:end -->
@@ -404,6 +399,14 @@ enum MessageAction {
         no_inject: bool,
         #[arg(long)]
         to: String,
+        /// Message kind. One of: TaskAssignment, Question, Finding, PatchProposal,
+        /// ReviewComment, TestResult, FailureReport, Decision, Handoff,
+        /// ApprovalRequest, ContextUpdate, StatusProbe. Defaults to Handoff.
+        #[arg(long)]
+        kind: Option<String>,
+        /// Message priority: low, normal, high, or urgent. Defaults to normal.
+        #[arg(long)]
+        priority: Option<String>,
         body: String,
     },
     /// Inject a message, bypassing delivery policy.
@@ -716,12 +719,14 @@ async fn main() -> Result<()> {
                 inject,
                 no_inject,
                 to,
+                kind,
+                priority,
                 body,
             } => {
                 send_message_and_maybe_inject(
                     &socket_path,
                     "message",
-                    message_send_request(to, body)?,
+                    message_send_request(to, body, kind, priority)?,
                     should_inject_message(inject, no_inject),
                 )
                 .await?;
@@ -1253,24 +1258,92 @@ fn message_show_request(message_id: String) -> ClientRequest {
     )
 }
 
-fn message_send_request(to: String, body: String) -> Result<ClientRequest> {
+fn message_send_request(
+    to: String,
+    body: String,
+    kind: Option<String>,
+    priority: Option<String>,
+) -> Result<ClientRequest> {
     if body.trim().is_empty() {
         return Err(AgentmuxError::UserError(
             "message body must not be empty".to_string(),
         ));
     }
 
+    let kind = match kind {
+        Some(raw) => normalize_message_kind(&raw)?,
+        None => "handoff".to_string(),
+    };
+    let priority = match priority {
+        Some(raw) => normalize_priority(&raw)?,
+        None => "normal".to_string(),
+    };
+
+    let mut payload = json!({
+        "to": to,
+        "body": body,
+        "kind": kind,
+        "priority": priority,
+        "delivery_mode": "inject_when_idle",
+    });
+
+    // When invoked from inside a live agent session, attribute the message to
+    // that agent so recipients can reply with `agent:<sender-session-name>`.
+    if let Ok(agent_id) = std::env::var("AGENTMUX_AGENT_ID")
+        && !agent_id.trim().is_empty()
+    {
+        payload["from_agent_id"] = json!(agent_id);
+    }
+
     Ok(ClientRequest::new(
         "req_message_send",
         IpcCommand::MessageCreate,
-        json!({
-            "to": to,
-            "body": body,
-            "kind": "handoff",
-            "priority": "normal",
-            "delivery_mode": "inject_when_idle",
-        }),
+        payload,
     ))
+}
+
+/// Map a user-supplied `--kind` value (the protocol's PascalCase names, accepted
+/// case-insensitively) to the daemon's snake_case wire value. Returns a clear
+/// error listing the allowed values for anything unrecognized.
+fn normalize_message_kind(raw: &str) -> Result<String> {
+    let wire = match raw.trim().to_ascii_lowercase().as_str() {
+        "taskassignment" => "task_assignment",
+        "question" => "question",
+        "finding" => "finding",
+        "patchproposal" => "patch_proposal",
+        "reviewcomment" => "review_comment",
+        "testresult" => "test_result",
+        "failurereport" => "failure_report",
+        "decision" => "decision",
+        "handoff" => "handoff",
+        "approvalrequest" => "approval_request",
+        "contextupdate" => "context_update",
+        "statusprobe" => "status_probe",
+        _ => {
+            return Err(AgentmuxError::UserError(format!(
+                "invalid message kind '{raw}'. Allowed values: TaskAssignment, Question, \
+                 Finding, PatchProposal, ReviewComment, TestResult, FailureReport, Decision, \
+                 Handoff, ApprovalRequest, ContextUpdate, StatusProbe"
+            )));
+        }
+    };
+    Ok(wire.to_string())
+}
+
+/// Validate and normalize a `--priority` value to the wire form.
+fn normalize_priority(raw: &str) -> Result<String> {
+    let wire = match raw.trim().to_ascii_lowercase().as_str() {
+        "low" => "low",
+        "normal" => "normal",
+        "high" => "high",
+        "urgent" => "urgent",
+        _ => {
+            return Err(AgentmuxError::UserError(format!(
+                "invalid priority '{raw}'. Allowed values: low, normal, high, urgent"
+            )));
+        }
+    };
+    Ok(wire.to_string())
 }
 
 fn should_inject_message(_inject: bool, no_inject: bool) -> bool {
@@ -3762,7 +3835,8 @@ mod tests {
         assert_eq!(show.command, IpcCommand::MessageShow);
         assert_eq!(show.payload["message_id"], "msg_01HX");
 
-        let send = message_send_request("agent_01HX".to_string(), "hello".to_string()).unwrap();
+        let send = message_send_request("agent_01HX".to_string(), "hello".to_string(), None, None)
+            .unwrap();
         assert_eq!(send.command, IpcCommand::MessageCreate);
         assert_eq!(send.payload["to"], "agent_01HX");
         assert_eq!(send.payload["body"], "hello");
@@ -3850,6 +3924,124 @@ mod tests {
             panic!("expected message send action");
         };
         assert!(!should_inject_message(inject, no_inject));
+    }
+
+    #[test]
+    fn message_send_accepts_kind_and_priority_flags() {
+        let cli = Cli::try_parse_from([
+            "agentmux",
+            "message",
+            "send",
+            "--to",
+            "role:tester",
+            "--kind",
+            "Question",
+            "--priority",
+            "high",
+            "ask something",
+        ])
+        .unwrap();
+        let Some(Commands::Message(args)) = cli.command else {
+            panic!("expected message command");
+        };
+        let MessageAction::Send {
+            to,
+            kind,
+            priority,
+            body,
+            ..
+        } = args.action
+        else {
+            panic!("expected message send action");
+        };
+        assert_eq!(to, "role:tester");
+        assert_eq!(kind.as_deref(), Some("Question"));
+        assert_eq!(priority.as_deref(), Some("high"));
+
+        let request = message_send_request(to, body, kind, priority).unwrap();
+        assert_eq!(request.payload["kind"], "question");
+        assert_eq!(request.payload["priority"], "high");
+    }
+
+    #[test]
+    fn message_send_defaults_kind_handoff_and_priority_normal() {
+        let request =
+            message_send_request("role:tester".to_string(), "body".to_string(), None, None)
+                .unwrap();
+        assert_eq!(request.payload["kind"], "handoff");
+        assert_eq!(request.payload["priority"], "normal");
+    }
+
+    #[test]
+    fn message_send_maps_protocol_kind_names_to_wire_values() {
+        assert_eq!(
+            normalize_message_kind("TaskAssignment").unwrap(),
+            "task_assignment"
+        );
+        assert_eq!(
+            normalize_message_kind("PatchProposal").unwrap(),
+            "patch_proposal"
+        );
+        assert_eq!(
+            normalize_message_kind("StatusProbe").unwrap(),
+            "status_probe"
+        );
+        // Case-insensitive.
+        assert_eq!(normalize_message_kind("handoff").unwrap(), "handoff");
+    }
+
+    #[test]
+    fn message_send_rejects_invalid_kind_and_priority() {
+        let kind_err = message_send_request(
+            "role:tester".to_string(),
+            "body".to_string(),
+            Some("Greeting".to_string()),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            kind_err
+                .to_string()
+                .contains("invalid message kind 'Greeting'")
+        );
+
+        let prio_err = message_send_request(
+            "role:tester".to_string(),
+            "body".to_string(),
+            None,
+            Some("critical".to_string()),
+        )
+        .unwrap_err();
+        assert!(prio_err.to_string().contains("invalid priority 'critical'"));
+    }
+
+    #[test]
+    fn message_send_attributes_agent_when_env_present() {
+        // Serialize env mutation across tests in this binary to avoid a race on
+        // the process-global `AGENTMUX_AGENT_ID`.
+        static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+
+        // SAFETY: env access is serialized by ENV_LOCK for the duration below.
+        unsafe {
+            std::env::set_var("AGENTMUX_AGENT_ID", "agent_01HXSENDER");
+        }
+        let request =
+            message_send_request("role:tester".to_string(), "body".to_string(), None, None);
+        // Remove before asserting so a failed assertion cannot leak the var.
+        unsafe {
+            std::env::remove_var("AGENTMUX_AGENT_ID");
+        }
+        let request = request.unwrap();
+        assert_eq!(request.payload["from_agent_id"], "agent_01HXSENDER");
+
+        let request =
+            message_send_request("role:tester".to_string(), "body".to_string(), None, None)
+                .unwrap();
+        assert!(
+            request.payload.get("from_agent_id").is_none(),
+            "no from_agent_id without env"
+        );
     }
 
     #[test]
@@ -3951,7 +4143,8 @@ mod tests {
 
     #[test]
     fn message_send_rejects_empty_body_before_ipc() {
-        let error = message_send_request("agent_01HX".to_string(), "  ".to_string()).unwrap_err();
+        let error = message_send_request("agent_01HX".to_string(), "  ".to_string(), None, None)
+            .unwrap_err();
 
         assert!(error.to_string().contains("message body must not be empty"));
     }
@@ -4239,13 +4432,18 @@ mod tests {
         assert!(contents.contains("Always send messages with inject delivery"));
         assert!(contents.contains("never pass `delivery_mode: inbox_only`"));
         assert!(contents.contains("Manual injection is a fallback"));
-        assert!(contents.contains("always reply through `messages[]`"));
+        // AGENTMUX_RESULT is now a turn-status notification; the CLI is the
+        // first-choice message channel and messages[] is the shell-less fallback.
+        assert!(contents.contains("turn-status notification"));
+        assert!(contents.contains("first choice is the CLI"));
+        assert!(contents.contains("agentmux message send --to <target> --kind <Kind>"));
+        assert!(contents.contains("fallback for agents that have no shell access"));
         assert!(contents.contains(
             "Do not ask the user for confirmation before sending normal message replies"
         ));
         assert!(contents.contains("back-and-forth turns"));
         assert!(contents.contains(MESSAGE_CONFIRM_AFTER_TURNS_ENV));
-        assert!(contents.contains("Allowed `messages[].kind` values"));
+        assert!(contents.contains("Allowed message kind values"));
         assert!(contents.contains("AGENTMUX_AGENT_NAME"));
         assert!(contents.contains("agentmux message inject <message_id>"));
         assert!(contents.contains("agentmux agent inject <message_id> <agent_id>"));
