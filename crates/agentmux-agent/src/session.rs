@@ -8,13 +8,23 @@ use std::time::Duration;
 
 use agentmux_core::{
     AgentMode, AgentProvider, AgentRole, AgentSessionId, AgentStatus, ContextScopeId, DateTimeUtc,
-    InboxId, PaneId, ProjectId, PtyId, TaskId, TerminalBufferId, WorktreeId, error::Result,
-    ids::ClientId,
+    InboxId, PaneId, ProjectId, PtyId, StateSignalSource, TaskId, TerminalBufferId, WorktreeId,
+    error::Result, ids::ClientId,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::capabilities::AgentCapabilities;
 use crate::signal::StateSignal;
+
+/// How long a winning `StateSignal` suppresses strictly-lower-priority
+/// signals before they are allowed to override it. Keeps a `HumanOverride`
+/// or `ExplicitMarker` verdict from being clobbered by a stray low-trust
+/// `ScreenPattern`/`PtyActivity` signal, while still letting state recover
+/// once the high-priority evidence is stale.
+///
+/// Currently a fixed default; a future change may surface this through
+/// project policy configuration.
+const STATE_SIGNAL_PRIORITY_TTL: Duration = Duration::from_secs(30);
 
 /// Represents a live (or recently-exited) agent process managed by agentmux.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,6 +51,12 @@ pub struct AgentSession {
     pub created_at: DateTimeUtc,
     pub last_activity_at: DateTimeUtc,
     pub exited_at: Option<DateTimeUtc>,
+    /// Source and observation time of the last `StateSignal` that won and set
+    /// `status`. Used to enforce the `StateSignalSource` priority ordering: a
+    /// lower-priority signal cannot override a higher-priority verdict until
+    /// that verdict goes stale. See `apply_state_signal`.
+    pub last_signal_source: Option<StateSignalSource>,
+    pub last_signal_at: Option<DateTimeUtc>,
 }
 
 impl AgentSession {
@@ -68,6 +84,8 @@ impl AgentSession {
             created_at: now,
             last_activity_at: now,
             exited_at: None,
+            last_signal_source: None,
+            last_signal_at: None,
         }
     }
 
@@ -96,7 +114,30 @@ impl AgentSession {
             )));
         }
 
-        self.transition_status(signal.value.clone(), signal.observed_at)
+        // Enforce the StateSignalSource priority ordering
+        // (HumanOverride > … > ScreenPattern). A signal whose source outranks
+        // or ties the last winning signal always applies; a lower-priority
+        // signal is ignored until the prior verdict goes stale.
+        if !self.signal_should_apply(signal) {
+            return Ok(());
+        }
+
+        self.transition_status(signal.value.clone(), signal.observed_at)?;
+        self.last_signal_source = Some(signal.source.clone());
+        self.last_signal_at = Some(signal.observed_at);
+        Ok(())
+    }
+
+    fn signal_should_apply(&self, signal: &StateSignal) -> bool {
+        match (&self.last_signal_source, self.last_signal_at) {
+            (Some(last_source), Some(last_at)) => {
+                // `StateSignalSource` derives `Ord` with ScreenPattern lowest
+                // and HumanOverride highest, so `>=` is "at least as trusted".
+                signal.source >= *last_source
+                    || add_std_duration(last_at, STATE_SIGNAL_PRIORITY_TTL) <= signal.observed_at
+            }
+            _ => true,
+        }
     }
 
     pub fn record_human_input(&mut self, at: DateTimeUtc) {
@@ -378,6 +419,74 @@ mod tests {
             session.last_activity_at,
             ready_at + time::Duration::seconds(3)
         );
+    }
+
+    fn signal_at(
+        session_id: &AgentSessionId,
+        source: StateSignalSource,
+        value: AgentStatus,
+        observed_at: DateTimeUtc,
+    ) -> StateSignal {
+        StateSignal {
+            agent_id: session_id.clone(),
+            source,
+            confidence: 1.0,
+            value,
+            evidence: "test".to_string(),
+            observed_at,
+        }
+    }
+
+    #[test]
+    fn state_signal_priority_and_staleness_are_enforced() {
+        let mut session = AgentSession::new(session_init(), now());
+        let id = session.id.clone();
+        let t0 = now();
+
+        // High-priority human verdict wins from the initial state.
+        session
+            .apply_state_signal(&signal_at(
+                &id,
+                StateSignalSource::HumanOverride,
+                AgentStatus::NeedsHuman,
+                t0,
+            ))
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::NeedsHuman);
+
+        // Lower-priority screen-scrape within the TTL is ignored, even though
+        // NeedsHuman -> AwaitingInput is itself a legal transition.
+        session
+            .apply_state_signal(&signal_at(
+                &id,
+                StateSignalSource::ScreenPattern,
+                AgentStatus::AwaitingInput,
+                t0 + time::Duration::seconds(5),
+            ))
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::NeedsHuman);
+
+        // Once the human verdict is stale, the lower-priority signal takes over.
+        session
+            .apply_state_signal(&signal_at(
+                &id,
+                StateSignalSource::ScreenPattern,
+                AgentStatus::AwaitingInput,
+                t0 + time::Duration::seconds(31),
+            ))
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::AwaitingInput);
+
+        // A higher-priority signal always wins regardless of staleness.
+        session
+            .apply_state_signal(&signal_at(
+                &id,
+                StateSignalSource::HumanOverride,
+                AgentStatus::NeedsHuman,
+                t0 + time::Duration::seconds(32),
+            ))
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::NeedsHuman);
     }
 
     #[test]
