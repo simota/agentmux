@@ -65,22 +65,37 @@ where
     R: AsyncBufRead + Unpin,
     T: DeserializeOwned,
 {
-    let mut line = String::new();
-    let bytes_read = reader
-        .read_line(&mut line)
-        .await
-        .map_err(|error| AgentmuxError::IpcError(format!("failed to read JSONL frame: {error}")))?;
+    // Read one line with a hard size cap enforced *during* accumulation, so a
+    // hostile/buggy client cannot make the daemon allocate an unbounded line
+    // (e.g. a 500 MiB frame) before the size guard runs.
+    let mut buf = Vec::new();
+    loop {
+        let chunk = reader.fill_buf().await.map_err(|error| {
+            AgentmuxError::IpcError(format!("failed to read JSONL frame: {error}"))
+        })?;
+        if chunk.is_empty() {
+            break; // EOF
+        }
+        let newline = chunk.iter().position(|byte| *byte == b'\n');
+        let take = newline.map_or(chunk.len(), |pos| pos + 1);
+        if buf.len() + take > MAX_JSONL_FRAME_BYTES {
+            return Err(AgentmuxError::IpcError(format!(
+                "JSONL frame exceeds {MAX_JSONL_FRAME_BYTES} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            break;
+        }
+    }
 
-    if bytes_read == 0 {
+    if buf.is_empty() {
         return Ok(None);
     }
 
-    if bytes_read > MAX_JSONL_FRAME_BYTES {
-        return Err(AgentmuxError::IpcError(format!(
-            "JSONL frame exceeds {MAX_JSONL_FRAME_BYTES} bytes"
-        )));
-    }
-
+    let line = String::from_utf8(buf)
+        .map_err(|error| AgentmuxError::IpcError(format!("JSONL frame was not utf-8: {error}")))?;
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() {
         return Err(AgentmuxError::IpcError(
@@ -176,6 +191,17 @@ mod tests {
         );
 
         let error = writer.write(&request).await.unwrap_err();
+        assert!(error.to_string().contains("JSONL frame exceeds"));
+    }
+
+    #[tokio::test]
+    async fn read_rejects_oversized_frame() {
+        // A single line longer than the cap and with no newline must be
+        // rejected by the reader (cap enforced during accumulation).
+        let oversized = vec![b'x'; MAX_JSONL_FRAME_BYTES + 64];
+        let mut reader = JsonlReader::new(BufReader::new(&oversized[..]));
+
+        let error = reader.read::<ClientRequest>().await.unwrap_err();
         assert!(error.to_string().contains("JSONL frame exceeds"));
     }
 

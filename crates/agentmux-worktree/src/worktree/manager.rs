@@ -197,7 +197,12 @@ impl WorktreeManager {
         match (result, restore) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Err(error), Ok(())) => Err(error),
-            (Ok(_), Err(error)) | (Err(_), Err(error)) => Err(error),
+            (Ok(_), Err(error)) => Err(error),
+            // Both failed: the merge/promote error is the root cause and must
+            // not be discarded; append the restore failure so neither is lost.
+            (Err(primary), Err(restore)) => Err(AgentmuxError::Internal(format!(
+                "{primary} (and failed to restore HEAD: {restore})"
+            ))),
         }
     }
 
