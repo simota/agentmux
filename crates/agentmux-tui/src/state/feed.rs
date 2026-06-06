@@ -185,6 +185,8 @@ fn event_kind_label(kind: &IpcEventKind) -> &'static str {
         IpcEventKind::WorktreeDiffCaptured => "worktree.diff_captured",
         IpcEventKind::WorktreeAdoptRequested => "worktree.adopt_requested",
         IpcEventKind::WorktreeTestCompleted => "worktree.test_completed",
+        IpcEventKind::ThreadOpened => "thread.opened",
+        IpcEventKind::ThreadClosed => "thread.closed",
         IpcEventKind::PolicyDenied => "policy.denied",
         IpcEventKind::Error => "error",
     }

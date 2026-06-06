@@ -10,7 +10,7 @@
     use crate::message::{
         AgentMessage, MessageKind, MessageSource, MessageTarget, NewAgentMessage,
     };
-    use crate::thread::{MessageThread, NewMessageThread};
+    use crate::thread::NewMessageThread;
 
     fn message_input(to: MessageTarget, delivery_mode: DeliveryMode) -> NewAgentMessage {
         NewAgentMessage {

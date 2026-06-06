@@ -1,4 +1,6 @@
 use super::*;
+#[cfg(feature = "activity-feed")]
+use agentmux_ipc::EVENT_SUBSCRIBE_PROTOCOL_VERSION;
 
     #[test]
     fn agent_resize_request_uses_resize_ipc_command() {
