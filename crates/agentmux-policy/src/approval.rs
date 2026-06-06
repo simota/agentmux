@@ -209,8 +209,11 @@ fn policy_denied_event(request: ApprovalRequest) -> ApprovalEvent {
 
 fn approval_kind_for_command(command: &str) -> ApprovalKind {
     let lower = command.to_ascii_lowercase();
-    if lower.split_whitespace().take(2).collect::<Vec<_>>() == ["git", "push"] {
+    let head: Vec<&str> = lower.split_whitespace().take(2).collect();
+    if head == ["git", "push"] {
         ApprovalKind::GitPush
+    } else if head == ["git", "commit"] {
+        ApprovalKind::GitCommit
     } else if lower.contains("curl ") || lower.contains("wget ") {
         ApprovalKind::NetworkAccess
     } else if contains_secret_indicator(&lower) {

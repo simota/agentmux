@@ -131,6 +131,16 @@ impl GridPerformer<'_> {
             .unwrap_or(default)
     }
 
+    /// Cursor-movement amount as a positive `i16`, clamped to `i16::MAX`.
+    ///
+    /// CSI parameters are `u16`; casting directly to `i16` wraps values
+    /// `>= 0x8000` to negatives (reversing direction), and negating a wrapped
+    /// `i16::MIN` overflows (debug panic / release wrap). Hostile or garbage
+    /// PTY output such as `CSI 32768 A` reaches here, so clamp before casting.
+    fn move_amount(params: &vte::Params, index: usize) -> i16 {
+        Self::param(params, index, 1).min(i16::MAX as u16) as i16
+    }
+
     fn params(params: &vte::Params) -> Vec<u16> {
         if params.is_empty() {
             return vec![0];
@@ -314,14 +324,10 @@ impl vte::Perform for GridPerformer<'_> {
             // emits an SGR reset for attributes it believes it never enabled.
             _ if !intermediates.is_empty() => {}
             '@' => self.grid().insert_blank_chars(Self::param(params, 0, 1)),
-            'A' => self
-                .grid()
-                .move_cursor(-(Self::param(params, 0, 1) as i16), 0),
-            'B' => self.grid().move_cursor(Self::param(params, 0, 1) as i16, 0),
-            'C' => self.grid().move_cursor(0, Self::param(params, 0, 1) as i16),
-            'D' => self
-                .grid()
-                .move_cursor(0, -(Self::param(params, 0, 1) as i16)),
+            'A' => self.grid().move_cursor(-Self::move_amount(params, 0), 0),
+            'B' => self.grid().move_cursor(Self::move_amount(params, 0), 0),
+            'C' => self.grid().move_cursor(0, Self::move_amount(params, 0)),
+            'D' => self.grid().move_cursor(0, -Self::move_amount(params, 0)),
             'G' => {
                 let col = Self::param(params, 0, 1).saturating_sub(1);
                 let row = self.grid().cursor().row;
@@ -585,6 +591,23 @@ mod tests {
 
         assert_eq!(parser.grid().line_text(1).as_deref(), Some("  A  "));
         assert_eq!(parser.grid().line_text(2).as_deref(), Some("    B"));
+    }
+
+    #[test]
+    fn large_cursor_move_params_are_clamped_and_do_not_overflow() {
+        // CSI params >= 0x8000 wrap to negative when cast to i16; negating the
+        // wrapped i16::MIN overflows (debug panic / release direction flip).
+        // Hostile PTY output must be clamped, not crash the terminal engine.
+        let mut parser = TerminalParser::new(4, 4);
+
+        parser.advance(b"\x1b[2;3H"); // row 1, col 2 (0-based)
+        parser.advance(b"\x1b[32768A\x1b[65535A\x1b[32768D"); // up + left, huge
+        assert_eq!(parser.grid().cursor().row, 0);
+        assert_eq!(parser.grid().cursor().col, 0);
+
+        parser.advance(b"\x1b[40000B\x1b[40000C"); // down + right, huge
+        assert_eq!(parser.grid().cursor().row, 3);
+        assert_eq!(parser.grid().cursor().col, 3);
     }
 
     #[test]

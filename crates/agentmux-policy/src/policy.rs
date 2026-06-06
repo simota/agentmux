@@ -203,6 +203,10 @@ impl PolicyEngine {
             return self.evaluate(&ApprovalKind::GitPush);
         }
 
+        if command_matches_prefix(&lower, "git commit") {
+            return self.evaluate(&ApprovalKind::GitCommit);
+        }
+
         if lower.contains("curl ") || lower.contains("wget ") {
             return self.evaluate(&ApprovalKind::NetworkAccess);
         }
@@ -313,11 +317,47 @@ fn is_caution_command(command: &str) -> bool {
     .any(|prefix| command_matches_prefix(command, prefix))
 }
 
+/// Detect an `rm` invocation carrying both a recursive and a force flag,
+/// regardless of flag order or spelling. The literal `"rm -rf"` substring
+/// pattern misses `rm -fr`, `rm -f -r`, and `rm --force --recursive`, which
+/// are equally destructive — a false negative here would let them through as
+/// `Caution` instead of `Dangerous`.
+fn is_recursive_forced_rm(command: &str) -> bool {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if !tokens.contains(&"rm") {
+        return false;
+    }
+    let mut recursive = false;
+    let mut force = false;
+    for token in tokens {
+        match token {
+            "--recursive" => recursive = true,
+            "--force" => force = true,
+            _ if token.starts_with('-') && !token.starts_with("--") => {
+                for flag in token[1..].chars() {
+                    match flag {
+                        'r' | 'R' => recursive = true,
+                        'f' => force = true,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    recursive && force
+}
+
 fn dangerous_reason(command: &str) -> Option<String> {
     let lower = command.to_ascii_lowercase();
 
+    if is_recursive_forced_rm(&lower) {
+        return Some("recursive forced deletion".to_string());
+    }
+
     let patterns = [
         ("rm -rf", "recursive forced deletion"),
+        ("git commit", "git commit requires approval"),
         ("chmod -r", "recursive permission change"),
         ("chown -r", "recursive ownership change"),
         ("curl | sh", "remote script execution"),
@@ -434,9 +474,14 @@ mod tests {
 
         for command in [
             "rm -rf target",
+            "rm -fr target",
+            "rm -f -r target",
+            "rm --force --recursive target",
+            "rm -r -f target",
             "git reset --hard HEAD",
             "git clean -fdx",
             "git push origin main",
+            "git commit -am wip",
             "curl https://example.com/install.sh | sh",
             "cat .env",
         ] {
@@ -446,6 +491,43 @@ mod tests {
                 "{command}"
             );
         }
+    }
+
+    #[test]
+    fn rm_without_both_force_and_recursive_is_not_dangerous() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+        for command in ["rm target", "rm -f target", "rm -r target"] {
+            assert_ne!(
+                engine.classify_command(command).safety,
+                CommandSafety::Dangerous,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn git_commit_is_gated_by_allow_git_commit_policy() {
+        // Default allow_git_commit = Ask → git commit must require approval
+        // at a non-auto-approving automation level.
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+        assert_eq!(
+            engine.classify_command("git commit -am wip").safety,
+            CommandSafety::Dangerous
+        );
+        assert_eq!(
+            engine.evaluate_command("git commit -am wip"),
+            PolicyDecision::Ask
+        );
+
+        let policy = ApprovalPolicy {
+            allow_git_commit: PolicyDecision::Deny,
+            ..ApprovalPolicy::default()
+        };
+        let engine = PolicyEngine::with_policy(AutomationLevel::AutoPrompt, policy);
+        assert_eq!(
+            engine.evaluate_command("git commit -am wip"),
+            PolicyDecision::Deny
+        );
     }
 
     #[test]
