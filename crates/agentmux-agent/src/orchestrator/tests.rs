@@ -185,6 +185,35 @@ fn result_next_creates_summary_handoff_when_no_explicit_messages() {
 }
 
 #[test]
+fn cancelled_result_with_no_followup_escalates_to_human() {
+    let result = AgentResult {
+        status: AgentResultStatus::Cancelled,
+        summary: "Turn cancelled before completion.".to_string(),
+        changed_files: Vec::new(),
+        messages: Vec::new(),
+        context_updates: Vec::new(),
+        needs: Vec::new(),
+        next: None,
+        recommendation: None,
+        risk: None,
+    };
+
+    let routed = route_agent_result(
+        &planner_identity(),
+        task_id(),
+        &default_claude_codex_team(),
+        result,
+    )
+    .expect("route cancelled");
+
+    // A Cancelled result with no next and no messages would otherwise stall
+    // the workflow silently; it must escalate to a human.
+    assert_eq!(routed.status, AgentResultStatus::Cancelled);
+    assert!(routed.needs_human);
+    assert!(routed.outgoing.is_empty());
+}
+
+#[test]
 fn malformed_result_parse_routes_status_probe() {
     let routed = route_agent_result_parse(
         &planner_identity(),

@@ -122,6 +122,18 @@ impl AgentSession {
             return Ok(());
         }
 
+        // A signal that passed priority/staleness gating but is not a legal FSM
+        // transition from the current status is a silent no-op, not a hard
+        // error. Otherwise a stale lower-priority signal admitted via the TTL
+        // path would `?`-propagate an `Err` every poll without updating
+        // `last_signal_*`, re-failing forever (a permanent error loop). We do
+        // not weaken `transition_status` itself — other callers still rely on
+        // its error contract. Leaving `last_signal_*` untouched is correct: a
+        // no-op signal did not win, so it must not reset the TTL window.
+        if !is_allowed_transition(&self.status, &signal.value) {
+            return Ok(());
+        }
+
         self.transition_status(signal.value.clone(), signal.observed_at)?;
         self.last_signal_source = Some(signal.source.clone());
         self.last_signal_at = Some(signal.observed_at);
@@ -487,6 +499,82 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(session.status, AgentStatus::NeedsHuman);
+    }
+
+    #[test]
+    fn ttl_admitted_signal_with_illegal_transition_is_silent_no_op() {
+        let mut session = AgentSession::new(session_init(), now());
+        let id = session.id.clone();
+        let t0 = now();
+
+        // A high-priority verdict wins and parks the FSM in a terminal-ish
+        // state. From CompletedTurn the only legal move is AwaitingInput.
+        session
+            .transition_status(AgentStatus::InteractiveReady, t0)
+            .unwrap();
+        session
+            .apply_state_signal(&signal_at(
+                &id,
+                StateSignalSource::HumanOverride,
+                AgentStatus::AwaitingInput,
+                t0 + time::Duration::seconds(1),
+            ))
+            .unwrap();
+        session
+            .transition_status(
+                AgentStatus::RunningTurn,
+                t0 + time::Duration::seconds(2),
+            )
+            .unwrap();
+        session
+            .transition_status(
+                AgentStatus::CompletedTurn,
+                t0 + time::Duration::seconds(3),
+            )
+            .unwrap();
+        // Re-stamp the winning verdict so the TTL window is anchored here.
+        session
+            .apply_state_signal(&signal_at(
+                &id,
+                StateSignalSource::HumanOverride,
+                AgentStatus::CompletedTurn,
+                t0 + time::Duration::seconds(3),
+            ))
+            .unwrap();
+        assert_eq!(session.status, AgentStatus::CompletedTurn);
+
+        // After the TTL elapses a lower-priority signal is admitted by the
+        // staleness path, but RunningTurn is NOT a legal move from
+        // CompletedTurn. This must be a no-op, NOT an error, and applying it
+        // repeatedly must not loop or change anything.
+        let stale_signal = signal_at(
+            &id,
+            StateSignalSource::ScreenPattern,
+            AgentStatus::RunningTurn,
+            t0 + time::Duration::seconds(40),
+        );
+        for _ in 0..3 {
+            session
+                .apply_state_signal(&stale_signal)
+                .expect("illegal-but-admitted signal is a no-op, never an error");
+            assert_eq!(session.status, AgentStatus::CompletedTurn);
+        }
+
+        // The winning verdict's bookkeeping is untouched, so a later legal
+        // lower-priority signal still applies once stale.
+        assert_eq!(
+            session.last_signal_source,
+            Some(StateSignalSource::HumanOverride)
+        );
+        session
+            .apply_state_signal(&signal_at(
+                &id,
+                StateSignalSource::ScreenPattern,
+                AgentStatus::AwaitingInput,
+                t0 + time::Duration::seconds(41),
+            ))
+            .expect("legal stale signal applies");
+        assert_eq!(session.status, AgentStatus::AwaitingInput);
     }
 
     #[test]

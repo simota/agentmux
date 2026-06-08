@@ -64,7 +64,10 @@ pub fn route_agent_result(
 ) -> Result<ResultRouting> {
     let needs_human = matches!(
         result.status,
-        AgentResultStatus::Blocked | AgentResultStatus::NeedsInput | AgentResultStatus::Failed
+        AgentResultStatus::Blocked
+            | AgentResultStatus::NeedsInput
+            | AgentResultStatus::Failed
+            | AgentResultStatus::Cancelled
     );
     let mut outgoing = Vec::new();
 
