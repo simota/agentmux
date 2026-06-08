@@ -408,6 +408,65 @@ use super::*;
     }
 
     #[tokio::test]
+    async fn manual_message_inject_skips_message_already_injecting() {
+        // #7: an idle auto-delivery marks the message `Injecting` and then sleeps
+        // for the settle delay before writing to the PTY. A manual `MessageInject`
+        // arriving during that window must not start a second injection, or the
+        // same prompt is written into the PTY twice. The guard rejects a message
+        // that is already `Injecting`.
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime.register_agent("inject-guard".to_string()).await;
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "deliver me once".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect("message is created");
+
+        // Simulate the first injection already being in flight.
+        {
+            let mut state = runtime.state.write().await;
+            state
+                .messages
+                .update_delivery_status(
+                    &message.id,
+                    DeliveryStatus::Injecting,
+                    DateTimeUtc::now_utc(),
+                )
+                .expect("status updates");
+        }
+
+        let error = runtime
+            .inject_message(&message.id)
+            .await
+            .expect_err("a message already injecting is not re-injected");
+        assert!(
+            error.to_string().contains("already injecting"),
+            "guard reports the in-flight injection: {error}"
+        );
+
+        // The status is untouched by the rejected manual attempt.
+        assert_eq!(
+            runtime
+                .get_message(&message.id)
+                .await
+                .unwrap()
+                .delivery_status,
+            DeliveryStatus::Injecting
+        );
+    }
+
+    #[tokio::test]
     async fn manual_message_inject_can_target_explicit_agent_session() {
         let root =
             std::env::temp_dir().join(format!("agentmux-explicit-inject-{}", ulid::Ulid::new()));

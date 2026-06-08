@@ -430,6 +430,17 @@ pub(crate) fn prepare_message_injection_for_resolved(
     message: &AgentMessage,
     now: DateTimeUtc,
 ) -> Result<PreparedInjection> {
+    // Guard against a double injection (#7): an idle auto-delivery marks the
+    // message `Injecting` and then sleeps for the settle delay before writing
+    // to the PTY. A manual `MessageInject` IPC arriving during that window must
+    // not start a second injection of the same message, or the prompt is
+    // written into the PTY twice. The idle path already self-guards via
+    // `next_inject_when_idle_message_id`; this closes the manual path.
+    if message.delivery_status == DeliveryStatus::Injecting {
+        return Err(AgentmuxError::UserError(format!(
+            "message '{id}' is already injecting"
+        )));
+    }
     let (provider, context) = delivery_render_inputs(state, agent_id, message)?;
     let thread = message
         .thread_id

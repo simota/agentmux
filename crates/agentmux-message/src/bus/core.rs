@@ -45,6 +45,18 @@ impl MessageBus {
         self.backfill_inbox_for_registered_agent(&agent_id);
     }
 
+    /// Remove an agent from the bus when its session stops.
+    ///
+    /// Drops both the routing descriptor (so `resolve_target` no longer yields
+    /// the stopped session for Role/Team/Broadcast/Agent targets) and the
+    /// agent's inbox (so the per-session message-id list does not leak for the
+    /// lifetime of the daemon). Stored messages themselves are retained for the
+    /// audit/history view; only this session's delivery routing is dropped.
+    pub fn deregister_agent(&mut self, agent_id: &AgentSessionId) {
+        self.agents.remove(agent_id);
+        self.inboxes.remove(agent_id);
+    }
+
     /// When an agent registers, claim any previously stored messages whose
     /// target now resolves to this agent but which were saved with no inbox
     /// entry (e.g. via `create_message_allow_no_recipients` while the target

@@ -238,6 +238,9 @@ impl DaemonRuntime {
                 "unknown agent session '{agent_id}'"
             )));
         };
+        // Drop the session from the message bus too, otherwise `resolve_target`
+        // keeps routing to the stopped agent and its inbox leaks (#8).
+        state.messages.deregister_agent(agent_id);
         drop(state);
 
         if let Some(pty) = &agent.pty {

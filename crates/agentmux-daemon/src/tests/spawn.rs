@@ -241,6 +241,62 @@ use super::*;
     }
 
     #[tokio::test]
+    async fn stop_agent_deregisters_session_from_message_bus() {
+        // #8: stopping an agent must drop it from the message bus too, otherwise
+        // `resolve_target` keeps routing to the dead session and its inbox leaks.
+        let runtime = DaemonRuntime::new(8);
+        let agent = runtime
+            .register_agent_with_role("retiring-tester".to_string(), AgentRole::Tester)
+            .await;
+
+        // While live, both an explicit-agent target and the role target resolve
+        // to the session.
+        {
+            let state = runtime.state.read().await;
+            assert_eq!(
+                state
+                    .messages
+                    .resolve_target(&MessageTarget::Agent(agent.id.clone()))
+                    .unwrap(),
+                vec![agent.id.clone()]
+            );
+            assert_eq!(
+                state
+                    .messages
+                    .resolve_target(&MessageTarget::Role(AgentRole::Tester))
+                    .unwrap(),
+                vec![agent.id.clone()]
+            );
+            // The inbox exists.
+            assert!(state.messages.inbox(&agent.id).is_ok());
+        }
+
+        runtime.stop_agent(&agent.id).await.expect("agent stops");
+
+        // After stop: the role target resolves to nobody, the explicit-agent
+        // target errors as unknown, and the inbox is gone.
+        let state = runtime.state.read().await;
+        assert!(
+            state
+                .messages
+                .resolve_target(&MessageTarget::Role(AgentRole::Tester))
+                .is_err(),
+            "role target no longer resolves to the stopped session"
+        );
+        assert!(
+            state
+                .messages
+                .resolve_target(&MessageTarget::Agent(agent.id.clone()))
+                .is_err(),
+            "explicit-agent target no longer resolves to the stopped session"
+        );
+        assert!(
+            state.messages.inbox(&agent.id).is_err(),
+            "stopped session's inbox is dropped"
+        );
+    }
+
+    #[tokio::test]
     async fn task_run_shell_stub_completes_standard_workflow() {
         let root = std::env::temp_dir().join(format!("agentmux-daemon-task-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("temporary root is created");
