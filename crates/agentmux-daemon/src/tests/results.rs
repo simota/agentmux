@@ -854,6 +854,7 @@ AGENTMUX_RESULT:
                     worktree_id: Some(worktree_id.clone()),
                     pty: None,
                     terminal: Arc::new(Mutex::new(TerminalParser::new(24, 80))),
+                    input_activity: InputActivity::new(),
                 },
             );
         }

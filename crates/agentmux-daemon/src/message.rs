@@ -131,6 +131,23 @@ impl DaemonRuntime {
         }
     }
 
+    /// Record a genuine human keystroke against a pane's activity timestamps.
+    ///
+    /// Only `send_input_script` (the `AgentSendInputScript` IPC, i.e. real human
+    /// key-forwarding) calls this. Automated injection never does, so the
+    /// quiet-window check distinguishes human typing from agentmux's own writes.
+    /// An unknown target is a no-op: the agent may have already deregistered.
+    pub(crate) async fn record_human_input_for_agent(
+        &self,
+        agent_id: &AgentSessionId,
+        now: DateTimeUtc,
+    ) {
+        let mut state = self.state.write().await;
+        if let Some(agent) = state.agents.get_mut(agent_id) {
+            agent.input_activity.record_human_input(now);
+        }
+    }
+
     pub async fn deliver_idle_messages_for_agent(
         &self,
         agent_id: &AgentSessionId,
@@ -139,6 +156,20 @@ impl DaemonRuntime {
         let now = DateTimeUtc::now_utc();
         let delivery = {
             let state = self.state.read().await;
+            // Spec invariant: never auto-inject into a pane where a human is
+            // currently typing. If the target pane saw a human keystroke within
+            // the `human_input_quiet` window, defer delivery -- the message stays
+            // queued and a later idle/status poll retries once the human goes
+            // quiet. This is the live wiring of `InputPrecondition::QuietFor`,
+            // fed by `record_human_input_for_agent` on the human key path.
+            if let Some(agent) = state.agents.get(agent_id) {
+                if !agent
+                    .input_activity
+                    .quiet_for_at(now, state.injection_timing.human_input_quiet)
+                {
+                    return Ok(None);
+                }
+            }
             let Some(message) = state.messages.next_inject_when_idle_message(agent_id)? else {
                 return Ok(None);
             };
@@ -402,6 +433,16 @@ impl DaemonRuntime {
 
     pub async fn send_input_script(&self, script: &InputScript) -> Result<()> {
         self.append_input_script_event("input_script.created", script)?;
+
+        // This is the genuine human key-forwarding path (`AgentSendInputScript`):
+        // record the keystroke against the target pane so the auto-injection
+        // quiet window (`human_input_quiet`) reflects real human typing. The
+        // automated message-injection path writes via
+        // `write_prepared_message_injection` -> `write_input_actions_to_agent_pty`
+        // and never reaches here, so auto-injected bytes are not mis-counted as
+        // human input.
+        self.record_human_input_for_agent(&script.target_agent_id, DateTimeUtc::now_utc())
+            .await;
 
         self.write_input_actions_to_agent_pty(&script.target_agent_id, &script.actions)
             .await?;

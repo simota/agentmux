@@ -89,6 +89,7 @@ impl DaemonRuntime {
                 worktree_id: worktree_id.clone(),
                 pty: Some(Mutex::new(pty)),
                 terminal,
+                input_activity: InputActivity::new(),
             },
         );
         state.messages.register_agent(

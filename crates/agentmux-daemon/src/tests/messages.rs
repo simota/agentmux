@@ -819,3 +819,414 @@ use super::*;
         terminate_agent_process(&runtime, &agent.id.to_string()).await;
         std::fs::remove_dir_all(root).expect("temporary root is removed");
     }
+
+    /// Step 1: a human keystroke forwarded via the live `send_input_script` path
+    /// (the `AgentSendInputScript` IPC handler) must update the target pane's
+    /// `last_human_input_at`. Before the fix this timestamp was never updated by
+    /// real keystrokes, so the auto-injection quiet window saw stale data.
+    #[tokio::test]
+    async fn human_input_script_records_last_human_input_on_live_path() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-human-input-record-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("human-input.txt");
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime
+            .spawn_agent(
+                "human-codex".to_string(),
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("agent is spawned");
+
+        // No human input recorded yet.
+        {
+            let state = runtime.state.read().await;
+            assert_eq!(
+                state.agents.get(&agent.id).unwrap().input_activity.last_human_input_at,
+                None,
+                "freshly spawned pane has no recorded human input"
+            );
+        }
+
+        let before = DateTimeUtc::now_utc();
+        let script = InputScript {
+            id: InputScriptId::new(),
+            target_agent_id: agent.id.clone(),
+            reason: "human keystroke".to_string(),
+            preconditions: Vec::new(),
+            actions: vec![InputAction::SendRaw(b"h".to_vec())],
+            safety: InputSafety::Safe,
+            created_at: DateTimeUtc::now_utc(),
+        };
+        runtime
+            .send_input_script(&script)
+            .await
+            .expect("human input script is delivered");
+
+        let recorded = {
+            let state = runtime.state.read().await;
+            state
+                .agents
+                .get(&agent.id)
+                .unwrap()
+                .input_activity
+                .last_human_input_at
+                .expect("live human key path records last_human_input_at")
+        };
+        assert!(
+            recorded >= before,
+            "recorded human input {recorded:?} should be at/after {before:?}"
+        );
+
+        terminate_agent_process(&runtime, &agent.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// Step 2: auto-injection (idle delivery) must be deferred while the target
+    /// pane is within the human-typing quiet window, and must proceed once the
+    /// last keystroke ages out of that window. Drives the real
+    /// `deliver_idle_messages_for_agent` path; the quiet window is the default
+    /// `InjectionTiming` value (non-zero even in tests).
+    #[tokio::test]
+    async fn auto_injection_defers_during_human_quiet_window_then_proceeds() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-quiet-defer-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("quiet-defer.txt");
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime
+            .spawn_agent(
+                "quiet-codex".to_string(),
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("agent is spawned");
+
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::High,
+                body: "quiet-window-deferred-body".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect("message is created");
+
+        // Simulate the human typing right now: record a keystroke at the
+        // current instant so the pane is inside the quiet window.
+        runtime
+            .record_human_input_for_agent(&agent.id, DateTimeUtc::now_utc())
+            .await;
+
+        let deferred = runtime
+            .deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput)
+            .await
+            .expect("idle delivery does not error while deferring");
+        assert!(
+            deferred.is_none(),
+            "auto-injection must be deferred while the human is typing"
+        );
+        assert_eq!(
+            runtime.get_message(&message.id).await.unwrap().delivery_status,
+            DeliveryStatus::Queued,
+            "deferred message stays queued for a later idle retry"
+        );
+
+        // Age the last keystroke out of the quiet window (default 2500ms) by
+        // backdating it well beyond the window. A later idle poll now proceeds.
+        {
+            let mut state = runtime.state.write().await;
+            let live = state.agents.get_mut(&agent.id).unwrap();
+            live.input_activity
+                .record_human_input(DateTimeUtc::now_utc() - Duration::from_secs(60));
+        }
+
+        let delivered = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput),
+        )
+        .await
+        .expect("idle delivery should not hang")
+        .expect("idle delivery succeeds")
+        .expect("message is delivered once the human goes quiet");
+        assert_eq!(delivered.id, message.id);
+        assert_eq!(delivered.delivery_status, DeliveryStatus::Delivered);
+
+        let output = wait_for_file_contains(&output_path, "quiet-window-deferred-body")
+            .await
+            .expect("message reached PTY after quiet window elapsed");
+        assert!(output.contains("quiet-window-deferred-body"));
+
+        terminate_agent_process(&runtime, &agent.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    // ── Radar edge-case additions ──────────────────────────────────────────
+    //
+    // Cases 4-6 guard multi-pane safety invariants that the happy-path suite
+    // didn't fully cover.
+
+    /// Edge case 4: per-pane isolation.
+    ///
+    /// A human keystroke recorded against pane A's quiet window must NOT defer
+    /// auto-injection into a DIFFERENT idle pane B. The quiet window is
+    /// per-agent, so pane B's message must be delivered even while pane A is
+    /// within its quiet window.
+    #[tokio::test]
+    async fn quiet_window_on_pane_a_does_not_defer_delivery_to_pane_b() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-pane-isolation-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let output_path = root.join("pane-b-output.txt");
+
+        let runtime = DaemonRuntime::new(16);
+
+        // Pane A: metadata-only (no PTY); only its quiet window is exercised.
+        let agent_a = runtime.register_agent("typing-human".to_string()).await;
+
+        // Pane B: live PTY agent that will receive a message.
+        let agent_b = runtime
+            .spawn_agent(
+                "idle-receiver".to_string(),
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.clone(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("pane_b agent is spawned");
+
+        // Queue a message for pane B.
+        let message_b = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent_b.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "pane-b-isolation-body".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect("message for pane B is created");
+
+        // Simulate a human typing in pane A RIGHT NOW → pane A is in its quiet window.
+        runtime
+            .record_human_input_for_agent(&agent_a.id, DateTimeUtc::now_utc())
+            .await;
+
+        // Pane B should still receive its message unaffected by pane A's activity.
+        let delivered_b = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.deliver_idle_messages_for_agent(&agent_b.id, AgentStatus::AwaitingInput),
+        )
+        .await
+        .expect("delivery for pane B must not hang")
+        .expect("delivery call for pane B must not error")
+        .expect("pane B must receive its message while pane A is in quiet window");
+
+        assert_eq!(
+            delivered_b.id, message_b.id,
+            "delivered message must be the one queued for pane B"
+        );
+        assert_eq!(
+            delivered_b.delivery_status,
+            DeliveryStatus::Delivered,
+            "pane B message status must be Delivered"
+        );
+
+        let output =
+            wait_for_file_contains(&output_path, "pane-b-isolation-body")
+                .await
+                .expect("pane B received message despite pane A being in quiet window");
+        assert!(output.contains("pane-b-isolation-body"));
+
+        terminate_agent_process(&runtime, &agent_b.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// Edge case 5: no-stuck-queue — deferred message is delivered on a later
+    /// attempt, confirming the message stays Queued (not dropped/failed) while
+    /// deferred and is then consumed on the next eligible call.
+    ///
+    /// NOTE: the existing `auto_injection_defers_during_human_quiet_window_then_proceeds`
+    /// test already covers this end-to-end. This lightweight unit-level variant
+    /// confirms the Queued status is preserved between calls using only a
+    /// metadata-only agent (no PTY spawn), verifying the guard returns Ok(None)
+    /// on both the first and a repeated call while still within the quiet window.
+    #[tokio::test]
+    async fn deferred_message_stays_queued_on_repeated_delivery_attempts() {
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime.register_agent("no-pty-typist".to_string()).await;
+
+        let message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "must stay queued".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect("message is created");
+
+        // Put the agent inside the quiet window.
+        runtime
+            .record_human_input_for_agent(&agent.id, DateTimeUtc::now_utc())
+            .await;
+
+        // First attempt: deferred (quiet window active).
+        let first = runtime
+            .deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput)
+            .await
+            .expect("first attempt must not error");
+        assert!(first.is_none(), "first attempt must be deferred");
+
+        // Status is still Queued — not dropped, not Failed.
+        assert_eq!(
+            runtime.get_message(&message.id).await.unwrap().delivery_status,
+            DeliveryStatus::Queued,
+            "message must stay Queued after the first deferred attempt"
+        );
+
+        // Second attempt within the same quiet window: still deferred.
+        let second = runtime
+            .deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput)
+            .await
+            .expect("second attempt must not error");
+        assert!(second.is_none(), "second attempt must still be deferred");
+
+        assert_eq!(
+            runtime.get_message(&message.id).await.unwrap().delivery_status,
+            DeliveryStatus::Queued,
+            "message must still be Queued after the second deferred attempt"
+        );
+    }
+
+    /// Edge case 6: boundary — injection is deferred when the last keystroke is
+    /// strictly inside the quiet window, and is attempted (no longer deferred by
+    /// the quiet-window guard) once the elapsed time reaches the window boundary.
+    ///
+    /// Uses time back-dating so the test runs instantly without real sleeps.
+    /// The "at exactly the boundary" case uses a metadata-only agent: the quiet-
+    /// window guard passes, so the call proceeds to the PTY-write step and fails
+    /// with "has no live PTY" rather than returning Ok(None). This distinguishes
+    /// "not deferred" from "deferred".
+    #[tokio::test]
+    async fn injection_defers_inside_window_and_proceeds_at_boundary() {
+        let runtime = DaemonRuntime::new(16);
+        let agent = runtime.register_agent("boundary-agent".to_string()).await;
+
+        let _message = runtime
+            .create_message(NewAgentMessage {
+                task_id: None,
+                thread_id: None,
+                from: MessageSource::System,
+                to: MessageTarget::Agent(agent.id.clone()),
+                kind: MessageKind::Handoff,
+                priority: Priority::Normal,
+                body: "boundary-test-body".to_string(),
+                context_refs: Vec::new(),
+                artifact_refs: Vec::new(),
+                delivery_mode: DeliveryMode::InjectWhenIdle,
+                requires_response: false,
+            })
+            .await
+            .expect("message is created");
+
+        let quiet = {
+            let state = runtime.state.read().await;
+            state.injection_timing.human_input_quiet
+        };
+
+        // --- Inside the quiet window (1 ms before the boundary) → deferred ---
+        {
+            let mut state = runtime.state.write().await;
+            let live = state.agents.get_mut(&agent.id).unwrap();
+            // Keystroke happened (quiet - 1 ms) ago, so elapsed < quiet.
+            live.input_activity
+                .record_human_input(DateTimeUtc::now_utc() - quiet + Duration::from_millis(1));
+        }
+
+        let inside_result = runtime
+            .deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput)
+            .await
+            .expect("inside-window call must not error");
+        assert!(
+            inside_result.is_none(),
+            "delivery must be deferred while 1 ms inside the quiet window"
+        );
+
+        // --- At the quiet-window boundary → the guard passes; no longer deferred ---
+        {
+            let mut state = runtime.state.write().await;
+            let live = state.agents.get_mut(&agent.id).unwrap();
+            // Keystroke happened exactly `quiet` duration ago.
+            live.input_activity
+                .record_human_input(DateTimeUtc::now_utc() - quiet);
+        }
+
+        // NOTE: the agent has no live PTY, so once the quiet-window guard passes
+        // the call will fail at the PTY-write step. The important invariant is
+        // that it does NOT return Ok(None) — i.e., the quiet-window guard itself
+        // no longer blocks delivery.
+        let boundary_result = runtime
+            .deliver_idle_messages_for_agent(&agent.id, AgentStatus::AwaitingInput)
+            .await;
+        assert!(
+            boundary_result.is_err() || boundary_result.as_ref().unwrap().is_some(),
+            "at the boundary the quiet-window guard must pass (result must be \
+             Err(no-live-PTY) or Some(...), never Ok(None))"
+        );
+        if let Ok(Some(msg)) = boundary_result {
+            // If a PTY were present, delivery would succeed.
+            assert_eq!(msg.delivery_status, DeliveryStatus::Delivered);
+        }
+        // Err path: confirm it's the PTY error, not a quiet-window deferral.
+        // (Ok(None) is the only incorrect outcome and was already excluded above.)
+    }

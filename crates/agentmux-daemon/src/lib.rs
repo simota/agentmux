@@ -14,7 +14,7 @@ pub(crate) use std::time::Duration;
 pub(crate) use agentmux_agent::adapter::InputSafety;
 pub(crate) use agentmux_agent::{
     AgentResult, AgentResultParse, AgentResultStatus, AgentRouteIdentity, EncodedInputStep,
-    InputAction, InputScript, StandardWorkflowState, WorkflowHandoffContext,
+    InputAction, InputActivity, InputScript, StandardWorkflowState, WorkflowHandoffContext,
     advance_standard_workflow, default_claude_codex_team, encode_input_action,
     parse_agent_result_marker, plan_task_run, route_agent_result,
 };

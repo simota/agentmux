@@ -5,6 +5,11 @@ pub(crate) struct LiveAgentSession {
     pub(crate) worktree_id: Option<WorktreeId>,
     pub(crate) pty: Option<Mutex<PtyHandle>>,
     pub(crate) terminal: Arc<Mutex<TerminalParser>>,
+    /// Per-pane human/PTY activity timestamps. `last_human_input_at` is updated
+    /// only by genuine human key-forwarding (`AgentSendInputScript` ->
+    /// `send_input_script`), never by automated message injection, so the
+    /// auto-injection quiet-window check reflects real keystrokes into this pane.
+    pub(crate) input_activity: InputActivity,
 }
 
 #[derive(Debug, Clone)]
@@ -32,6 +37,11 @@ pub(crate) struct InjectionTiming {
     pub(crate) result_detection_tail_bytes: usize,
     /// Inline-context budget used when rendering an injected message prompt.
     pub(crate) max_inline_chars: usize,
+    /// Quiet window after a human keystroke during which automated injection
+    /// into that pane must be deferred. Enforces the spec invariant "do not
+    /// auto-inject into a pane where a human is currently typing"
+    /// (`automation.human_input_quiet_ms`).
+    pub(crate) human_input_quiet: Duration,
 }
 
 impl InjectionTiming {
@@ -42,6 +52,7 @@ impl InjectionTiming {
             paste_enter_delay: Duration::from_millis(automation.message_paste_enter_delay_ms),
             result_detection_tail_bytes: automation.result_detection_tail_bytes,
             max_inline_chars: context.max_inline_chars,
+            human_input_quiet: Duration::from_millis(automation.human_input_quiet_ms),
         }
     }
 
@@ -64,9 +75,14 @@ impl Default for InjectionTiming {
             paste_enter_delay: Duration::from_millis(DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS),
             result_detection_tail_bytes: DEFAULT_RESULT_DETECTION_TAIL_BYTES,
             max_inline_chars: DEFAULT_MAX_INLINE_CHARS,
+            human_input_quiet: Duration::from_millis(DEFAULT_HUMAN_INPUT_QUIET_MS),
         }
     }
 }
+
+/// Fallback human-typing quiet window when no `[automation]` config is wired in.
+/// Matches the documented example (`docs/config/agentmux.config.example.toml`).
+pub(crate) const DEFAULT_HUMAN_INPUT_QUIET_MS: u64 = 2500;
 
 /// Fallback inline-context budget when no `[context]` config is wired in.
 pub(crate) const DEFAULT_MAX_INLINE_CHARS: usize = 2048;
@@ -127,6 +143,7 @@ impl LiveAgentSession {
             worktree_id: None,
             pty: None,
             terminal: Arc::new(Mutex::new(TerminalParser::default())),
+            input_activity: InputActivity::new(),
         }
     }
 }
