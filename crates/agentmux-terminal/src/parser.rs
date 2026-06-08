@@ -163,11 +163,33 @@ impl GridPerformer<'_> {
         for param in Self::params(params) {
             match (is_private, param) {
                 (true, 25) => self.grid().set_cursor_visible(enabled),
-                (true, 1047 | 1049) if enabled => {
+                // `?1049h` (smcup) saves the primary-screen cursor before
+                // switching to the alternate screen; `?1049l` (rmcup) restores
+                // it on return. `?1047` switches screens but never saves or
+                // restores the cursor. Both clear the alternate screen only on
+                // the transition INTO it from the primary screen — re-entering
+                // the alternate screen while already there must not wipe its
+                // content.
+                (true, 1049) if enabled => {
+                    self.save_cursor();
+                    let entering = *self.active_screen == ActiveScreen::Primary;
                     *self.active_screen = ActiveScreen::Alternate;
-                    self.alternate.clear_screen();
+                    if entering {
+                        self.alternate.clear_screen();
+                    }
                 }
-                (true, 1047 | 1049) => {
+                (true, 1049) => {
+                    *self.active_screen = ActiveScreen::Primary;
+                    self.restore_cursor();
+                }
+                (true, 1047) if enabled => {
+                    let entering = *self.active_screen == ActiveScreen::Primary;
+                    *self.active_screen = ActiveScreen::Alternate;
+                    if entering {
+                        self.alternate.clear_screen();
+                    }
+                }
+                (true, 1047) => {
                     *self.active_screen = ActiveScreen::Primary;
                 }
                 (true, 2004) => *self.bracketed_paste = enabled,
@@ -282,7 +304,10 @@ impl vte::Perform for GridPerformer<'_> {
                 // Move to the next tab stop without erasing cells (a real
                 // terminal's TAB repositions the cursor; it never prints).
                 let cursor = self.grid().cursor();
-                let next_tab = ((cursor.col / 8) + 1) * 8;
+                // Saturating math: `((col / 8) + 1) * 8` overflows u16 for
+                // col >= 65528 (absurd widths, but hostile PTY output can park
+                // the cursor there). Clamp to the last column instead.
+                let next_tab = (cursor.col / 8).saturating_add(1).saturating_mul(8);
                 let col = next_tab.min(self.grid().cols().saturating_sub(1));
                 self.grid().set_cursor(cursor.row, col);
             }
@@ -542,6 +567,63 @@ mod tests {
     }
 
     #[test]
+    fn smcup_saves_and_rmcup_restores_the_primary_cursor() {
+        // `?1049h` (smcup) must save the primary cursor; `?1049l` (rmcup) must
+        // restore it. Position the primary cursor, switch to the alternate
+        // screen, move within it, then return — the primary cursor must be
+        // exactly where it was before smcup.
+        let mut parser = TerminalParser::new(4, 6);
+
+        parser.advance(b"\x1b[2;3H"); // primary cursor -> row 1, col 2 (0-based)
+        assert_eq!(parser.grid().cursor().row, 1);
+        assert_eq!(parser.grid().cursor().col, 2);
+
+        parser.advance(b"\x1b[?1049h"); // smcup: save + switch to alternate
+        parser.advance(b"\x1b[4;6Halt"); // move around on the alternate screen
+        assert_eq!(parser.active_screen(), ActiveScreen::Alternate);
+
+        parser.advance(b"\x1b[?1049l"); // rmcup: switch back + restore cursor
+        assert_eq!(parser.active_screen(), ActiveScreen::Primary);
+        assert_eq!(parser.grid().cursor().row, 1, "primary row restored");
+        assert_eq!(parser.grid().cursor().col, 2, "primary col restored");
+    }
+
+    #[test]
+    fn smcup_does_not_clear_alternate_when_already_active() {
+        // A second `?1049h` while already on the alternate screen must not wipe
+        // the alternate content (only the primary->alternate transition clears).
+        let mut parser = TerminalParser::new(2, 6);
+
+        parser.advance(b"\x1b[?1049halt"); // enter alternate, write "alt"
+        assert_eq!(parser.active_screen(), ActiveScreen::Alternate);
+        assert_eq!(parser.grid().line_text(0).as_deref(), Some("alt   "));
+
+        parser.advance(b"\x1b[?1049h"); // redundant smcup while already alternate
+        assert_eq!(parser.active_screen(), ActiveScreen::Alternate);
+        assert_eq!(
+            parser.grid().line_text(0).as_deref(),
+            Some("alt   "),
+            "alternate content must survive a redundant smcup"
+        );
+    }
+
+    #[test]
+    fn ti1047_does_not_save_or_restore_the_primary_cursor() {
+        // `?1047` switches screens but, unlike `?1049`, never saves/restores
+        // the cursor. After rmcup the primary cursor stays where the last
+        // primary-screen positioning left it.
+        let mut parser = TerminalParser::new(4, 6);
+
+        parser.advance(b"\x1b[2;3H"); // primary cursor -> row 1, col 2
+        parser.advance(b"\x1b[?1047h\x1b[4;6Halt"); // enter alternate, move
+        parser.advance(b"\x1b[?1047l"); // leave alternate, no restore
+
+        assert_eq!(parser.active_screen(), ActiveScreen::Primary);
+        assert_eq!(parser.grid().cursor().row, 1);
+        assert_eq!(parser.grid().cursor().col, 2);
+    }
+
+    #[test]
     fn osc_title_and_bracketed_paste_mode_are_tracked() {
         let mut parser = TerminalParser::new(1, 5);
 
@@ -608,6 +690,19 @@ mod tests {
         parser.advance(b"\x1b[40000B\x1b[40000C"); // down + right, huge
         assert_eq!(parser.grid().cursor().row, 3);
         assert_eq!(parser.grid().cursor().col, 3);
+    }
+
+    #[test]
+    fn tab_at_extreme_column_does_not_overflow() {
+        // `((col / 8) + 1) * 8` overflows u16 for col >= 65528. Park the cursor
+        // near the right margin of an extreme-width terminal and TAB: the
+        // saturating math must clamp to the last column, not panic/wrap.
+        let mut parser = TerminalParser::new(1, u16::MAX);
+
+        parser.advance(b"\x1b[1;65535H"); // col 65534 (0-based), within tab-overflow range
+        parser.advance(b"\t");
+
+        assert_eq!(parser.grid().cursor().col, u16::MAX - 1);
     }
 
     #[test]

@@ -235,7 +235,11 @@ impl ScreenGrid {
         }
         let top = top.min(self.rows.saturating_sub(1));
         let bottom = bottom.min(self.rows.saturating_sub(1));
-        if top >= bottom {
+        // xterm permits a degenerate one-row scroll region (`top == bottom`);
+        // only an inverted region (`top > bottom`) is invalid and resets to the
+        // full screen. The downstream scroll ops handle a 1-row region safely
+        // (`normalized_region` admits `top <= bottom`, height becomes 1).
+        if top > bottom {
             self.reset_scroll_region();
             return;
         }
@@ -599,6 +603,14 @@ impl ScreenGrid {
     }
 
     fn newline(&mut self) {
+        // NOTE (ONLCR contract): a strict VT line feed is column-preserving —
+        // only CR resets the column. This terminal is driven by a PTY slave
+        // running with the default `OPOST|ONLCR` termios, so the kernel
+        // translates every program `\n` into `\r\n` before it reaches the
+        // master. The CR has already zeroed the column by the time LF arrives,
+        // so resetting `col` here is a no-op on real input and keeps `newline`
+        // reusable by `ESC E` (NEL) and the wrap path. Do not switch to
+        // column-preserving LF without first disabling ONLCR on the slave.
         self.cursor.col = 0;
         self.wrap_pending = false;
         if self.cursor.row == self.scroll_bottom {
@@ -963,6 +975,44 @@ mod tests {
         grid.resize(1, 3);
 
         assert_eq!(grid.cell(0, 0), Some(&Cell::blank()));
+    }
+
+    #[test]
+    fn degenerate_one_row_scroll_region_is_accepted() {
+        // xterm permits `top == bottom` (a 1-row region). It must be applied,
+        // not treated as invalid and reset to the full screen with cursor home.
+        let mut grid = ScreenGrid::new(4, 4);
+
+        grid.set_scroll_region(2, 2);
+
+        assert_eq!(
+            grid.scroll_region(),
+            Some((2, 2)),
+            "1-row region must be applied"
+        );
+
+        // Scrolling within the 1-row region is safe and blanks that single row.
+        for ch in "row3".chars() {
+            grid.write_char(ch, CellStyle::default());
+        }
+        grid.set_cursor(2, 0);
+        grid.write_char('X', CellStyle::default());
+        grid.scroll_up_region(2, 2, 1);
+        assert_eq!(grid.line_text(2).as_deref(), Some("    "));
+    }
+
+    #[test]
+    fn inverted_scroll_region_resets_to_full_screen() {
+        // `top > bottom` is genuinely invalid: reset to the full screen and
+        // home the cursor.
+        let mut grid = ScreenGrid::new(4, 4);
+        grid.set_scroll_region(1, 2);
+
+        grid.set_scroll_region(3, 1);
+
+        assert_eq!(grid.scroll_region(), Some((0, 3)));
+        assert_eq!(grid.cursor().row, 0);
+        assert_eq!(grid.cursor().col, 0);
     }
 
     #[test]
