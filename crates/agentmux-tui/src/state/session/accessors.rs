@@ -38,6 +38,7 @@ impl TuiSessionState {
             arena_selected: 0,
             daemon_protocol_version: None,
             runtime_notice: None,
+            prefix_active: false,
         }
     }
 
@@ -225,6 +226,36 @@ impl TuiSessionState {
         self.runtime_notice.as_deref()
     }
 
+    /// Mirror the keymap dispatcher's prefix state into render state.
+    ///
+    /// The driver calls this each frame with `dispatcher.is_awaiting_prefix_command()`.
+    /// The dispatcher stays the single source of truth.
+    pub fn set_prefix_active(&mut self, active: bool) {
+        self.prefix_active = active;
+    }
+
+    /// Whether the `Ctrl-g` prefix is armed and awaiting its command key.
+    pub fn prefix_active(&self) -> bool {
+        self.prefix_active
+    }
+
+    /// Status-bar label describing the focused pane: `focus: <name> [i/N]`.
+    ///
+    /// Position is 1-based over the layout's pane order. Returns `None` when no
+    /// pane is focused (empty layout).
+    pub fn focus_position_label(&self) -> Option<String> {
+        let focused = self.layout.focused()?;
+        let panes = self.layout.panes();
+        let total = panes.len();
+        let index = panes.iter().position(|pane_id| pane_id == focused)?;
+        let name = self
+            .panes
+            .get(focused)
+            .map(|pane| pane.name().to_string())
+            .unwrap_or_else(|| focused.to_string());
+        Some(format!("focus: {name} [{}/{}]", index + 1, total))
+    }
+
     pub fn set_runtime_notice(&mut self, notice: impl Into<String>) {
         self.runtime_notice = Some(notice.into());
     }
@@ -239,10 +270,37 @@ impl TuiSessionState {
 
     pub fn focus_next(&mut self) {
         self.layout.focus_next();
+        self.clear_focused_pane_unseen();
     }
 
     pub fn focus_previous(&mut self) {
         self.layout.focus_previous();
+        self.clear_focused_pane_unseen();
+    }
+
+    /// Focus the pane with `agent_id`, clearing its unseen-output marker.
+    ///
+    /// Returns `false` (and changes nothing) if no pane has that id.
+    pub fn focus_pane(&mut self, agent_id: &str) -> bool {
+        if self.layout.focus(agent_id) {
+            self.clear_focused_pane_unseen();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear the unseen-output marker on the currently focused pane.
+    ///
+    /// Called whenever focus changes so a pane the user is now looking at no
+    /// longer advertises pending output.
+    pub fn clear_focused_pane_unseen(&mut self) {
+        let Some(agent_id) = self.layout.focused().map(ToOwned::to_owned) else {
+            return;
+        };
+        if let Some(pane) = self.panes.get_mut(&agent_id) {
+            pane.has_unseen_output = false;
+        }
     }
 
     pub fn toggle_zoom(&mut self) {

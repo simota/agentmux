@@ -473,3 +473,77 @@ fn terminal_style_conversion_maps_flags_and_colors() {
     assert!(converted.add_modifier.contains(Modifier::REVERSED));
     assert!(converted.add_modifier.contains(Modifier::DIM));
 }
+
+fn row_text(buffer: &Buffer, y: u16, width: u16) -> String {
+    (0..width)
+        .filter_map(|x| buffer.cell((x, y)).map(|cell| cell.symbol().to_string()))
+        .collect()
+}
+
+#[test]
+fn status_bar_shows_prefix_indicator_and_focus_label() {
+    let mut state = TuiSessionState::default();
+    state.apply_daemon_status(&json!({
+        "agents": [
+            {"id": "left", "name": "planner"},
+            {"id": "right", "name": "impl"}
+        ]
+    }));
+    assert!(state.layout_mut().focus("right"));
+    state.set_prefix_active(true);
+
+    let area = Rect::new(0, 0, 60, 6);
+    let mut buffer = Buffer::empty(area);
+    TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+    let status = row_text(&buffer, 5, 60);
+    assert!(status.contains("PREFIX (Ctrl-g)"), "status was {status:?}");
+    assert!(status.contains("focus: impl [2/2]"), "status was {status:?}");
+    // Prefix segment is rendered on a highlighted background.
+    let cell = buffer.cell((0, 5)).expect("status cell");
+    assert_eq!(cell.bg, Color::Yellow);
+}
+
+#[test]
+fn status_bar_hides_prefix_segment_when_not_armed() {
+    let mut state = TuiSessionState::default();
+    state.apply_daemon_status(&json!({
+        "agents": [{"id": "solo", "name": "solo"}]
+    }));
+
+    let area = Rect::new(0, 0, 40, 5);
+    let mut buffer = Buffer::empty(area);
+    TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+    let status = row_text(&buffer, 4, 40);
+    assert!(!status.contains("PREFIX"), "status was {status:?}");
+    assert!(status.contains("focus: solo [1/1]"), "status was {status:?}");
+}
+
+#[test]
+fn pane_title_marks_focus_glyph_and_unseen_output() {
+    let mut state = TuiSessionState::default();
+    state.apply_daemon_status(&json!({
+        "agents": [
+            {"id": "left", "name": "planner"},
+            {"id": "right", "name": "impl"}
+        ]
+    }));
+    assert!(state.layout_mut().focus("left"));
+    // Output to the unfocused pane raises its attention marker.
+    state.apply_event(&agentmux_ipc::protocol::DaemonEvent::new(
+        agentmux_ipc::protocol::IpcEventKind::PtyOutputChunk,
+        json!({ "agent_id": "right", "text": "x" }),
+    ));
+
+    let area = Rect::new(0, 0, 40, 6);
+    let mut buffer = Buffer::empty(area);
+    TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+    // The focus glyph sits on the focused (left) pane's title row.
+    let left_title = row_text(&buffer, 0, 20);
+    assert!(left_title.contains('▶'), "left title was {left_title:?}");
+    // The unseen marker sits on the unfocused (right) pane's title row.
+    let right_title = row_text(&buffer, 0, 40);
+    assert!(right_title.contains('●'), "right title was {right_title:?}");
+}

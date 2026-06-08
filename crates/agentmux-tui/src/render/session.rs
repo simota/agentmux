@@ -44,8 +44,13 @@ impl TuiSessionRenderer {
             let Some(pane) = state.pane(&pane_id) else {
                 continue;
             };
-            let chrome = PaneChrome::new(pane.chrome_title())
-                .focused(state.layout().focused() == Some(pane.agent_id()));
+            let focused = state.layout().focused() == Some(pane.agent_id());
+            let chrome = PaneChrome::new(pane_chrome_title(
+                &pane.chrome_title(),
+                focused,
+                pane.has_unseen_output(),
+            ))
+            .focused(focused);
             let selection = state
                 .copy_selection()
                 .filter(|selection| selection.agent_id == pane.agent_id());
@@ -80,10 +85,65 @@ impl TuiSessionRenderer {
             render_arena_overlay(area, state, buffer);
         }
 
+        render_status_bar(area, state, buffer);
+
         if let Some(notice) = state.runtime_notice() {
             render_runtime_notice(area, notice, buffer);
         }
     }
+}
+
+/// Glyph prepended to the focused pane's title so focus is legible without
+/// relying on border color alone (works in low-contrast themes).
+const FOCUS_MARKER: &str = "▶ ";
+/// Glyph appended to an unfocused pane that has received output the user has
+/// not yet seen.
+const UNSEEN_MARKER: &str = " ●";
+
+/// Compose a pane's title with focus and unseen-content markers.
+fn pane_chrome_title(base: &str, focused: bool, has_unseen: bool) -> String {
+    let mut title = String::new();
+    if focused {
+        title.push_str(FOCUS_MARKER);
+    }
+    title.push_str(base);
+    if !focused && has_unseen {
+        title.push_str(UNSEEN_MARKER);
+    }
+    title
+}
+
+/// Render the bottom status bar: prefix-mode indicator and focused-pane label.
+fn render_status_bar(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    let mut segments: Vec<String> = Vec::new();
+    if state.prefix_active() {
+        segments.push("PREFIX (Ctrl-g)".to_string());
+    }
+    if let Some(focus) = state.focus_position_label() {
+        segments.push(focus);
+    }
+    if segments.is_empty() {
+        return;
+    }
+
+    let line = segments.join("  |  ");
+    let style = if state.prefix_active() {
+        Style::default().fg(Color::Black).bg(Color::Yellow)
+    } else {
+        Style::default().fg(Color::White).bg(Color::DarkGray)
+    };
+    write_line(
+        buffer,
+        area.x,
+        area.y + area.height.saturating_sub(1),
+        area.width,
+        &truncate_to_width(&line, area.width),
+        style,
+    );
 }
 
 fn render_runtime_notice(area: Rect, notice: &str, buffer: &mut Buffer) {

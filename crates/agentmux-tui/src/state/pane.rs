@@ -19,6 +19,9 @@ pub struct AgentPaneState {
     pub(crate) terminal: TerminalParser,
     pub(crate) scroll_offset: usize,
     pub(crate) last_event: Option<IpcEventKind>,
+    /// Set when this pane's terminal buffer updates while it is NOT focused;
+    /// cleared when the pane gains focus. Drives the new-content attention marker.
+    pub(crate) has_unseen_output: bool,
 }
 
 impl AgentPaneState {
@@ -37,6 +40,7 @@ impl AgentPaneState {
             terminal: TerminalParser::new(size.rows, size.cols),
             scroll_offset: 0,
             last_event: Some(IpcEventKind::AgentSpawned),
+            has_unseen_output: false,
         }
     }
 
@@ -70,6 +74,12 @@ impl AgentPaneState {
 
     pub fn last_event(&self) -> Option<&IpcEventKind> {
         self.last_event.as_ref()
+    }
+
+    /// Whether this pane received output while unfocused and the user has not
+    /// yet looked at it (focused it).
+    pub fn has_unseen_output(&self) -> bool {
+        self.has_unseen_output
     }
 
     pub fn chrome_title(&self) -> String {

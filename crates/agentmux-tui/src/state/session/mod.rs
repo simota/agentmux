@@ -69,6 +69,12 @@ pub struct TuiSessionState {
     arena_selected: usize,
     daemon_protocol_version: Option<u32>,
     runtime_notice: Option<String>,
+    /// Render mirror of the keymap dispatcher's `awaiting_prefix_command` flag.
+    ///
+    /// The dispatcher remains the single source of truth; the driver refreshes
+    /// this each frame via [`TuiSessionState::set_prefix_active`] so the render
+    /// layer can surface a prefix-mode indicator.
+    prefix_active: bool,
 }
 
 impl Default for TuiSessionState {

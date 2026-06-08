@@ -388,6 +388,10 @@ pub(crate) async fn run_tui_session_inner(
                 state.provider_picker_visible(),
                 conversation_list_focused,
             );
+            // Mirror the dispatcher's prefix state into render state so the
+            // status bar can show the PREFIX indicator (single source of truth
+            // stays in the dispatcher; this just reflects it each key event).
+            state.set_prefix_active(keymap.is_awaiting_prefix_command());
             if let Some(command) = match &dispatch {
                 agentmux_tui::keymap::KeyDispatch::Command(command) => Some(*command),
                 _ => None,

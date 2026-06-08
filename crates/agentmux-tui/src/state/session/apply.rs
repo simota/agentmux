@@ -340,6 +340,7 @@ impl TuiSessionState {
         };
 
         if self.layout.focus(&agent_id) {
+            self.clear_focused_pane_unseen();
             StateChange::FocusedPane(agent_id)
         } else {
             StateChange::Ignored
@@ -385,6 +386,8 @@ impl TuiSessionState {
             return StateChange::Ignored;
         };
 
+        let is_focused = self.layout.focused() == Some(agent_id.as_str());
+
         let Some(pane) = self.panes.get_mut(&agent_id) else {
             return StateChange::Ignored;
         };
@@ -392,6 +395,9 @@ impl TuiSessionState {
         if pane.scroll_offset > 0 {
             let max_offset = pane.terminal.grid().scrollback().len();
             pane.scroll_offset = pane.scroll_offset.min(max_offset);
+        }
+        if !is_focused {
+            pane.has_unseen_output = true;
         }
         pane.last_event = Some(event.kind.clone());
         StateChange::UpdatedPane(agent_id)

@@ -382,6 +382,7 @@ impl TuiSessionState {
             return;
         };
         self.layout.focus(&agent_id);
+        self.clear_focused_pane_unseen();
         self.session_list_visible = false;
     }
 
