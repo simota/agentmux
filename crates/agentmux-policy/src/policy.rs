@@ -85,6 +85,17 @@ pub struct PolicyEngine {
     pub automation_level: AutomationLevel,
     pub policy: ApprovalPolicy,
     test_command_prefixes: Vec<String>,
+    /// Glob patterns for paths that must never be written automatically
+    /// (spec §9 `protected_paths`: `.git/**`, `.env`, `*secret*`, `.agentmux/state.db`).
+    protected_paths: Vec<String>,
+}
+
+fn default_test_command_prefixes() -> Vec<String> {
+    vec![
+        "cargo test".to_string(),
+        "npm test".to_string(),
+        "pytest".to_string(),
+    ]
 }
 
 impl PolicyEngine {
@@ -92,11 +103,8 @@ impl PolicyEngine {
         Self {
             automation_level,
             policy: ApprovalPolicy::default(),
-            test_command_prefixes: vec![
-                "cargo test".to_string(),
-                "npm test".to_string(),
-                "pytest".to_string(),
-            ],
+            test_command_prefixes: default_test_command_prefixes(),
+            protected_paths: Vec::new(),
         }
     }
 
@@ -104,11 +112,8 @@ impl PolicyEngine {
         Self {
             automation_level,
             policy,
-            test_command_prefixes: vec![
-                "cargo test".to_string(),
-                "npm test".to_string(),
-                "pytest".to_string(),
-            ],
+            test_command_prefixes: default_test_command_prefixes(),
+            protected_paths: Vec::new(),
         }
     }
 
@@ -119,6 +124,39 @@ impl PolicyEngine {
     {
         self.test_command_prefixes = prefixes.into_iter().map(Into::into).collect();
         self
+    }
+
+    pub fn with_protected_paths<I, S>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.protected_paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Returns `true` when `path` matches any configured protected glob pattern.
+    ///
+    /// Path separators are normalized to `/`, a leading `./` is stripped, and any
+    /// `..` traversal component forces a match (treated as protected) so a write
+    /// cannot escape the workspace to reach a protected file by relative climbing.
+    pub fn is_protected_path(&self, path: &str) -> bool {
+        let normalized = normalize_path(path);
+        if normalized.split('/').any(|segment| segment == "..") {
+            return true;
+        }
+        self.protected_paths
+            .iter()
+            .any(|pattern| glob_match(&normalize_path(pattern), &normalized))
+    }
+
+    /// Evaluate a proposed file write. Protected paths are denied outright;
+    /// everything else delegates to the configured `FileWrite` policy.
+    pub fn evaluate_file_write(&self, path: &str) -> PolicyDecision {
+        if self.is_protected_path(path) {
+            return PolicyDecision::Deny;
+        }
+        self.evaluate(&ApprovalKind::FileWrite)
     }
 
     /// Evaluate whether `kind` of approval action is permitted.
@@ -199,11 +237,14 @@ impl PolicyEngine {
     fn evaluate_dangerous_command(&self, command: &str) -> PolicyDecision {
         let lower = command.to_ascii_lowercase();
 
-        if command_matches_prefix(&lower, "git push") {
+        // Use the same `contains`-based detection as `dangerous_reason` so that
+        // chained or prefixed forms (`cd repo && git push`, `GIT_SSH=x git push`)
+        // route to the correct `ApprovalKind` instead of falling through to `Ask`.
+        if lower.contains("git push") {
             return self.evaluate(&ApprovalKind::GitPush);
         }
 
-        if command_matches_prefix(&lower, "git commit") {
+        if lower.contains("git commit") {
             return self.evaluate(&ApprovalKind::GitCommit);
         }
 
@@ -288,18 +329,94 @@ fn normalize_command(command: &str) -> String {
     command.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Normalize a path for matching: convert `\` separators to `/` and strip a
+/// single leading `./`. `..` components are preserved so callers can detect
+/// traversal attempts.
+fn normalize_path(path: &str) -> String {
+    let unified = path.replace('\\', "/");
+    unified.strip_prefix("./").unwrap_or(&unified).to_string()
+}
+
+/// Minimal glob matcher over `/`-separated paths supporting:
+/// - `**` — matches any number of segments (including zero),
+/// - `*` — matches any run of characters within a single segment,
+/// - exact characters otherwise.
+///
+/// Both `pattern` and `path` are expected to be `normalize_path`-ed already.
+fn glob_match(pattern: &str, path: &str) -> bool {
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    let path_segments: Vec<&str> = path.split('/').collect();
+    glob_match_segments(&pattern_segments, &path_segments)
+}
+
+fn glob_match_segments(pattern: &[&str], path: &[&str]) -> bool {
+    match pattern.split_first() {
+        None => path.is_empty(),
+        Some((&"**", rest)) => {
+            // `**` matches zero or more leading path segments.
+            (0..=path.len()).any(|skip| glob_match_segments(rest, &path[skip..]))
+        }
+        Some((seg, rest)) => match path.split_first() {
+            Some((&candidate, path_rest)) if segment_match(seg, candidate) => {
+                glob_match_segments(rest, path_rest)
+            }
+            _ => false,
+        },
+    }
+}
+
+/// Match a single path segment against a pattern segment where `*` matches any
+/// run of characters within that segment.
+fn segment_match(pattern: &str, segment: &str) -> bool {
+    let pattern_chars: Vec<char> = pattern.chars().collect();
+    let segment_chars: Vec<char> = segment.chars().collect();
+    segment_match_inner(&pattern_chars, &segment_chars)
+}
+
+fn segment_match_inner(pattern: &[char], segment: &[char]) -> bool {
+    match pattern.split_first() {
+        None => segment.is_empty(),
+        Some(('*', rest)) => {
+            (0..=segment.len()).any(|skip| segment_match_inner(rest, &segment[skip..]))
+        }
+        Some((&p, rest)) => match segment.split_first() {
+            Some((&s, seg_rest)) if p == s => segment_match_inner(rest, seg_rest),
+            _ => false,
+        },
+    }
+}
+
 fn command_matches_prefix(command: &str, prefix: &str) -> bool {
     command == prefix || command.starts_with(&format!("{prefix} "))
 }
 
 fn is_safeish_read_only(command: &str) -> bool {
+    // A command can only be Safeish if it does not chain, redirect, or substitute
+    // another command. `normalize_command` collapses whitespace but preserves these
+    // tokens, so `ls && npm install` or `cat $(cat /etc/shadow)` must be rejected
+    // before any read-only prefix is honored — otherwise the trailing command
+    // bypasses its own Caution/Dangerous gate.
+    if contains_command_chaining(command) {
+        return false;
+    }
+
     ["git status", "git diff", "ls", "pwd"]
         .iter()
         .any(|prefix| command_matches_prefix(command, prefix))
-        || command_matches_prefix(command, "cat")
-            && !contains_secret_path(command)
-            && !command.contains('>')
-            && !command.contains('|')
+        || command_matches_prefix(command, "cat") && !contains_secret_path(command)
+}
+
+/// Detect shell metacharacters that chain, redirect, or substitute a second
+/// command. Any of these means the command is not a single read-only invocation.
+fn contains_command_chaining(command: &str) -> bool {
+    command.contains("&&")
+        || command.contains("||")
+        || command.contains(';')
+        || command.contains('|')
+        || command.contains('`')
+        || command.contains("$(")
+        || command.contains('>')
+        || command.contains('<')
 }
 
 fn is_caution_command(command: &str) -> bool {
@@ -558,6 +675,134 @@ mod tests {
             engine.evaluate_command("git push origin main"),
             PolicyDecision::Deny
         );
+    }
+
+    #[test]
+    fn chained_or_prefixed_git_push_commit_route_to_correct_approval_kind() {
+        // Default policy: git push = Deny, git commit = Ask. Chained/prefixed forms
+        // are classified Dangerous and must route via the same `contains` logic as
+        // `dangerous_reason`, not fall through to a generic `Ask`.
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+
+        assert_eq!(
+            engine.evaluate_command("cd /tmp && git push"),
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            engine.evaluate_command("GIT_SSH=x git push"),
+            PolicyDecision::Deny
+        );
+        assert_eq!(
+            engine.evaluate_command("make build && git commit -m x"),
+            PolicyDecision::Ask
+        );
+    }
+
+    #[test]
+    fn chained_safeish_prefix_is_downgraded_to_caution() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+
+        // A read-only prefix followed by a chained command must not be Safeish,
+        // otherwise the second command bypasses its own gate.
+        assert_eq!(
+            engine.classify_command("ls && npm install").safety,
+            CommandSafety::Caution
+        );
+        assert_eq!(
+            engine
+                .classify_command("git status && prettier --write .")
+                .safety,
+            CommandSafety::Caution
+        );
+    }
+
+    #[test]
+    fn plain_read_only_commands_remain_safeish() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+
+        for command in ["ls", "ls -la", "git diff", "git diff --stat", "pwd"] {
+            assert_eq!(
+                engine.classify_command(command).safety,
+                CommandSafety::Safeish,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn cat_with_command_substitution_is_not_safeish() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+
+        // `$(...)` substitution can read a protected file even without a literal
+        // secret keyword or redirect, so it must not be classified Safeish.
+        assert_ne!(
+            engine.classify_command("cat $(cat /etc/passwd)").safety,
+            CommandSafety::Safeish
+        );
+    }
+
+    #[test]
+    fn protected_path_glob_matcher_covers_documented_patterns() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt).with_protected_paths([
+            ".git/**",
+            ".env",
+            "*secret*",
+            ".agentmux/state.db",
+        ]);
+
+        // Matches.
+        assert!(engine.is_protected_path(".git/config"));
+        assert!(engine.is_protected_path(".git/hooks/pre-commit"));
+        assert!(engine.is_protected_path(".env"));
+        assert!(engine.is_protected_path("./.env"));
+        assert!(engine.is_protected_path("my-secret-file"));
+        assert!(engine.is_protected_path("app.secrets.json"));
+        assert!(engine.is_protected_path(".agentmux/state.db"));
+        // Backslash separators are normalized.
+        assert!(engine.is_protected_path(".git\\config"));
+        // `..` traversal is always treated as protected.
+        assert!(engine.is_protected_path("../outside/.config"));
+
+        // Non-matches.
+        assert!(!engine.is_protected_path("src/main.rs"));
+        assert!(!engine.is_protected_path("README.md"));
+        assert!(!engine.is_protected_path(".gitignore")); // `.git` segment, not `.git/**`
+        assert!(!engine.is_protected_path(".agentmux/config.toml"));
+    }
+
+    #[test]
+    fn empty_protected_paths_match_nothing() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+        assert!(!engine.is_protected_path(".env"));
+        assert!(!engine.is_protected_path(".git/config"));
+    }
+
+    #[test]
+    fn evaluate_file_write_denies_protected_and_delegates_otherwise() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoWorkspaceWrite)
+            .with_protected_paths([".git/**", ".env", "*secret*", ".agentmux/state.db"]);
+
+        assert_eq!(
+            engine.evaluate_file_write(".git/config"),
+            PolicyDecision::Deny
+        );
+        assert_eq!(engine.evaluate_file_write(".env"), PolicyDecision::Deny);
+
+        // Non-protected path delegates to FileWrite policy; AutoWorkspaceWrite
+        // auto-allows FileWrite.
+        assert_eq!(
+            engine.evaluate_file_write("src/main.rs"),
+            PolicyDecision::Allow
+        );
+
+        // At a lower automation level, FileWrite defaults to Ask.
+        let observe = PolicyEngine::new(AutomationLevel::AutoPrompt)
+            .with_protected_paths([".env".to_string()]);
+        assert_eq!(
+            observe.evaluate_file_write("src/main.rs"),
+            PolicyDecision::Ask
+        );
+        assert_eq!(observe.evaluate_file_write(".env"), PolicyDecision::Deny);
     }
 
     #[test]

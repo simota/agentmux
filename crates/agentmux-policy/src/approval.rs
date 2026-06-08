@@ -209,10 +209,14 @@ fn policy_denied_event(request: ApprovalRequest) -> ApprovalEvent {
 
 fn approval_kind_for_command(command: &str) -> ApprovalKind {
     let lower = command.to_ascii_lowercase();
-    let head: Vec<&str> = lower.split_whitespace().take(2).collect();
-    if head == ["git", "push"] {
+    // Detect git push/commit with the same `contains` logic the policy engine
+    // uses (`evaluate_dangerous_command`), so chained or prefixed forms
+    // (`cd repo && git push`) are labeled correctly in the audit log / approval
+    // UI instead of collapsing to a generic `ShellCommand`. Push/commit are
+    // checked before curl/secret to keep ordering consistent with the engine.
+    if lower.contains("git push") {
         ApprovalKind::GitPush
-    } else if head == ["git", "commit"] {
+    } else if lower.contains("git commit") {
         ApprovalKind::GitCommit
     } else if lower.contains("curl ") || lower.contains("wget ") {
         ApprovalKind::NetworkAccess
@@ -304,6 +308,44 @@ mod tests {
             ApprovalGate::Allowed
         );
         assert!(queue.pending().is_empty());
+    }
+
+    #[test]
+    fn approval_kind_for_chained_git_push_commit_is_correct() {
+        // Chained / env-prefixed forms must be labeled GitPush / GitCommit (not a
+        // generic ShellCommand) so the audit log and approval UI match the policy
+        // engine's classification.
+        assert_eq!(
+            approval_kind_for_command("cd repo && git push"),
+            ApprovalKind::GitPush
+        );
+        assert_eq!(
+            approval_kind_for_command("GIT_SSH=x git push origin main"),
+            ApprovalKind::GitPush
+        );
+        assert_eq!(
+            approval_kind_for_command("make build && git commit -m x"),
+            ApprovalKind::GitCommit
+        );
+        // Plain forms still resolve correctly.
+        assert_eq!(
+            approval_kind_for_command("git push origin main"),
+            ApprovalKind::GitPush
+        );
+    }
+
+    #[test]
+    fn chained_git_push_is_denied_and_labeled_git_push() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt);
+        let mut queue = ApprovalQueue::new();
+
+        let gate = queue.gate_command(&engine, "cd repo && git push");
+
+        let ApprovalGate::Denied(ApprovalEvent::PolicyDenied { kind, .. }) = gate else {
+            panic!("expected chained git push to be denied as GitPush");
+        };
+        assert_eq!(kind, ApprovalKind::GitPush);
+        assert_eq!(queue.pending().len(), 0);
     }
 
     #[test]
