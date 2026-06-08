@@ -26,10 +26,10 @@ pub(crate) use agentmux_core::config::{
     DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS, DEFAULT_RESULT_DETECTION_TAIL_BYTES,
 };
 pub(crate) use agentmux_core::{
-    AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ApprovalId, ClientId,
-    ClientSessionId, ContextItemId, ContextKind, ContextScope, ContextSource, DateTimeUtc,
-    DeliveryMode, DeliveryStatus, InputScriptId, MessageId, Priority, ProjectId, TaskId, ThreadId,
-    Visibility, WorktreeId, WorktreeStatus, error::Result,
+    AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ApprovalId,
+    AutomationLevel, ClientId, ClientSessionId, ContextItemId, ContextKind, ContextScope,
+    ContextSource, DateTimeUtc, DeliveryMode, DeliveryStatus, InputScriptId, MessageId, Priority,
+    ProjectId, TaskId, ThreadId, Visibility, WorktreeId, WorktreeStatus, error::Result,
 };
 pub(crate) use agentmux_ipc::{
     ClientHello, ClientRequest, DaemonEvent, DaemonResponse, ErrorBody, EventSubscribeFilter,
@@ -40,7 +40,9 @@ pub(crate) use agentmux_message::{
     MessageTarget, MessageThread, NewAgentMessage, NewMessageThread, PreparedInjection,
     PromptContext, PromptContextItem,
 };
-pub(crate) use agentmux_policy::{ApprovalEvent, ApprovalQueue, ApprovalQueueError, ApprovalRequest};
+pub(crate) use agentmux_policy::{
+    ApprovalEvent, ApprovalQueue, ApprovalQueueError, ApprovalRequest, PolicyDecision, PolicyEngine,
+};
 pub(crate) use agentmux_pty::{CTRL_C, PtyHandle, PtyReadEvent, PtySpawnSpec};
 pub(crate) use agentmux_store::{EventLog, EventLogEntry};
 pub(crate) use agentmux_terminal::TerminalParser;
@@ -84,7 +86,7 @@ pub(crate) use server::*;
 pub(crate) use state::*;
 pub(crate) use worktree::*;
 
-pub use config::{DaemonConfig, RegisteredAgentSession};
+pub use config::{DaemonConfig, RegisteredAgentSession, policy_engine_from_config};
 pub use runtime::DaemonRuntime;
 pub use server::{handle_client, serve, serve_until_shutdown};
 pub use state::OpenMeetingInput;

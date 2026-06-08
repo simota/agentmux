@@ -703,3 +703,84 @@ use super::*;
 
         server.abort();
     }
+
+    #[tokio::test]
+    async fn ipc_worktree_test_rejects_policy_denied_command() {
+        // #14: a command the policy engine denies (default policy denies
+        // `git push`) must be rejected before it can reach `/bin/sh -c`. The
+        // gate fires after worktree-id parsing but before the worktree lookup,
+        // so a well-formed (non-existent) worktree id is enough to exercise it.
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_test",
+                IpcCommand::WorktreeTest,
+                json!({
+                    "worktree_id": WorktreeId::new().to_string(),
+                    "name": "smoke",
+                    "command": "git push origin main",
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!response.ok);
+        let error = response.error.unwrap();
+        assert_eq!(error.code, "WORKTREE_TEST_DENIED");
+        assert!(
+            error.message.contains("git push"),
+            "denial message names the rejected command: {}",
+            error.message
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ipc_worktree_test_allows_non_denied_command() {
+        // A command the policy engine does not deny (the default `printf` is
+        // classified `Ask`, not `Deny`) must pass the gate and fail later only
+        // on the missing worktree — confirming the gate does not over-reject.
+        let runtime = DaemonRuntime::new(16);
+        let (client_stream, server_stream) = UnixStream::pair().unwrap();
+        let server_runtime = runtime.clone();
+        let server =
+            tokio::spawn(async move { handle_client(server_stream, server_runtime).await });
+
+        let (reader, writer) = client_stream.into_split();
+        let mut reader = JsonlReader::new(BufReader::new(reader));
+        let mut writer = JsonlWriter::new(writer);
+
+        writer.write(&ClientHello::new("0.1.0")).await.unwrap();
+        writer
+            .write(&ClientRequest::new(
+                "req_worktree_test",
+                IpcCommand::WorktreeTest,
+                json!({
+                    "worktree_id": WorktreeId::new().to_string(),
+                    "name": "smoke",
+                    "command": "printf test-ok",
+                }),
+            ))
+            .await
+            .unwrap();
+
+        let response: DaemonResponse = reader.read().await.unwrap().unwrap();
+        assert!(!response.ok);
+        // Not denied by policy: the request proceeds past the gate and fails on
+        // the unknown worktree instead.
+        assert_ne!(response.error.unwrap().code, "WORKTREE_TEST_DENIED");
+
+        server.abort();
+    }

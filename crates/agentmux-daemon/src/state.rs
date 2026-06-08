@@ -83,6 +83,12 @@ pub(crate) struct DaemonState {
     pub(crate) layout_presets: BTreeMap<String, serde_json::Value>,
     pub(crate) default_project_id: ProjectId,
     pub(crate) injection_timing: InjectionTiming,
+    /// Policy engine derived from `[policy]` + `[automation]` config. Gates
+    /// command execution (`WorktreeTest`) and file writes against the configured
+    /// automation level and `protected_paths`. The `Default` impl reproduces the
+    /// spec defaults (`AutoPrompt` + `ApprovalPolicy::default()`); real config
+    /// overrides it via `DaemonRuntime::with_policy_engine`.
+    pub(crate) policy: PolicyEngine,
 }
 
 impl Default for DaemonState {
@@ -107,6 +113,10 @@ impl Default for DaemonState {
             layout_presets: BTreeMap::new(),
             default_project_id: ProjectId::new(),
             injection_timing,
+            policy: PolicyEngine::with_policy(
+                AutomationLevel::AutoPrompt,
+                agentmux_policy::ApprovalPolicy::default(),
+            ),
         }
     }
 }

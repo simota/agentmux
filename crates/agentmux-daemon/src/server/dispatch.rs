@@ -725,6 +725,18 @@ pub(crate) async fn handle_request(
                 }
             };
             let command = worktree_test_command_payload(&request.payload);
+            // #14: gate the test command (passed to `/bin/sh -c` in
+            // agentmux-worktree git.rs) through the policy engine and reject a
+            // `Deny` decision before it can reach the shell.
+            if runtime.command_is_denied(&command.command).await {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new(
+                        "WORKTREE_TEST_DENIED",
+                        format!("test command denied by policy: {}", command.command),
+                    ),
+                );
+            }
             match runtime.run_worktree_test(&worktree_id, command).await {
                 Ok(payload) => DaemonResponse::ok(request.id, payload),
                 Err(error) => DaemonResponse::error(

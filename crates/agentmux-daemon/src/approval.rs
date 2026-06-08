@@ -1,6 +1,10 @@
 use crate::*;
 
 impl DaemonRuntime {
+    // NOTE: worktree-adoption approvals always enqueue (PolicyDecision::Ask) —
+    // promotion is a human-gated merge, never auto-approved. Command gating for
+    // WorktreeTest goes through `command_is_denied` (PolicyEngine) in dispatch;
+    // file-write gating is staged in `file_write_is_denied` (see #2 there).
     pub async fn submit_approval_request(&self, request: ApprovalRequest) -> ApprovalRequest {
         let mut state = self.state.write().await;
         let gate = state
@@ -44,6 +48,31 @@ impl DaemonRuntime {
             }),
         ));
         Ok(request)
+    }
+
+    /// Evaluate a shell command against the configured policy engine. Returns
+    /// `true` when the decision is `Deny` (the only outcome that aborts before
+    /// the command can run); `Allow`/`Ask`/`AllowIfMatchesRules` all return
+    /// `false` so the existing run/approval flow is preserved.
+    pub(crate) async fn command_is_denied(&self, command: &str) -> bool {
+        let state = self.state.read().await;
+        state.policy.evaluate_command(command) == PolicyDecision::Deny
+    }
+
+    /// Evaluate a proposed workspace file write against the configured policy
+    /// engine. Returns `true` when the decision is `Deny` (protected path or a
+    /// `Deny` workspace-write policy).
+    ///
+    /// NOTE: there is no caller yet — the daemon has no FileWrite dispatch path
+    /// (no IPC command or approval flow writes workspace files through the
+    /// daemon today; agents write directly inside their own PTYs/worktrees).
+    /// This connects `PolicyEngine::evaluate_file_write` so #2 is wired the
+    /// moment such a path is added; until then it intentionally has no call
+    /// site. The `#[allow(dead_code)]` keeps the build clean without a TODO.
+    #[allow(dead_code)]
+    pub(crate) async fn file_write_is_denied(&self, path: &str) -> bool {
+        let state = self.state.read().await;
+        state.policy.evaluate_file_write(path) == PolicyDecision::Deny
     }
 
     pub async fn list_approvals(&self) -> Vec<ApprovalRequest> {

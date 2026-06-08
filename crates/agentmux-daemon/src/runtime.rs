@@ -28,6 +28,15 @@ impl DaemonRuntime {
         self
     }
 
+    /// Install the policy engine derived from project config (`[policy]` +
+    /// `[automation]`) so command execution and file writes are gated against
+    /// the configured automation level and `protected_paths`. Without this the
+    /// daemon uses the spec-default engine (`AutoPrompt` + `ApprovalPolicy::default`).
+    pub async fn with_policy_engine(self, policy: PolicyEngine) -> Self {
+        self.state.write().await.policy = policy;
+        self
+    }
+
     pub async fn recover_state_from_event_log(&self) -> Result<usize> {
         let Some(event_log) = &self.event_log else {
             return Ok(0);
