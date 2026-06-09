@@ -272,13 +272,25 @@ pub(crate) async fn run_tui_session_inner(
     }
     draw_tui_frame(&mut terminal, &renderer, &state)?;
 
+    // Cap how many PTY output frames are drained before the loop yields to the
+    // keyboard poll below. Without this bound, an agent that streams output
+    // continuously (e.g. agy while it is running) keeps `frame_rx` non-empty, so
+    // an unbounded drain loop never falls through to `poll_event` and human keys
+    // (Esc and every other key) are starved for as long as the agent keeps
+    // producing output. Draining a bounded batch and coalescing the redraw into a
+    // single call per iteration keeps input responsive under heavy output.
+    const MAX_FRAMES_PER_TICK: usize = 64;
     loop {
-        while let Ok(frame) = frame_rx.try_recv() {
+        let mut pending_redraw = false;
+        for _ in 0..MAX_FRAMES_PER_TICK {
             // Stream-level errors (daemon closed / read failure) stay fatal via `?`.
             // A per-request response error during the session — e.g. a keystroke
             // forwarded to an agent with no live PTY — must NOT tear down the
             // cockpit; surface it as a notice and keep running.
-            let frame = frame?;
+            let frame = match frame_rx.try_recv() {
+                Ok(frame) => frame?,
+                Err(_) => break,
+            };
             let spawned_agent_id = spawned_agent_id_from_frame(&frame);
             let _notice = apply_runtime_stream_frame(&mut state, frame);
             if let Some(agent_id) = spawned_agent_id {
@@ -287,6 +299,9 @@ pub(crate) async fn run_tui_session_inner(
                 writer.write(&attach_request(agent_id.clone())).await?;
                 writer.write(&snapshot_request(agent_id)).await?;
             }
+            pending_redraw = true;
+        }
+        if pending_redraw {
             draw_tui_frame(&mut terminal, &renderer, &state)?;
         }
 
