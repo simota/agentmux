@@ -212,13 +212,22 @@ pub(crate) fn parse_message_target(raw: &str) -> Result<MessageTarget> {
     Ok(MessageTarget::AgentName(raw.to_string()))
 }
 
+/// Parse a free-form role label into an `AgentRole`.
+///
+/// Known labels (matched case-insensitively, with `-`/space treated like `_`)
+/// map to their enum variant — this is the inverse of `agent_role_label`. Any
+/// other non-empty input becomes `AgentRole::Custom` holding the *trimmed raw*
+/// string (not the normalized form) so that a custom role round-trips through
+/// `agent_role_label` unchanged and `role:<label>` bus targets resolve to the
+/// same session that was assigned the label. An empty label is a user error.
 pub(crate) fn parse_agent_role(raw: &str) -> Result<AgentRole> {
-    let normalized = raw.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-    if normalized.is_empty() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return Err(AgentmuxError::UserError(
             "agent role must not be empty".to_string(),
         ));
     }
+    let normalized = trimmed.to_ascii_lowercase().replace(['-', ' '], "_");
     let role = match normalized.as_str() {
         "planner" => AgentRole::Planner,
         "implementer" | "impl" => AgentRole::Implementer,
@@ -230,7 +239,7 @@ pub(crate) fn parse_agent_role(raw: &str) -> Result<AgentRole> {
         "docs_writer" | "docs" | "docswriter" => AgentRole::DocsWriter,
         "integrator" => AgentRole::Integrator,
         "context_manager" | "context" => AgentRole::ContextManager,
-        _ => AgentRole::Custom(normalized),
+        _ => AgentRole::Custom(trimmed.to_string()),
     };
     Ok(role)
 }
@@ -409,5 +418,44 @@ pub(crate) fn provider_command(provider: &str) -> String {
         "codex" => "codex".to_string(),
         "agy" => "agy".to_string(),
         custom => custom.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_agent_role_maps_known_labels_to_variants() {
+        assert_eq!(parse_agent_role("reviewer").unwrap(), AgentRole::Reviewer);
+        assert_eq!(parse_agent_role("Tester").unwrap(), AgentRole::Tester);
+        assert_eq!(
+            parse_agent_role("security-reviewer").unwrap(),
+            AgentRole::SecurityReviewer
+        );
+        // The inverse of agent_role_label round-trips for a known variant.
+        assert_eq!(
+            parse_agent_role(&agent_role_label(&AgentRole::DocsWriter)).unwrap(),
+            AgentRole::DocsWriter
+        );
+    }
+
+    #[test]
+    fn parse_agent_role_keeps_custom_label_verbatim_and_round_trips() {
+        let role = parse_agent_role("qa-lead").unwrap();
+        assert_eq!(role, AgentRole::Custom("qa-lead".to_string()));
+        // A custom role survives a label/parse round-trip unchanged so that a
+        // `role:qa-lead` bus target resolves to the assigned session.
+        assert_eq!(parse_agent_role(&agent_role_label(&role)).unwrap(), role);
+    }
+
+    #[test]
+    fn parse_agent_role_rejects_empty_label() {
+        assert!(parse_agent_role("   ").is_err());
+    }
+
+    #[test]
+    fn default_agent_role_label_is_default() {
+        assert_eq!(agent_role_label(&default_agent_role()), "default");
     }
 }

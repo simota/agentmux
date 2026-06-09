@@ -269,6 +269,29 @@ pub(crate) fn agent_interrupt_request(agent_id: String) -> ClientRequest {
     )
 }
 
+/// Build an `agent.set_role` request that reassigns the role of a live
+/// session. The role string is forwarded verbatim; the daemon parses it
+/// (known label -> enum variant, anything else -> custom role) and rejects an
+/// empty role. The TUI Commands panel builds the same request with the focused
+/// pane's `agent_id` and the operator-entered role.
+pub(crate) fn agent_set_role_request(agent_id: String, role: String) -> Result<ClientRequest> {
+    if agent_id.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "agent_id must not be empty".to_string(),
+        ));
+    }
+    if role.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "agent role must not be empty".to_string(),
+        ));
+    }
+    Ok(ClientRequest::new(
+        "req_agent_set_role",
+        IpcCommand::AgentSetRole,
+        json!({ "agent_id": agent_id, "role": role }),
+    ))
+}
+
 pub(crate) fn agent_resize_request(id: String, agent_id: String, size: TuiTerminalSize) -> ClientRequest {
     ClientRequest::new(
         id,

@@ -251,3 +251,19 @@ use super::*;
         assert_eq!(request.command, IpcCommand::ClientDetach);
         assert_eq!(request.payload, json!({}));
     }
+
+    #[test]
+    fn agent_set_role_request_carries_agent_id_and_role() {
+        let request =
+            agent_set_role_request("agent_001".to_string(), "qa-lead".to_string()).unwrap();
+
+        assert_eq!(request.command, IpcCommand::AgentSetRole);
+        assert_eq!(request.payload["agent_id"], "agent_001");
+        assert_eq!(request.payload["role"], "qa-lead");
+    }
+
+    #[test]
+    fn agent_set_role_request_rejects_empty_inputs() {
+        assert!(agent_set_role_request("  ".to_string(), "reviewer".to_string()).is_err());
+        assert!(agent_set_role_request("agent_001".to_string(), "  ".to_string()).is_err());
+    }

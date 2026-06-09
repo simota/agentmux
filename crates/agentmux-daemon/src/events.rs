@@ -118,6 +118,7 @@ pub(crate) fn event_kind_label(kind: &IpcEventKind) -> &'static str {
         IpcEventKind::AgentSpawned => "agent.spawned",
         IpcEventKind::AgentStatusSignal => "agent.status_signal",
         IpcEventKind::AgentStatusChanged => "agent.status_changed",
+        IpcEventKind::AgentRoleChanged => "agent.role_changed",
         IpcEventKind::AgentExited => "agent.exited",
         IpcEventKind::PtyOutputChunk => "pty.output_chunk",
         IpcEventKind::ScreenDiff => "screen.diff",

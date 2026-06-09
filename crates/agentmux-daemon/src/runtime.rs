@@ -91,7 +91,7 @@ impl DaemonRuntime {
                 .and_then(|role| role.as_str())
                 .map(parse_agent_role)
                 .transpose()?
-                .unwrap_or_else(|| inferred_agent_role(&name));
+                .unwrap_or_else(default_agent_role);
             recovered_message_agents
                 .push(AgentDescriptor::new(id.clone(), role.clone()).with_name(name.clone()));
             recovered.insert(

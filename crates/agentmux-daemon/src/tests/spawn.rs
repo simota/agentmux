@@ -297,6 +297,88 @@ use super::*;
     }
 
     #[tokio::test]
+    async fn register_agent_without_explicit_role_starts_at_default_role() {
+        // Sessions no longer infer a role from their name; an operator assigns a
+        // meaningful role at runtime via `agent.set_role`.
+        let runtime = DaemonRuntime::new(8);
+        let tester = runtime.register_agent("tester".to_string()).await;
+        let planner = runtime.register_agent("planner".to_string()).await;
+
+        let status = runtime.status_payload().await;
+        let roles: BTreeSet<&str> = status["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|agent| agent["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, BTreeSet::from(["default"]));
+        assert_eq!(tester.role, AgentRole::Custom("default".to_string()));
+        assert_eq!(planner.role, AgentRole::Custom("default".to_string()));
+    }
+
+    #[tokio::test]
+    async fn set_agent_role_updates_metadata_bus_routing_and_publishes_event() {
+        let runtime = DaemonRuntime::new(8);
+        let agent = runtime.register_agent("agy-worker".to_string()).await;
+        let mut events = runtime.subscribe();
+
+        // A known label maps to its enum variant and reroutes the role target.
+        let updated = runtime
+            .set_agent_role(&agent.id, AgentRole::Reviewer)
+            .await
+            .expect("role is updated");
+        assert_eq!(updated.role, AgentRole::Reviewer);
+
+        let event = events.recv().await.expect("role change event is published");
+        assert_eq!(event.kind, IpcEventKind::AgentRoleChanged);
+        assert_eq!(event.payload["agent_id"], agent.id.to_string());
+        assert_eq!(event.payload["role"], "reviewer");
+
+        {
+            let state = runtime.state.read().await;
+            assert_eq!(
+                state
+                    .messages
+                    .resolve_target(&MessageTarget::Role(AgentRole::Reviewer))
+                    .unwrap(),
+                vec![agent.id.clone()]
+            );
+            assert!(
+                state
+                    .messages
+                    .resolve_target(&MessageTarget::Role(AgentRole::Custom(
+                        "default".to_string()
+                    )))
+                    .is_err(),
+                "the previous default role no longer resolves to the session"
+            );
+            assert_eq!(state.agents[&agent.id].metadata.role, AgentRole::Reviewer);
+        }
+    }
+
+    #[tokio::test]
+    async fn set_agent_role_accepts_custom_label_and_rejects_unknown_agent() {
+        let runtime = DaemonRuntime::new(8);
+        let agent = runtime.register_agent("agy-worker".to_string()).await;
+
+        // Any non-standard label becomes a custom role verbatim.
+        let updated = runtime
+            .set_agent_role(&agent.id, AgentRole::Custom("qa-lead".to_string()))
+            .await
+            .expect("custom role is accepted");
+        assert_eq!(updated.role, AgentRole::Custom("qa-lead".to_string()));
+
+        // An unknown agent id is a user error.
+        let missing = AgentSessionId::new();
+        assert!(
+            runtime
+                .set_agent_role(&missing, AgentRole::Reviewer)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn task_run_shell_stub_completes_standard_workflow() {
         let root = std::env::temp_dir().join(format!("agentmux-daemon-task-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&root).expect("temporary root is created");

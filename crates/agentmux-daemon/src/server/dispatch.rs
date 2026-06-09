@@ -115,7 +115,7 @@ pub(crate) async fn handle_request(
                 .transpose()
             {
                 Ok(Some(role)) => role,
-                Ok(None) => inferred_agent_role(&name),
+                Ok(None) => default_agent_role(),
                 Err(error) => {
                     return DaemonResponse::error(
                         request.id,
@@ -416,6 +416,53 @@ pub(crate) async fn handle_request(
                 Err(error) => DaemonResponse::error(
                     request.id,
                     ErrorBody::new("BROADCAST_INPUT_FAILED", error.to_string()),
+                ),
+            }
+        }
+        IpcCommand::AgentSetRole => {
+            let agent_id = match agent_id_payload(&request.payload, "agent.set_role") {
+                Ok(id) => id,
+                Err(error) => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ID", error.to_string()),
+                    );
+                }
+            };
+            let role = match request
+                .payload
+                .get("role")
+                .and_then(|value| value.as_str())
+            {
+                Some(raw) => match parse_agent_role(raw) {
+                    Ok(role) => role,
+                    Err(error) => {
+                        return DaemonResponse::error(
+                            request.id,
+                            ErrorBody::new("INVALID_AGENT_ROLE", error.to_string()),
+                        );
+                    }
+                },
+                None => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new("INVALID_AGENT_ROLE", "agent.set_role requires role")
+                            .with_hint("e.g. reviewer / tester / qa-lead"),
+                    );
+                }
+            };
+            match runtime.set_agent_role(&agent_id, role).await {
+                Ok(agent) => DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "agent_id": agent.id.to_string(),
+                        "role": agent_role_label(&agent.role),
+                    }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("AGENT_SET_ROLE_FAILED", error.to_string())
+                        .with_hint("check live sessions with `agentmux sessions`"),
                 ),
             }
         }

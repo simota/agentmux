@@ -318,9 +318,24 @@ impl DaemonRuntime {
         let completed = result.status == AgentResultStatus::Completed;
         let task_id = TaskId::new();
         let team = default_claude_codex_team();
+        // Resolve the emitting session's role from live state rather than
+        // guessing it from the name. Sessions start at the default role and
+        // are reassigned at runtime via `agent.set_role`; the routing identity
+        // must reflect that current role, not a name heuristic.
+        let role = match agent_id {
+            Some(agent_id) => self
+                .state
+                .read()
+                .await
+                .agents
+                .get(agent_id)
+                .map(|session| session.metadata.role.clone())
+                .unwrap_or_else(default_agent_role),
+            None => default_agent_role(),
+        };
         let agent = AgentRouteIdentity {
             name: agent_name.to_string(),
-            role: inferred_agent_role(agent_name),
+            role,
         };
         let messages = self
             .persist_agent_result_messages(&agent, task_id, &team, result)

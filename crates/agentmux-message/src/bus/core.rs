@@ -1,8 +1,8 @@
 use std::collections::BTreeMap;
 
 use agentmux_core::{
-    AgentProvider, AgentSessionId, AgentStatus, AgentmuxError, ContextItemId, DateTimeUtc,
-    DeliveryMode, DeliveryStatus, MessageId, ThreadId, error::Result,
+    AgentProvider, AgentRole, AgentSessionId, AgentStatus, AgentmuxError, ContextItemId,
+    DateTimeUtc, DeliveryMode, DeliveryStatus, MessageId, ThreadId, error::Result,
 };
 
 use super::render::{render_prompt, target_label};
@@ -43,6 +43,22 @@ impl MessageBus {
         // Role/Task/Team/AgentName/Agent targets.
         self.agents.insert(agent_id.clone(), agent);
         self.backfill_inbox_for_registered_agent(&agent_id);
+    }
+
+    /// Update the role of an already-registered agent so that subsequent
+    /// `resolve_target(Role(..))` lookups route to (or away from) this session.
+    ///
+    /// Returns `true` when the agent was registered (and its role updated),
+    /// `false` when no descriptor exists for `agent_id`. Backfill is re-run
+    /// because a freshly assigned role can make this session a recipient of
+    /// previously stored, still-pending role-targeted messages.
+    pub fn set_agent_role(&mut self, agent_id: &AgentSessionId, role: AgentRole) -> bool {
+        let Some(descriptor) = self.agents.get_mut(agent_id) else {
+            return false;
+        };
+        descriptor.role = role;
+        self.backfill_inbox_for_registered_agent(agent_id);
+        true
     }
 
     /// Remove an agent from the bus when its session stops.

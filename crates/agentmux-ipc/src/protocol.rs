@@ -241,6 +241,8 @@ pub enum IpcCommand {
     AgentSendInputScript,
     #[serde(rename = "agent.broadcast_input")]
     AgentBroadcastInput,
+    #[serde(rename = "agent.set_role")]
+    AgentSetRole,
     #[serde(rename = "agent.snapshot")]
     AgentSnapshot,
     #[serde(rename = "meeting.open")]
@@ -307,6 +309,8 @@ pub enum IpcEventKind {
     AgentStatusSignal,
     #[serde(rename = "agent.status_changed")]
     AgentStatusChanged,
+    #[serde(rename = "agent.role_changed")]
+    AgentRoleChanged,
     #[serde(rename = "agent.exited")]
     AgentExited,
     #[serde(rename = "pty.output_chunk")]
@@ -523,6 +527,43 @@ mod tests {
             decoded.protocol_compatibility(),
             ProtocolCompatibility::Compatible
         );
+    }
+
+    #[test]
+    fn agent_set_role_command_round_trips_payload() {
+        // The set-role wire shape: an agent_id plus a free-form role label.
+        // The daemon parses the label (known label -> variant, otherwise custom)
+        // and replies with the resolved label.
+        let request = ClientRequest::new(
+            "req_agent_set_role",
+            IpcCommand::AgentSetRole,
+            json!({ "agent_id": "agent_001", "role": "reviewer" }),
+        );
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["type"], "agent.set_role");
+        assert_eq!(encoded["payload"]["agent_id"], "agent_001");
+        assert_eq!(encoded["payload"]["role"], "reviewer");
+
+        let decoded: ClientRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.command, IpcCommand::AgentSetRole);
+        assert_eq!(
+            decoded.protocol_compatibility(),
+            ProtocolCompatibility::Compatible
+        );
+    }
+
+    #[test]
+    fn agent_role_changed_event_serializes_spec_shape() {
+        let event = DaemonEvent::new(
+            IpcEventKind::AgentRoleChanged,
+            json!({ "agent_id": "agent_001", "role": "qa-lead" }),
+        );
+
+        let encoded = serde_json::to_value(&event).unwrap();
+        assert_eq!(encoded["type"], "agent.role_changed");
+        assert_eq!(encoded["payload"]["agent_id"], "agent_001");
+        assert_eq!(encoded["payload"]["role"], "qa-lead");
     }
 
     #[test]

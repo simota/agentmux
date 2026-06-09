@@ -94,7 +94,10 @@ use super::*;
         let spawn_response = read_response(&mut reader).await;
         assert!(spawn_response.ok);
         let spawn_payload = spawn_response.payload.unwrap();
-        assert_eq!(spawn_payload["role"], "implementer");
+        // No explicit role was requested, so the session starts at the default
+        // role rather than inferring one from the "impl-codex" name. Runtime
+        // role assignment happens later via `agent.set_role`.
+        assert_eq!(spawn_payload["role"], "default");
         let agent_id = spawn_payload["agent_id"].as_str().unwrap().to_string();
         assert_no_frame(&mut reader).await;
 

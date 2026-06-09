@@ -223,6 +223,12 @@ async fn main() -> Result<()> {
                     send_daemon_request(&socket_path, agent_interrupt_request(agent_id)).await?;
                 print_response("agent", response)?;
             }
+            AgentAction::SetRole { agent_id, role } => {
+                let response =
+                    send_daemon_request(&socket_path, agent_set_role_request(agent_id, role)?)
+                        .await?;
+                print_response("agent", response)?;
+            }
         },
         Commands::Sessions(_) => {
             let response = send_daemon_request(&socket_path, sessions_list_request()).await?;

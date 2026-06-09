@@ -695,3 +695,42 @@
         );
         assert!(bus.create_message(unresolved).is_err());
     }
+
+    #[test]
+    fn set_agent_role_reroutes_role_target_to_new_role() {
+        let mut bus = MessageBus::new();
+        let agent_id = AgentSessionId::new();
+        bus.register_agent(AgentDescriptor::new(agent_id.clone(), AgentRole::Implementer));
+
+        // Before the change, only the implementer role resolves to this session.
+        assert_eq!(
+            bus.resolve_target(&MessageTarget::Role(AgentRole::Implementer))
+                .unwrap(),
+            vec![agent_id.clone()]
+        );
+        assert!(
+            bus.resolve_target(&MessageTarget::Role(AgentRole::Reviewer))
+                .is_err()
+        );
+
+        assert!(bus.set_agent_role(&agent_id, AgentRole::Reviewer));
+
+        // After the change the reviewer role resolves and the old role no longer
+        // does.
+        assert_eq!(
+            bus.resolve_target(&MessageTarget::Role(AgentRole::Reviewer))
+                .unwrap(),
+            vec![agent_id.clone()]
+        );
+        assert!(
+            bus.resolve_target(&MessageTarget::Role(AgentRole::Implementer))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn set_agent_role_returns_false_for_unknown_agent() {
+        let mut bus = MessageBus::new();
+        let unknown = AgentSessionId::new();
+        assert!(!bus.set_agent_role(&unknown, AgentRole::Reviewer));
+    }

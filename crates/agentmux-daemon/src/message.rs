@@ -689,29 +689,12 @@ pub(crate) fn provider_for_agent_name(name: &str) -> AgentProvider {
     }
 }
 
-pub(crate) fn inferred_agent_role(name: &str) -> AgentRole {
-    let normalized = name.trim().to_ascii_lowercase().replace(['-', ' '], "_");
-    if normalized.contains("planner") {
-        AgentRole::Planner
-    } else if normalized.contains("tester") || normalized.contains("qa") {
-        AgentRole::Tester
-    } else if normalized.contains("reviewer") {
-        AgentRole::Reviewer
-    } else if normalized.contains("debugger") {
-        AgentRole::Debugger
-    } else if normalized.contains("refactorer") {
-        AgentRole::Refactorer
-    } else if normalized.contains("security") {
-        AgentRole::SecurityReviewer
-    } else if normalized.contains("docs") {
-        AgentRole::DocsWriter
-    } else if normalized.contains("integrator") {
-        AgentRole::Integrator
-    } else if normalized.starts_with("impl") || normalized.contains("implementer") {
-        AgentRole::Implementer
-    } else {
-        AgentRole::Custom(name.to_string())
-    }
+/// Default role assigned to a session when no explicit role is provided at
+/// spawn/register/restore time. Sessions no longer infer a role from their
+/// name; an operator (or the TUI Commands panel via `agent.set_role`) sets a
+/// meaningful role at runtime instead.
+pub(crate) fn default_agent_role() -> AgentRole {
+    AgentRole::Custom("default".to_string())
 }
 
 pub(crate) fn agent_role_label(role: &AgentRole) -> String {

@@ -219,6 +219,14 @@ pub(crate) enum AgentAction {
     Focus { agent_id: String },
     /// Send an interrupt (Ctrl-C) to an agent.
     Interrupt { agent_id: String },
+    /// Reassign the role of a running agent session.
+    SetRole {
+        agent_id: String,
+        /// New role label (known: planner/implementer/reviewer/tester/debugger/
+        /// refactorer/security_reviewer/docs_writer/integrator/context_manager;
+        /// any other string becomes a custom role).
+        role: String,
+    },
 }
 
 #[derive(Parser)]

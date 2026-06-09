@@ -2,8 +2,7 @@ use crate::*;
 
 impl DaemonRuntime {
     pub async fn register_agent(&self, name: String) -> RegisteredAgentSession {
-        let role = inferred_agent_role(&name);
-        self.register_agent_with_role(name, role).await
+        self.register_agent_with_role(name, default_agent_role()).await
     }
 
     pub async fn register_agent_with_role(
@@ -38,8 +37,8 @@ impl DaemonRuntime {
         name: String,
         spec: PtySpawnSpec,
     ) -> Result<RegisteredAgentSession> {
-        let role = inferred_agent_role(&name);
-        self.spawn_agent_with_role(name, role, spec).await
+        self.spawn_agent_with_role(name, default_agent_role(), spec)
+            .await
     }
 
     pub async fn spawn_agent_with_role(
@@ -230,6 +229,43 @@ impl DaemonRuntime {
             json!({ "client_id": client_id.to_string(), "agent_id": agent_id.to_string() }),
         ));
         Ok(())
+    }
+
+    /// Reassign the role of a live session at runtime.
+    ///
+    /// Updates both the session metadata (so the role surfaced in
+    /// `daemon.status` / snapshots changes) and the message-bus descriptor (so
+    /// `resolve_target(Role(..))` routes to — or away from — this session).
+    /// Publishes an `agent.role_changed` event so attached clients can refresh
+    /// the role rendered for the pane. The returned session reflects the new
+    /// role.
+    pub async fn set_agent_role(
+        &self,
+        agent_id: &AgentSessionId,
+        role: AgentRole,
+    ) -> Result<RegisteredAgentSession> {
+        let mut state = self.state.write().await;
+        let Some(agent) = state.agents.get_mut(agent_id) else {
+            return Err(AgentmuxError::UserError(format!(
+                "unknown agent session '{agent_id}'"
+            )));
+        };
+        agent.metadata.role = role.clone();
+        let updated = agent.metadata.clone();
+        // Keep the bus routing descriptor in sync; a missing descriptor here
+        // would mean state.agents and the bus diverged, which the bus tolerates
+        // by reporting `false` (no panic).
+        state.messages.set_agent_role(agent_id, role.clone());
+        drop(state);
+
+        self.publish(DaemonEvent::new(
+            IpcEventKind::AgentRoleChanged,
+            json!({
+                "agent_id": updated.id.to_string(),
+                "role": agent_role_label(&updated.role),
+            }),
+        ));
+        Ok(updated)
     }
 
     pub async fn stop_agent(&self, agent_id: &AgentSessionId) -> Result<RegisteredAgentSession> {
