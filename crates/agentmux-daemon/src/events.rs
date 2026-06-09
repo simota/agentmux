@@ -29,7 +29,11 @@ impl DaemonRuntime {
         event_log.append(&entry)
     }
 
-    pub(crate) fn append_daemon_lifecycle_event(&self, kind: &str, payload: serde_json::Value) -> Result<()> {
+    pub(crate) fn append_daemon_lifecycle_event(
+        &self,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
         let Some(event_log) = &self.event_log else {
             return Ok(());
         };
@@ -190,11 +194,14 @@ pub(crate) fn approval_daemon_event(event: &ApprovalEvent) -> DaemonEvent {
     }
 }
 
-pub(crate) fn artifact_payload(artifact_id: String, path: String, title: String) -> serde_json::Value {
+pub(crate) fn artifact_payload(
+    artifact_id: String,
+    path: String,
+    title: String,
+) -> serde_json::Value {
     json!({
         "artifact_id": artifact_id,
         "path": path,
         "title": title,
     })
 }
-

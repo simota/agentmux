@@ -107,7 +107,9 @@ pub(crate) fn detach_request() -> ClientRequest {
 }
 
 #[cfg(feature = "activity-feed")]
-pub(crate) fn event_subscribe_request(filter: &agentmux_tui::state::EventFeedFilter) -> ClientRequest {
+pub(crate) fn event_subscribe_request(
+    filter: &agentmux_tui::state::EventFeedFilter,
+) -> ClientRequest {
     ClientRequest::new(
         "req_event_subscribe",
         IpcCommand::EventSubscribe,
@@ -330,7 +332,11 @@ pub(crate) fn agent_set_role_request(agent_id: String, role: String) -> Result<C
     ))
 }
 
-pub(crate) fn agent_resize_request(id: String, agent_id: String, size: TuiTerminalSize) -> ClientRequest {
+pub(crate) fn agent_resize_request(
+    id: String,
+    agent_id: String,
+    size: TuiTerminalSize,
+) -> ClientRequest {
     ClientRequest::new(
         id,
         IpcCommand::AgentResize,

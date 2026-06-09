@@ -2,7 +2,8 @@ use crate::*;
 
 impl DaemonRuntime {
     pub async fn register_agent(&self, name: String) -> RegisteredAgentSession {
-        self.register_agent_with_role(name, default_agent_role()).await
+        self.register_agent_with_role(name, default_agent_role())
+            .await
     }
 
     pub async fn register_agent_with_role(
@@ -428,6 +429,4 @@ impl DaemonRuntime {
             "lines": lines,
         }))
     }
-
 }
-

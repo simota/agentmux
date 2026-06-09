@@ -779,8 +779,12 @@ mod tests {
 
     #[test]
     fn evaluate_file_write_denies_protected_and_delegates_otherwise() {
-        let engine = PolicyEngine::new(AutomationLevel::AutoWorkspaceWrite)
-            .with_protected_paths([".git/**", ".env", "*secret*", ".agentmux/state.db"]);
+        let engine = PolicyEngine::new(AutomationLevel::AutoWorkspaceWrite).with_protected_paths([
+            ".git/**",
+            ".env",
+            "*secret*",
+            ".agentmux/state.db",
+        ]);
 
         assert_eq!(
             engine.evaluate_file_write(".git/config"),

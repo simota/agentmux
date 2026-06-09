@@ -89,7 +89,6 @@ impl DaemonRuntime {
         let entry = EventLogEntry::new(kind, DateTimeUtc::now_utc(), thread_payload(thread, 0))?;
         event_log.append(&entry)
     }
-
 }
 
 /// Resolve one `meeting.open` participant entry (session id or unique name).
@@ -125,4 +124,3 @@ pub(crate) fn thread_payload(thread: &MessageThread, message_count: usize) -> se
         "closed_at": thread.closed_at.map(|ts| ts.to_string()),
     })
 }
-

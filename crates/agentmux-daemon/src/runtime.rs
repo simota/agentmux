@@ -168,7 +168,6 @@ impl DaemonRuntime {
     pub(crate) fn publish(&self, event: DaemonEvent) {
         let _ = self.events.send(event);
     }
-
 }
 
 #[derive(Clone)]
@@ -177,4 +176,3 @@ pub struct DaemonRuntime {
     pub(crate) events: broadcast::Sender<DaemonEvent>,
     pub(crate) event_log: Option<EventLog>,
 }
-

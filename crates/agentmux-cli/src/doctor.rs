@@ -140,7 +140,10 @@ fn check_command_available(command: &'static str) -> DoctorCheck {
     }
 }
 
-pub(crate) fn find_command_in_path(command: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+pub(crate) fn find_command_in_path(
+    command: &str,
+    path: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
     let path = path?;
     std::env::split_paths(path)
         .map(|dir| dir.join(command))

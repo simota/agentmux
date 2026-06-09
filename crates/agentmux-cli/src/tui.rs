@@ -6,10 +6,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use agentmux_core::{AgentmuxError, error::Result};
-use agentmux_ipc::{
-    ClientHello, DaemonStreamFrame, JsonlReader, JsonlWriter,
-};
 use agentmux_ipc::ClientRequest;
+use agentmux_ipc::{ClientHello, DaemonStreamFrame, JsonlReader, JsonlWriter};
 use agentmux_tui::{
     input::{InputForwardError, dispatch_to_daemon_request},
     keymap::KeymapDispatcher,
@@ -31,25 +29,24 @@ use tokio::net::UnixStream;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use crate::cli::StartupPaneChoice;
+#[cfg(feature = "arena")]
+use crate::daemon::daemon_supports_arena_state;
+#[cfg(feature = "activity-feed")]
+use crate::daemon::daemon_supports_event_subscribe;
 use crate::daemon::ensure_daemon;
 use crate::output::response_error;
-use crate::requests::{
-    agent_broadcast_input_request, agent_resize_request, agent_send_keys_request,
-    agent_set_role_request,
-    agent_spawn_for_provider_request_with_id, agent_spawn_for_provider_request_with_size,
-    agent_stop_request, attach_request, detach_request, message_list_request, snapshot_request,
-    tui_daemon_status_request,
-};
+use crate::parse::{StartupLayout, StartupLayoutNode};
 #[cfg(feature = "activity-feed")]
 use crate::requests::event_subscribe_request;
 #[cfg(feature = "arena")]
 use crate::requests::worktree_adopt_request;
-#[cfg(feature = "activity-feed")]
-use crate::daemon::daemon_supports_event_subscribe;
-#[cfg(feature = "arena")]
-use crate::daemon::daemon_supports_arena_state;
-use crate::cli::StartupPaneChoice;
-use crate::parse::{StartupLayout, StartupLayoutNode};
+use crate::requests::{
+    agent_broadcast_input_request, agent_resize_request, agent_send_keys_request,
+    agent_set_role_request, agent_spawn_for_provider_request_with_id,
+    agent_spawn_for_provider_request_with_size, agent_stop_request, attach_request, detach_request,
+    message_list_request, snapshot_request, tui_daemon_status_request,
+};
 use agentmux_tui::layout::LayoutNode;
 use agentmux_tui::state::{COMMANDS_PANE_ID, CONVERSATION_LIST_PANE_ID};
 
@@ -71,7 +68,9 @@ pub(crate) fn tui_close_request(effect: CommandEffect) -> Option<ClientRequest> 
     }
 }
 
-pub(crate) fn spawn_tui_signal_forwarder(signal_tx: mpsc::UnboundedSender<TuiSignal>) -> JoinHandle<()> {
+pub(crate) fn spawn_tui_signal_forwarder(
+    signal_tx: mpsc::UnboundedSender<TuiSignal>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
             let _ = signal_tx.send(TuiSignal::Sigint);
@@ -464,7 +463,8 @@ pub(crate) async fn run_tui_session_inner(
                     Some(CommandsInputAction::Send) => match state.parse_commands_input() {
                         Some(CommandsSubmit::Broadcast(text)) => {
                             let target = state.commands_target().to_string();
-                            match agent_broadcast_input_request(target.clone(), text.clone(), true) {
+                            match agent_broadcast_input_request(target.clone(), text.clone(), true)
+                            {
                                 Ok(request) => {
                                     state.begin_commands_broadcast(target, text);
                                     writer.write(&request).await?;
@@ -1188,4 +1188,3 @@ pub(crate) fn resize_pane_sizes(
         })
         .collect()
 }
-

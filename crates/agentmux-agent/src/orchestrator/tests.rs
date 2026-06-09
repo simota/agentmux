@@ -1,8 +1,6 @@
 use std::time::Duration;
 
-use agentmux_core::{
-    AgentRole, AgentStatus, DateTimeUtc, DeliveryMode, Priority, TaskId,
-};
+use agentmux_core::{AgentRole, AgentStatus, DateTimeUtc, DeliveryMode, Priority, TaskId};
 use agentmux_message::{MessageKind, MessageSource, MessageTarget};
 
 use super::*;

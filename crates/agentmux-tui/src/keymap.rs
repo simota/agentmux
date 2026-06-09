@@ -784,7 +784,10 @@ mod tests {
 
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('v'), KeyModifiers::NONE));
 
-        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ToggleResultMarker));
+        assert_eq!(
+            dispatch,
+            KeyDispatch::Command(TuiCommand::ToggleResultMarker)
+        );
     }
 
     #[test]

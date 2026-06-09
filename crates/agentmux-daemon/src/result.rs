@@ -26,4 +26,3 @@ pub(crate) fn result_content_hash(agent_name: &str, result: &AgentResult) -> u64
     }
     hasher.finish()
 }
-

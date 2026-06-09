@@ -1,6 +1,8 @@
 use crate::*;
 
-pub(crate) fn task_run_payload(payload: &serde_json::Value) -> Result<(String, String, PathBuf, String)> {
+pub(crate) fn task_run_payload(
+    payload: &serde_json::Value,
+) -> Result<(String, String, PathBuf, String)> {
     let body = required_string(payload, "body", "task.run")?.to_string();
     let team = payload
         .get("team")
@@ -70,7 +72,10 @@ pub(crate) fn parse_agent_session_id(value: &str) -> Option<AgentSessionId> {
     value.parse::<AgentSessionId>().ok()
 }
 
-pub(crate) fn agent_id_payload(payload: &serde_json::Value, command: &str) -> Result<AgentSessionId> {
+pub(crate) fn agent_id_payload(
+    payload: &serde_json::Value,
+    command: &str,
+) -> Result<AgentSessionId> {
     required_string(payload, "agent_id", command)?
         .parse::<AgentSessionId>()
         .map_err(|error| AgentmuxError::UserError(format!("invalid agent_id: {error}")))
@@ -260,7 +265,6 @@ pub(crate) fn parse_delivery_mode(raw: &str) -> Result<DeliveryMode> {
     })
 }
 
-
 pub(crate) fn message_payload(message: &AgentMessage) -> serde_json::Value {
     json!({
         "message_id": message.id.to_string(),
@@ -281,7 +285,6 @@ pub(crate) fn message_payload(message: &AgentMessage) -> serde_json::Value {
         "read_at": message.read_at.map(|ts| ts.to_string()),
     })
 }
-
 
 pub(crate) fn required_string<'a>(
     payload: &'a serde_json::Value,
@@ -308,13 +311,19 @@ pub(crate) fn parse_visibility(raw: &str) -> Result<Visibility> {
         .map_err(|error| AgentmuxError::UserError(format!("invalid visibility '{raw}': {error}")))
 }
 
-pub(crate) fn worktree_id_payload(payload: &serde_json::Value, command: &str) -> Result<WorktreeId> {
+pub(crate) fn worktree_id_payload(
+    payload: &serde_json::Value,
+    command: &str,
+) -> Result<WorktreeId> {
     required_string(payload, "worktree_id", command)?
         .parse::<WorktreeId>()
         .map_err(|error| AgentmuxError::UserError(format!("invalid worktree_id: {error}")))
 }
 
-pub(crate) fn approval_id_payload(payload: &serde_json::Value, command: &str) -> Result<ApprovalId> {
+pub(crate) fn approval_id_payload(
+    payload: &serde_json::Value,
+    command: &str,
+) -> Result<ApprovalId> {
     required_string(payload, "approval_id", command)?
         .parse::<ApprovalId>()
         .map_err(|error| AgentmuxError::UserError(format!("invalid approval_id: {error}")))
@@ -339,7 +348,9 @@ pub(crate) fn json_error(error: serde_json::Error) -> AgentmuxError {
     AgentmuxError::StoreError(format!("failed to encode event payload: {error}"))
 }
 
-pub(crate) fn pty_spawn_spec_from_payload(payload: &serde_json::Value) -> Result<Option<PtySpawnSpec>> {
+pub(crate) fn pty_spawn_spec_from_payload(
+    payload: &serde_json::Value,
+) -> Result<Option<PtySpawnSpec>> {
     let provider = payload.get("provider").and_then(|value| value.as_str());
     let command = match payload.get("command").and_then(|value| value.as_str()) {
         Some(command) => command.to_string(),

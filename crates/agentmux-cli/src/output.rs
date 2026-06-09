@@ -191,7 +191,10 @@ pub(crate) fn format_sessions_payload(payload: &Value) -> String {
     output
 }
 
-pub(crate) fn format_message_history_payload(payload: &Value, filter: &MessageHistoryFilter) -> String {
+pub(crate) fn format_message_history_payload(
+    payload: &Value,
+    filter: &MessageHistoryFilter,
+) -> String {
     let mut messages = payload
         .get("messages")
         .and_then(Value::as_array)
@@ -237,7 +240,10 @@ pub(crate) fn format_message_history_payload(payload: &Value, filter: &MessageHi
     output
 }
 
-pub(crate) fn message_matches_history_filter(message: &Value, filter: &MessageHistoryFilter) -> bool {
+pub(crate) fn message_matches_history_filter(
+    message: &Value,
+    filter: &MessageHistoryFilter,
+) -> bool {
     if let Some(task) = filter.task.as_deref() {
         if message_string_field(message, "task_id") != task {
             return false;

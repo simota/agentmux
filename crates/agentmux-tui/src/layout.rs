@@ -40,7 +40,9 @@ impl SplitDirection {
 /// [`SplitDirection::Horizontal`]).
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum LayoutNode {
-    Leaf { pane_id: PaneId },
+    Leaf {
+        pane_id: PaneId,
+    },
     Split {
         direction: SplitDirection,
         children: Vec<LayoutChild>,
@@ -302,7 +304,11 @@ impl PaneLayout {
     }
 
     pub fn remove_pane(&mut self, pane_id: &str) -> bool {
-        let Some(index) = self.leaf_order.iter().position(|existing| existing == pane_id) else {
+        let Some(index) = self
+            .leaf_order
+            .iter()
+            .position(|existing| existing == pane_id)
+        else {
             return false;
         };
         self.root.remove_leaf(pane_id);

@@ -3,7 +3,9 @@
 use std::path::PathBuf;
 
 use agentmux_core::{AgentmuxConfig, AgentmuxError, error::Result};
-use agentmux_ipc::{ClientRequest, DaemonResponse, DaemonStreamFrame, IpcCommand, PROTOCOL_VERSION};
+use agentmux_ipc::{
+    ClientRequest, DaemonResponse, DaemonStreamFrame, IpcCommand, PROTOCOL_VERSION,
+};
 use agentmux_tui::layout::Rect;
 use agentmux_tui::state::{
     AgentProviderChoice, CommandEffect, TerminalSize as TuiTerminalSize, TuiSessionState,

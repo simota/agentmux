@@ -21,7 +21,6 @@ pub const ACTIVITY_FEED_PANE_ID: &str = "__agentmux_activity_feed__";
 const MAX_FEED_ENTRIES: usize = 500;
 
 pub use choices::{AgentProviderChoice, CommandEffect, NewPaneChoice, ProviderOption, StateChange};
-pub use session::{CommandsLogEntry, CommandsLogKind, CommandsSubmit};
 pub use copy::{CopyPoint, CopySelection};
 #[cfg(feature = "activity-feed")]
 pub use feed::{EventFeedFilter, FeedEntry, SitrepEntry};
@@ -30,3 +29,4 @@ pub use message::MessageListItem;
 pub use pane::ArenaCandidateState;
 pub use pane::{AgentPaneState, TerminalSize};
 pub use session::TuiSessionState;
+pub use session::{CommandsLogEntry, CommandsLogKind, CommandsSubmit};

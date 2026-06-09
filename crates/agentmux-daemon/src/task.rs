@@ -349,7 +349,6 @@ impl DaemonRuntime {
         }
         Ok(LiveResultOutcome::Persisted)
     }
-
 }
 
 #[derive(Debug)]
@@ -470,4 +469,3 @@ pub(crate) fn slug_label(value: &str) -> String {
         slug
     }
 }
-

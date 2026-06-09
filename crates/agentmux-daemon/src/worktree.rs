@@ -6,7 +6,11 @@ impl DaemonRuntime {
         state.worktrees.insert(worktree.id.clone(), worktree);
     }
 
-    pub(crate) async fn register_worktree_with_repo_root(&self, worktree: Worktree, repo_root: PathBuf) {
+    pub(crate) async fn register_worktree_with_repo_root(
+        &self,
+        worktree: Worktree,
+        repo_root: PathBuf,
+    ) {
         let mut state = self.state.write().await;
         state
             .worktree_repo_roots
@@ -160,7 +164,10 @@ impl DaemonRuntime {
             .await
     }
 
-    pub(crate) async fn ensure_arena_candidate_ready(&self, worktree_id: &WorktreeId) -> Result<()> {
+    pub(crate) async fn ensure_arena_candidate_ready(
+        &self,
+        worktree_id: &WorktreeId,
+    ) -> Result<()> {
         let state = self.state.read().await;
         let Some(candidate) = state.arena_candidates.get(worktree_id) else {
             return Err(AgentmuxError::UserError(format!(
@@ -289,7 +296,6 @@ impl DaemonRuntime {
             }
         });
     }
-
 }
 
 pub(crate) fn worktree_payload(worktree: &Worktree) -> serde_json::Value {
@@ -305,4 +311,3 @@ pub(crate) fn worktree_payload(worktree: &Worktree) -> serde_json::Value {
         "created_at": worktree.created_at.to_string(),
     })
 }
-

@@ -105,7 +105,6 @@ impl DaemonRuntime {
         })?;
         Ok(contexts.len())
     }
-
 }
 
 pub(crate) fn parse_context_item_id(value: &str) -> Option<ContextItemId> {
@@ -181,7 +180,9 @@ pub(crate) fn context_search_payload(payload: &serde_json::Value) -> Result<Cont
     }
 }
 
-pub(crate) fn context_attach_payload(payload: &serde_json::Value) -> Result<(ContextItemId, MessageId)> {
+pub(crate) fn context_attach_payload(
+    payload: &serde_json::Value,
+) -> Result<(ContextItemId, MessageId)> {
     let context_id = required_string(payload, "context_id", "context.attach")?
         .parse::<ContextItemId>()
         .map_err(|error| AgentmuxError::UserError(format!("invalid context_id: {error}")))?;
@@ -191,7 +192,9 @@ pub(crate) fn context_attach_payload(payload: &serde_json::Value) -> Result<(Con
     Ok((context_id, message_id))
 }
 
-pub(crate) fn context_inject_payload(payload: &serde_json::Value) -> Result<(ContextItemId, AgentSessionId)> {
+pub(crate) fn context_inject_payload(
+    payload: &serde_json::Value,
+) -> Result<(ContextItemId, AgentSessionId)> {
     let context_id = required_string(payload, "context_id", "context.inject")?
         .parse::<ContextItemId>()
         .map_err(|error| AgentmuxError::UserError(format!("invalid context_id: {error}")))?;
@@ -229,4 +232,3 @@ pub(crate) fn context_payload(item: &ContextItem) -> serde_json::Value {
         "updated_at": item.updated_at.to_string(),
     })
 }
-

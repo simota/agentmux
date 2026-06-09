@@ -9,7 +9,9 @@ use agentmux_core::{
     error::Result,
 };
 
-use super::artifact::{artifact_metadata, artifact_path, next_artifact_sequence, write_artifact_file};
+use super::artifact::{
+    artifact_metadata, artifact_path, next_artifact_sequence, write_artifact_file,
+};
 use super::branch::{
     agentmux_branch_name, parse_worktree_list, slug_segment, validate_git_ref_name,
     validate_test_command, validate_worktree_path,

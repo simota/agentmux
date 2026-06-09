@@ -20,7 +20,10 @@ impl DaemonRuntime {
         request
     }
 
-    pub(crate) async fn request_worktree_adoption(&self, worktree_id: WorktreeId) -> Result<ApprovalRequest> {
+    pub(crate) async fn request_worktree_adoption(
+        &self,
+        worktree_id: WorktreeId,
+    ) -> Result<ApprovalRequest> {
         let _ = self.worktree_by_id(&worktree_id).await?;
         self.ensure_arena_candidate_ready(&worktree_id).await?;
         {
@@ -142,7 +145,6 @@ impl DaemonRuntime {
         }
         Ok(request)
     }
-
 }
 
 pub(crate) fn approval_payload(approval: &ApprovalRequest) -> serde_json::Value {
@@ -168,4 +170,3 @@ pub(crate) fn approval_queue_error(error: ApprovalQueueError) -> String {
         }
     }
 }
-

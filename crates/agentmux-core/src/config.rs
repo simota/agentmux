@@ -859,18 +859,15 @@ mod tests {
         // change to the example is caught immediately.
         let config = AgentmuxConfig::parse_str(EXAMPLE_CONFIG).unwrap();
         assert_eq!(
-            config.automation.message_inject_send_delay_ms,
-            DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
+            config.automation.message_inject_send_delay_ms, DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
             "message_inject_send_delay_ms parsed from example TOML"
         );
         assert_eq!(
-            config.automation.message_paste_enter_delay_ms,
-            DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS,
+            config.automation.message_paste_enter_delay_ms, DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS,
             "message_paste_enter_delay_ms parsed from example TOML"
         );
         assert_eq!(
-            config.automation.result_detection_tail_bytes,
-            DEFAULT_RESULT_DETECTION_TAIL_BYTES,
+            config.automation.result_detection_tail_bytes, DEFAULT_RESULT_DETECTION_TAIL_BYTES,
             "result_detection_tail_bytes parsed from example TOML"
         );
     }
@@ -890,18 +887,15 @@ mod tests {
 
         let config = AgentmuxConfig::parse_str(&stripped).unwrap();
         assert_eq!(
-            config.automation.message_inject_send_delay_ms,
-            DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
+            config.automation.message_inject_send_delay_ms, DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
             "absent message_inject_send_delay_ms must default to 5000"
         );
         assert_eq!(
-            config.automation.message_paste_enter_delay_ms,
-            DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS,
+            config.automation.message_paste_enter_delay_ms, DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS,
             "absent message_paste_enter_delay_ms must default to 120"
         );
         assert_eq!(
-            config.automation.result_detection_tail_bytes,
-            DEFAULT_RESULT_DETECTION_TAIL_BYTES,
+            config.automation.result_detection_tail_bytes, DEFAULT_RESULT_DETECTION_TAIL_BYTES,
             "absent result_detection_tail_bytes must default to 65536"
         );
     }

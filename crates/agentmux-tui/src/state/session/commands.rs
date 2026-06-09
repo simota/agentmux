@@ -483,7 +483,9 @@ impl TuiSessionState {
                         agent_id,
                         role: rest.to_string(),
                     }),
-                    None => Some(CommandsSubmit::Error(format!("no live session named {name}"))),
+                    None => Some(CommandsSubmit::Error(format!(
+                        "no live session named {name}"
+                    ))),
                 }
             }
             "keys" => {
@@ -505,7 +507,9 @@ impl TuiSessionState {
                         agent_id,
                         spec: rest.to_string(),
                     }),
-                    None => Some(CommandsSubmit::Error(format!("no live session named {name}"))),
+                    None => Some(CommandsSubmit::Error(format!(
+                        "no live session named {name}"
+                    ))),
                 }
             }
             other => Some(CommandsSubmit::Error(format!("unknown command: /{other}"))),

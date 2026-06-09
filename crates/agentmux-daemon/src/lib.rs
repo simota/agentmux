@@ -56,19 +56,19 @@ pub(crate) use tokio::net::{UnixListener, UnixStream};
 pub(crate) use tokio::sync::{RwLock, broadcast, mpsc, watch};
 pub(crate) use tokio::task::JoinSet;
 
-mod config;
-mod state;
-mod runtime;
 mod agent;
-mod message;
-mod context;
-mod worktree;
 mod approval;
-mod meeting;
-mod task;
-mod result;
+mod config;
+mod context;
 mod events;
+mod meeting;
+mod message;
+mod result;
+mod runtime;
 mod server;
+mod state;
+mod task;
+mod worktree;
 
 #[cfg(test)]
 mod tests;

@@ -12,25 +12,23 @@ use unicode_width::UnicodeWidthChar;
 use crate::keymap::{FocusDirection, TuiCommand};
 use crate::layout::{LayoutNode, PaneLayout, SplitDirection};
 
-use super::choices::{
-    CommandEffect, NewPaneChoice, ProviderOption, StateChange, PROVIDER_OPTIONS,
-};
+#[cfg(feature = "activity-feed")]
+use super::ACTIVITY_FEED_PANE_ID;
+use super::COMMANDS_PANE_ID;
+use super::CONVERSATION_LIST_PANE_ID;
+#[cfg(feature = "activity-feed")]
+use super::MAX_FEED_ENTRIES;
+use super::choices::{CommandEffect, NewPaneChoice, PROVIDER_OPTIONS, ProviderOption, StateChange};
 use super::copy::CopySelection;
 #[cfg(feature = "activity-feed")]
 use super::feed::needs_attention_status;
-use super::feed::{output_bytes, string_field};
 #[cfg(feature = "activity-feed")]
 use super::feed::{EventFeedFilter, FeedEntry, SitrepEntry};
+use super::feed::{output_bytes, string_field};
 use super::message::MessageListItem;
 #[cfg(feature = "arena")]
 use super::pane::ArenaCandidateState;
 use super::pane::{AgentPaneState, TerminalSize};
-use super::CONVERSATION_LIST_PANE_ID;
-use super::COMMANDS_PANE_ID;
-#[cfg(feature = "activity-feed")]
-use super::ACTIVITY_FEED_PANE_ID;
-#[cfg(feature = "activity-feed")]
-use super::MAX_FEED_ENTRIES;
 
 mod accessors;
 mod apply;

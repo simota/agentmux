@@ -191,7 +191,6 @@ impl SeenResultHashes {
     }
 }
 
-
 /// Input for `meeting.open`: topic + participant session names/ids.
 pub struct OpenMeetingInput {
     pub topic: String,

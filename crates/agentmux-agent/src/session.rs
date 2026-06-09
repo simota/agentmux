@@ -521,16 +521,10 @@ mod tests {
             ))
             .unwrap();
         session
-            .transition_status(
-                AgentStatus::RunningTurn,
-                t0 + time::Duration::seconds(2),
-            )
+            .transition_status(AgentStatus::RunningTurn, t0 + time::Duration::seconds(2))
             .unwrap();
         session
-            .transition_status(
-                AgentStatus::CompletedTurn,
-                t0 + time::Duration::seconds(3),
-            )
+            .transition_status(AgentStatus::CompletedTurn, t0 + time::Duration::seconds(3))
             .unwrap();
         // Re-stamp the winning verdict so the TTL window is anchored here.
         session

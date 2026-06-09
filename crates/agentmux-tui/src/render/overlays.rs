@@ -14,11 +14,11 @@ use ratatui::{
 #[cfg(feature = "activity-feed")]
 use super::messages::feed_time;
 use super::messages::{message_list_lines, render_message_list_panel};
+use super::util::centered_rect;
 #[cfg(any(feature = "activity-feed", feature = "arena"))]
 use super::util::truncate_to_width;
 #[cfg(any(feature = "activity-feed", feature = "arena"))]
 use super::util::write_line;
-use super::util::centered_rect;
 
 const KEYBINDING_HELP_LINES: &[&str] = &[
     "Prefix: Ctrl-g",

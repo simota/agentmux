@@ -108,7 +108,10 @@ pub async fn handle_client(stream: UnixStream, runtime: DaemonRuntime) -> Result
         .map_err(|error| AgentmuxError::IpcError(error.to_string()))?
 }
 
-pub(crate) async fn send_frame(frames: &mpsc::Sender<ServerFrame>, frame: ServerFrame) -> Result<()> {
+pub(crate) async fn send_frame(
+    frames: &mpsc::Sender<ServerFrame>,
+    frame: ServerFrame,
+) -> Result<()> {
     frames
         .send(frame)
         .await

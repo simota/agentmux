@@ -11,7 +11,14 @@ pub(crate) fn truncate_to_width(line: &str, width: u16) -> String {
     line.chars().take(usize::from(width)).collect()
 }
 
-pub(crate) fn write_line(buffer: &mut Buffer, x: u16, y: u16, width: u16, line: &str, style: Style) {
+pub(crate) fn write_line(
+    buffer: &mut Buffer,
+    x: u16,
+    y: u16,
+    width: u16,
+    line: &str,
+    style: Style,
+) {
     for col in 0..width {
         if let Some(cell) = buffer.cell_mut((x + col, y)) {
             cell.set_char(' ');

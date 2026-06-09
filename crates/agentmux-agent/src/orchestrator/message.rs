@@ -46,7 +46,10 @@ impl OrchestratorMessage {
     }
 }
 
-pub(crate) fn resolve_result_target(team: &super::TeamTemplate, raw: &str) -> Result<MessageTarget> {
+pub(crate) fn resolve_result_target(
+    team: &super::TeamTemplate,
+    raw: &str,
+) -> Result<MessageTarget> {
     let target = raw.trim();
     if target.is_empty() {
         return Err(AgentmuxError::OrchestratorError(

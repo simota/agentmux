@@ -58,8 +58,8 @@ pub(crate) fn render_commands_panel(
         return None;
     }
     let prefix_width = 2u16; // "> "
-    let buffer_width = u16::try_from(UnicodeWidthStr::width(state.commands_input_buffer()))
-        .unwrap_or(u16::MAX);
+    let buffer_width =
+        u16::try_from(UnicodeWidthStr::width(state.commands_input_buffer())).unwrap_or(u16::MAX);
     let max_x = area.x + area.width.saturating_sub(2); // last column before the right border
     let cursor_x = (area.x + 1)
         .saturating_add(prefix_width)
@@ -110,7 +110,11 @@ pub(crate) fn commands_panel_lines(
 
     if options.is_empty() || (options.len() == 1 && options[0] == "broadcast") {
         // No live sessions — still show broadcast option + placeholder.
-        let marker = if current_target == "broadcast" { "▸ " } else { "  " };
+        let marker = if current_target == "broadcast" {
+            "▸ "
+        } else {
+            "  "
+        };
         targets_lines.push(truncate_marker_line(marker, "broadcast", content_width));
         targets_lines.push(truncate_marker_line("  ", "(no sessions)", content_width));
     } else {
@@ -118,12 +122,7 @@ pub(crate) fn commands_panel_lines(
         let name_to_role: std::collections::HashMap<String, Option<String>> = state
             .panes()
             .filter(|pane| pane.process_id().is_some())
-            .map(|pane| {
-                (
-                    pane.name().to_string(),
-                    pane.role().map(ToOwned::to_owned),
-                )
-            })
+            .map(|pane| (pane.name().to_string(), pane.role().map(ToOwned::to_owned)))
             .collect();
 
         for option in &options {
@@ -249,10 +248,16 @@ mod tests {
         state.commands_input_push('o');
 
         let lines = commands_panel_lines(&state, 60, 10);
-        assert!(lines.iter().any(|line| line.contains("[broadcast] run tests")));
-        assert!(lines
-            .iter()
-            .any(|line| line.contains("delivered 2, skipped 1")));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("[broadcast] run tests"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("delivered 2, skipped 1"))
+        );
         assert_eq!(lines.last().unwrap().as_str(), "> go\u{2588}");
     }
 
@@ -273,11 +278,20 @@ mod tests {
         // Cursor sits after the "> " prefix (2 cols) + "go" (2 cols) on the last
         // interior row (area.y + height - 2).
         let cursor = render_commands_panel(area, &state, true, &mut buffer);
-        assert_eq!(cursor, Some(Position { x: 1 + 2 + 2, y: 8 - 2 }));
+        assert_eq!(
+            cursor,
+            Some(Position {
+                x: 1 + 2 + 2,
+                y: 8 - 2
+            })
+        );
 
         // Unfocused panes do not own the hardware cursor.
         let mut unfocused = Buffer::empty(area);
-        assert_eq!(render_commands_panel(area, &state, false, &mut unfocused), None);
+        assert_eq!(
+            render_commands_panel(area, &state, false, &mut unfocused),
+            None
+        );
     }
 
     #[test]
@@ -290,7 +304,13 @@ mod tests {
         let mut buffer = Buffer::empty(area);
 
         let cursor = render_commands_panel(area, &state, true, &mut buffer);
-        assert_eq!(cursor, Some(Position { x: 1 + 2 + 4, y: 8 - 2 }));
+        assert_eq!(
+            cursor,
+            Some(Position {
+                x: 1 + 2 + 4,
+                y: 8 - 2
+            })
+        );
     }
 
     /// Targets section shows all broadcast options; active target gets the ▸ marker.
@@ -327,11 +347,15 @@ mod tests {
         );
         // Agent lines must be present and annotated with role.
         assert!(
-            lines.iter().any(|l| l.contains("impl-1") && l.contains("implementer")),
+            lines
+                .iter()
+                .any(|l| l.contains("impl-1") && l.contains("implementer")),
             "agent:impl-1 line missing or not annotated"
         );
         assert!(
-            lines.iter().any(|l| l.contains("rev-1") && l.contains("reviewer")),
+            lines
+                .iter()
+                .any(|l| l.contains("rev-1") && l.contains("reviewer")),
             "agent:rev-1 line missing or not annotated"
         );
 
@@ -378,7 +402,10 @@ mod tests {
             "unexpected role line when session has no role"
         );
         // Agent line for "solo" must exist (no parenthesised annotation).
-        let solo_line = lines.iter().find(|l| l.contains("solo")).expect("solo line");
+        let solo_line = lines
+            .iter()
+            .find(|l| l.contains("solo"))
+            .expect("solo line");
         assert!(
             !solo_line.contains('('),
             "solo agent line should not have role annotation, got: {solo_line:?}"

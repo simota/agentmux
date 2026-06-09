@@ -192,11 +192,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
-            AgentAction::Broadcast {
-                to,
-                no_enter,
-                text,
-            } => {
+            AgentAction::Broadcast { to, no_enter, text } => {
                 let response = send_daemon_request(
                     &socket_path,
                     agent_broadcast_input_request(to, text, !no_enter)?,

@@ -429,11 +429,7 @@ pub(crate) async fn handle_request(
                     );
                 }
             };
-            let role = match request
-                .payload
-                .get("role")
-                .and_then(|value| value.as_str())
-            {
+            let role = match request.payload.get("role").and_then(|value| value.as_str()) {
                 Some(raw) => match parse_agent_role(raw) {
                     Ok(role) => role,
                     Err(error) => {
