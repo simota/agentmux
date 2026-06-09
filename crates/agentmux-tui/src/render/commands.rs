@@ -3,23 +3,28 @@
 
 use ratatui::{
     buffer::Buffer,
-    layout::{Alignment, Rect},
+    layout::{Alignment, Position, Rect},
     style::{Color, Style},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
+use unicode_width::UnicodeWidthStr;
 
 use crate::state::TuiSessionState;
 
 use super::util::truncate_cell;
 
+/// Render the commands panel. When `focused`, returns the hardware cursor
+/// [`Position`] at the end of the input field so the real terminal cursor sits
+/// in the input area (keeping typing and IME preedit anchored there); returns
+/// `None` when unfocused or the pane is too small to host the input row.
 pub(crate) fn render_commands_panel(
     area: Rect,
     state: &TuiSessionState,
     focused: bool,
     buffer: &mut Buffer,
-) {
+) -> Option<Position> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
 
     let content_width = usize::from(area.width.saturating_sub(4)).clamp(16, 120);
@@ -43,6 +48,28 @@ pub(crate) fn render_commands_panel(
         .alignment(Alignment::Left)
         .style(Style::default().fg(Color::White).bg(Color::Black));
     paragraph.render(area, buffer);
+
+    // Focused: place the real cursor at the end of the input field. The input
+    // line is pinned to the last interior row by `commands_panel_lines`, and is
+    // rendered as `> {buffer}█`, so the cursor sits after the `> ` prefix plus
+    // the display width of the current input. This keeps typing and IME preedit
+    // anchored to the input area rather than wherever ratatui last left it.
+    if !focused || area.height < 4 || area.width < 4 {
+        return None;
+    }
+    let prefix_width = 2u16; // "> "
+    let buffer_width = u16::try_from(UnicodeWidthStr::width(state.commands_input_buffer()))
+        .unwrap_or(u16::MAX);
+    let max_x = area.x + area.width.saturating_sub(2); // last column before the right border
+    let cursor_x = (area.x + 1)
+        .saturating_add(prefix_width)
+        .saturating_add(buffer_width)
+        .min(max_x);
+    let cursor_y = area.y + area.height.saturating_sub(2); // last interior row (input field)
+    Some(Position {
+        x: cursor_x,
+        y: cursor_y,
+    })
 }
 
 /// Compose the panel body:
@@ -230,6 +257,37 @@ mod tests {
     fn zero_height_area_produces_no_lines() {
         let state = TuiSessionState::default();
         assert!(commands_panel_lines(&state, 40, 1).is_empty());
+    }
+
+    #[test]
+    fn focused_panel_reports_cursor_at_end_of_input_field() {
+        let mut state = TuiSessionState::default();
+        state.commands_input_push('g');
+        state.commands_input_push('o');
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buffer = Buffer::empty(area);
+
+        // Cursor sits after the "> " prefix (2 cols) + "go" (2 cols) on the last
+        // interior row (area.y + height - 2).
+        let cursor = render_commands_panel(area, &state, true, &mut buffer);
+        assert_eq!(cursor, Some(Position { x: 1 + 2 + 2, y: 8 - 2 }));
+
+        // Unfocused panes do not own the hardware cursor.
+        let mut unfocused = Buffer::empty(area);
+        assert_eq!(render_commands_panel(area, &state, false, &mut unfocused), None);
+    }
+
+    #[test]
+    fn focused_panel_cursor_accounts_for_wide_input_chars() {
+        let mut state = TuiSessionState::default();
+        // Two full-width characters occupy 4 display columns.
+        state.commands_input_push('あ');
+        state.commands_input_push('い');
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buffer = Buffer::empty(area);
+
+        let cursor = render_commands_panel(area, &state, true, &mut buffer);
+        assert_eq!(cursor, Some(Position { x: 1 + 2 + 4, y: 8 - 2 }));
     }
 
     /// Targets section shows all broadcast options; active target gets the ▸ marker.

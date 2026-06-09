@@ -49,7 +49,10 @@ impl TuiSessionRenderer {
 
             if state.is_commands_pane(&pane_id) {
                 let focused = state.layout().focused() == Some(pane_id.as_str());
-                render_commands_panel(rect, state, focused, buffer);
+                let pane_cursor = render_commands_panel(rect, state, focused, buffer);
+                if focused {
+                    cursor_position = pane_cursor;
+                }
                 continue;
             }
 
