@@ -980,13 +980,14 @@ pub(crate) enum CommandsInputAction {
 /// Map a key code to a Commands-panel input action.
 ///
 /// `Enter` submits, `Tab` cycles the broadcast target, `Esc` clears, `Backspace`
-/// deletes, and printable characters are inserted. Other keys are ignored.
+/// and `Delete` both delete the previous character (the input field has no
+/// in-line cursor), and printable characters are inserted. Other keys are ignored.
 pub(crate) fn commands_input_key(code: KeyCode) -> Option<CommandsInputAction> {
     match code {
         KeyCode::Enter => Some(CommandsInputAction::Send),
         KeyCode::Tab => Some(CommandsInputAction::CycleTarget),
         KeyCode::Esc => Some(CommandsInputAction::Clear),
-        KeyCode::Backspace => Some(CommandsInputAction::Backspace),
+        KeyCode::Backspace | KeyCode::Delete => Some(CommandsInputAction::Backspace),
         KeyCode::Char(ch) => Some(CommandsInputAction::Insert(ch)),
         _ => None,
     }

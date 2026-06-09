@@ -443,6 +443,11 @@ use agentmux_ipc::EVENT_SUBSCRIBE_PROTOCOL_VERSION;
             commands_input_key(KeyCode::Backspace),
             Some(CommandsInputAction::Backspace)
         );
+        // Delete is treated like Backspace in the panel input field.
+        assert_eq!(
+            commands_input_key(KeyCode::Delete),
+            Some(CommandsInputAction::Backspace)
+        );
         assert_eq!(
             commands_input_key(KeyCode::Char('a')),
             Some(CommandsInputAction::Insert('a'))
