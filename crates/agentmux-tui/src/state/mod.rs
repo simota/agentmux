@@ -14,12 +14,14 @@ mod session;
 mod tests;
 
 pub const CONVERSATION_LIST_PANE_ID: &str = "__agentmux_conversation_list__";
+pub const COMMANDS_PANE_ID: &str = "__agentmux_commands__";
 #[cfg(feature = "activity-feed")]
 pub const ACTIVITY_FEED_PANE_ID: &str = "__agentmux_activity_feed__";
 #[cfg(feature = "activity-feed")]
 const MAX_FEED_ENTRIES: usize = 500;
 
 pub use choices::{AgentProviderChoice, CommandEffect, NewPaneChoice, ProviderOption, StateChange};
+pub use session::CommandsLogEntry;
 pub use copy::{CopyPoint, CopySelection};
 #[cfg(feature = "activity-feed")]
 pub use feed::{EventFeedFilter, FeedEntry, SitrepEntry};

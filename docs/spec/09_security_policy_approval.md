@@ -191,6 +191,15 @@ enum InputSafety {
 - Dangerousはmanual approval必須。
 - `PressEnter`のみでも、直前に危険なprompt/commandが入力されている可能性があるため、context-awareに判定する。
 
+## 8.1 Broadcast 入力の安全境界
+
+`agent.broadcast_input`（IPC）および `agentmux agent broadcast`（CLI）による一括 PTY 注入は、既存の自動入力安全境界をすべて継承する。
+
+- **human-typing skip**: 人間が typing 中の pane（`human_input_quiet` の quiet ガード中）には注入しない。注入を見送った対象は IPC response の `skipped` カウントに含まれ、Commands パネル履歴にも表示される。
+- **監査ログ**: すべての broadcast 注入は `input_script.created` / `input_script.injected` に相当するイベントとして JSONL event log（`.agentmux/events.jsonl`）に記録される。
+- **利用者の明示操作起点**: broadcast は自動ではなく、利用者が Commands パネルで Enter を押すか CLI を明示実行した場合にのみ発火する。agentmux は broadcast を自律的にトリガーしない。
+- **破壊的コマンドの一斉送信リスク**: 全エージェントへ同一の危険なコマンド（例: `git reset --hard`）を一度に送れるため、Commands パネルは利用者に一斉送信の対象と内容を確認させる UI（送信履歴ログと対象表示）を提供する。
+
 ## 9. Secret Redaction
 
 ### 9.1 検出対象

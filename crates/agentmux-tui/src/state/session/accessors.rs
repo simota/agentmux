@@ -36,6 +36,10 @@ impl TuiSessionState {
             arena_candidates: Vec::new(),
             #[cfg(feature = "arena")]
             arena_selected: 0,
+            commands_input_buffer: String::new(),
+            commands_target: "broadcast".to_string(),
+            commands_history: Vec::new(),
+            commands_pending_broadcast: None,
             daemon_protocol_version: None,
             runtime_notice: None,
             prefix_active: false,
@@ -77,6 +81,30 @@ impl TuiSessionState {
                 .panes()
                 .iter()
                 .any(|existing| existing == pane_id)
+    }
+
+    pub fn is_commands_pane(&self, pane_id: &str) -> bool {
+        pane_id == COMMANDS_PANE_ID
+            && self
+                .layout
+                .panes()
+                .iter()
+                .any(|existing| existing == pane_id)
+    }
+
+    /// Text the user is currently composing in the Commands panel.
+    pub fn commands_input_buffer(&self) -> &str {
+        &self.commands_input_buffer
+    }
+
+    /// Current broadcast target (`"broadcast"` or `"role:<role>"`).
+    pub fn commands_target(&self) -> &str {
+        &self.commands_target
+    }
+
+    /// Sent-broadcast history, oldest first.
+    pub fn commands_history(&self) -> &[CommandsLogEntry] {
+        &self.commands_history
     }
 
     #[cfg(feature = "activity-feed")]

@@ -1230,3 +1230,258 @@ use super::*;
         // Err path: confirm it's the PTY error, not a quiet-window deferral.
         // (Ok(None) is the only incorrect outcome and was already excluded above.)
     }
+
+    // ── Commands-panel broadcast-input (agent.broadcast_input) ──────────────
+
+    /// Spawn a perl-capture PTY agent under `role` that writes everything it
+    /// receives to `output_path`. Shared by the broadcast tests below.
+    async fn spawn_capture_agent(
+        runtime: &DaemonRuntime,
+        name: &str,
+        role: AgentRole,
+        root: &Path,
+        output_path: &Path,
+    ) -> RegisteredAgentSession {
+        runtime
+            .spawn_agent_with_role(
+                name.to_string(),
+                role,
+                PtySpawnSpec {
+                    command: "/usr/bin/perl".to_string(),
+                    args: vec![
+                        "-e".to_string(),
+                        pty_capture_script().to_string(),
+                        output_path.display().to_string(),
+                    ],
+                    cwd: root.to_path_buf(),
+                    env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                    size: Default::default(),
+                },
+            )
+            .await
+            .expect("capture agent is spawned")
+    }
+
+    /// `broadcast` fans the raw input out to every live agent PTY.
+    #[tokio::test]
+    async fn broadcast_input_delivers_to_all_agents() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-broadcast-all-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let out_a = root.join("a.txt");
+        let out_b = root.join("b.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        let agent_a =
+            spawn_capture_agent(&runtime, "impl-a", AgentRole::Implementer, &root, &out_a).await;
+        let agent_b =
+            spawn_capture_agent(&runtime, "tester-b", AgentRole::Tester, &root, &out_b).await;
+
+        let outcome = runtime
+            .broadcast_input(
+                &MessageTarget::Broadcast,
+                &[
+                    InputAction::PasteText("broadcast-all-body".to_string()),
+                    InputAction::PressEnter,
+                ],
+            )
+            .await
+            .expect("broadcast must succeed");
+
+        assert_eq!(outcome.skipped.len(), 0, "no pane is typing → none skipped");
+        let delivered: std::collections::BTreeSet<_> = outcome.delivered.into_iter().collect();
+        assert!(delivered.contains(&agent_a.id));
+        assert!(delivered.contains(&agent_b.id));
+
+        assert!(
+            wait_for_file_contains(&out_a, "broadcast-all-body")
+                .await
+                .is_some(),
+            "agent A PTY received the broadcast text"
+        );
+        assert!(
+            wait_for_file_contains(&out_b, "broadcast-all-body")
+                .await
+                .is_some(),
+            "agent B PTY received the broadcast text"
+        );
+
+        terminate_agent_process(&runtime, &agent_a.id.to_string()).await;
+        terminate_agent_process(&runtime, &agent_b.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// A pane with a human typing inside the quiet window is skipped; the other
+    /// resolved panes still receive the broadcast.
+    #[tokio::test]
+    async fn broadcast_input_skips_pane_with_human_typing() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-broadcast-skip-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let out_idle = root.join("idle.txt");
+        let out_typing = root.join("typing.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        let idle =
+            spawn_capture_agent(&runtime, "impl-idle", AgentRole::Implementer, &root, &out_idle)
+                .await;
+        let typing =
+            spawn_capture_agent(&runtime, "impl-typing", AgentRole::Implementer, &root, &out_typing)
+                .await;
+
+        // The "typing" pane saw a human keystroke right now → inside quiet window.
+        runtime
+            .record_human_input_for_agent(&typing.id, DateTimeUtc::now_utc())
+            .await;
+
+        let outcome = runtime
+            .broadcast_input(
+                &MessageTarget::Broadcast,
+                &[
+                    InputAction::PasteText("broadcast-skip-body".to_string()),
+                    InputAction::PressEnter,
+                ],
+            )
+            .await
+            .expect("broadcast must succeed even when a pane is skipped");
+
+        assert_eq!(outcome.delivered, vec![idle.id.clone()], "only the idle pane is written");
+        assert_eq!(outcome.skipped, vec![typing.id.clone()], "the typing pane is skipped");
+
+        assert!(
+            wait_for_file_contains(&out_idle, "broadcast-skip-body")
+                .await
+                .is_some(),
+            "idle pane received the broadcast text"
+        );
+
+        terminate_agent_process(&runtime, &idle.id.to_string()).await;
+        terminate_agent_process(&runtime, &typing.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// `role:<role>` restricts the broadcast to the matching role only.
+    #[tokio::test]
+    async fn broadcast_input_role_target_filters_recipients() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-broadcast-role-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let out_tester = root.join("tester.txt");
+        let out_impl = root.join("impl.txt");
+        let runtime = DaemonRuntime::new(16);
+
+        let tester =
+            spawn_capture_agent(&runtime, "qa-1", AgentRole::Tester, &root, &out_tester).await;
+        let implementer =
+            spawn_capture_agent(&runtime, "impl-1", AgentRole::Implementer, &root, &out_impl).await;
+
+        let outcome = runtime
+            .broadcast_input(
+                &MessageTarget::Role(AgentRole::Tester),
+                &[
+                    InputAction::PasteText("role-scoped-body".to_string()),
+                    InputAction::PressEnter,
+                ],
+            )
+            .await
+            .expect("role-scoped broadcast must succeed");
+
+        assert_eq!(outcome.delivered, vec![tester.id.clone()], "only testers receive it");
+        assert!(outcome.skipped.is_empty());
+
+        assert!(
+            wait_for_file_contains(&out_tester, "role-scoped-body")
+                .await
+                .is_some(),
+            "tester pane received the role-scoped broadcast"
+        );
+        // The implementer pane must not have received it.
+        assert!(
+            !std::fs::read_to_string(&out_impl)
+                .unwrap_or_default()
+                .contains("role-scoped-body"),
+            "implementer pane must NOT receive a tester-scoped broadcast"
+        );
+
+        terminate_agent_process(&runtime, &tester.id.to_string()).await;
+        terminate_agent_process(&runtime, &implementer.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }
+
+    /// A target that resolves to no agents surfaces the bus `UserError`.
+    #[tokio::test]
+    async fn broadcast_input_unresolvable_target_is_user_error() {
+        let runtime = DaemonRuntime::new(16);
+        // No agents registered at all → broadcast resolves to empty.
+        let error = runtime
+            .broadcast_input(
+                &MessageTarget::Broadcast,
+                &[InputAction::PasteText("noone".to_string())],
+            )
+            .await
+            .expect_err("broadcast to no agents must error");
+        assert!(matches!(error, AgentmuxError::UserError(_)), "got {error:?}");
+
+        // A role with no matching agents also errors, even if other agents exist.
+        let _other = runtime.register_agent("planner-only".to_string()).await;
+        let role_error = runtime
+            .broadcast_input(
+                &MessageTarget::Role(AgentRole::Tester),
+                &[InputAction::PasteText("noone".to_string())],
+            )
+            .await
+            .expect_err("broadcast to an unmatched role must error");
+        assert!(matches!(role_error, AgentmuxError::UserError(_)));
+    }
+
+    /// Every broadcast write is recorded in the JSONL event log
+    /// (input_script.created + input_script.injected), preserving auditability.
+    #[tokio::test]
+    async fn broadcast_input_records_event_log_entries() {
+        let root = std::env::temp_dir()
+            .join(format!("agentmux-broadcast-events-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&root).expect("temporary root is created");
+        let event_log_path = root.join(".agentmux").join("events.jsonl");
+        let out = root.join("out.txt");
+        let runtime = DaemonRuntime::new(16).with_event_log(EventLog::new(&event_log_path));
+
+        let agent =
+            spawn_capture_agent(&runtime, "impl-evt", AgentRole::Implementer, &root, &out).await;
+
+        runtime
+            .broadcast_input(
+                &MessageTarget::Broadcast,
+                &[InputAction::PasteText("audit-me".to_string())],
+            )
+            .await
+            .expect("broadcast must succeed");
+
+        // The JSONL event log captures both lifecycle events for the broadcast
+        // write, preserving the spec's auditability invariant.
+        let content = std::fs::read_to_string(&event_log_path).expect("event log is written");
+        let events: Vec<serde_json::Value> = content
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("valid JSONL event"))
+            .collect();
+        let created = events
+            .iter()
+            .filter(|event| event["type"] == "input_script.created")
+            .count();
+        let injected = events
+            .iter()
+            .filter(|event| event["type"] == "input_script.injected")
+            .count();
+        assert_eq!(created, 1, "broadcast appends exactly one input_script.created");
+        assert_eq!(injected, 1, "broadcast appends exactly one input_script.injected");
+        // The recorded script is attributed to the target agent and carries the
+        // broadcast reason.
+        let created_event = events
+            .iter()
+            .find(|event| event["type"] == "input_script.created")
+            .unwrap();
+        assert_eq!(created_event["agent_id"], agent.id.to_string());
+        assert_eq!(created_event["payload"]["reason"], "agent.broadcast_input");
+
+        terminate_agent_process(&runtime, &agent.id.to_string()).await;
+        std::fs::remove_dir_all(root).expect("temporary root is removed");
+    }

@@ -19,6 +19,14 @@ pub enum CommandEffect {
     Quit,
     SpawnAgentPane(AgentProviderChoice),
     OpenConversationListPane,
+    OpenCommandsPane,
+    /// Broadcast raw input text into every PTY resolved by `target`. The client
+    /// loop performs the actual IPC round-trip and records the result via
+    /// [`TuiSessionState::push_commands_history`].
+    BroadcastInput {
+        target: String,
+        text: String,
+    },
     #[cfg(feature = "activity-feed")]
     ToggleActivityFeedPane {
         visible: bool,
@@ -69,6 +77,7 @@ impl AgentProviderChoice {
 pub enum NewPaneChoice {
     Agent(AgentProviderChoice),
     ConversationList,
+    Commands,
 }
 
 impl NewPaneChoice {
@@ -76,6 +85,7 @@ impl NewPaneChoice {
         match self {
             Self::Agent(provider) => provider.label(),
             Self::ConversationList => "Conversation List",
+            Self::Commands => "Broadcast commands",
         }
     }
 }
@@ -102,5 +112,9 @@ pub(crate) const PROVIDER_OPTIONS: &[ProviderOption] = &[
     ProviderOption {
         choice: NewPaneChoice::ConversationList,
         hint: "Message history panel",
+    },
+    ProviderOption {
+        choice: NewPaneChoice::Commands,
+        hint: "Broadcast input to all agents",
     },
 ];

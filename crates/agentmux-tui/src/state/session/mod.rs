@@ -26,6 +26,7 @@ use super::message::MessageListItem;
 use super::pane::ArenaCandidateState;
 use super::pane::{AgentPaneState, TerminalSize};
 use super::CONVERSATION_LIST_PANE_ID;
+use super::COMMANDS_PANE_ID;
 #[cfg(feature = "activity-feed")]
 use super::ACTIVITY_FEED_PANE_ID;
 #[cfg(feature = "activity-feed")]
@@ -34,6 +35,19 @@ use super::MAX_FEED_ENTRIES;
 mod accessors;
 mod apply;
 mod commands;
+
+/// One sent broadcast recorded in the Commands panel's history log.
+///
+/// `delivered` / `skipped` mirror the daemon's `AgentBroadcastInput` response:
+/// `skipped` counts agents that were not injected because a human was typing
+/// into them (the daemon owns that safety decision; the UI only reports it).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CommandsLogEntry {
+    pub target: String,
+    pub text: String,
+    pub delivered: usize,
+    pub skipped: usize,
+}
 
 pub struct TuiSessionState {
     panes: BTreeMap<String, AgentPaneState>,
@@ -67,6 +81,16 @@ pub struct TuiSessionState {
     arena_candidates: Vec<ArenaCandidateState>,
     #[cfg(feature = "arena")]
     arena_selected: usize,
+    /// Commands-panel input editor buffer (text the user is composing).
+    commands_input_buffer: String,
+    /// Current broadcast target: `"broadcast"` or `"role:<role>"`.
+    commands_target: String,
+    /// Sent-broadcast history, oldest first.
+    commands_history: Vec<CommandsLogEntry>,
+    /// `(target, text)` of an in-flight broadcast awaiting its daemon response.
+    /// The client loop records the request before sending, then the response
+    /// handler pairs it with the `delivered`/`skipped` counts for the history.
+    commands_pending_broadcast: Option<(String, String)>,
     daemon_protocol_version: Option<u32>,
     runtime_notice: Option<String>,
     /// Render mirror of the keymap dispatcher's `awaiting_prefix_command` flag.

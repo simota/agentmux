@@ -135,6 +135,46 @@ use super::*;
     }
 
     #[test]
+    fn agent_broadcast_input_request_builds_target_and_actions() {
+        // Default: paste the text and submit it with a trailing PressEnter.
+        let with_enter = agent_broadcast_input_request(
+            "broadcast".to_string(),
+            "git status".to_string(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(with_enter.command, IpcCommand::AgentBroadcastInput);
+        assert_eq!(with_enter.payload["target"], "broadcast");
+        assert_eq!(with_enter.payload["actions"][0]["paste_text"], "git status");
+        assert_eq!(with_enter.payload["actions"][1], "press_enter");
+
+        // --no-enter: paste only, no trailing PressEnter action.
+        let no_enter = agent_broadcast_input_request(
+            "role:tester".to_string(),
+            "echo hi".to_string(),
+            false,
+        )
+        .unwrap();
+        assert_eq!(no_enter.payload["target"], "role:tester");
+        assert_eq!(no_enter.payload["actions"].as_array().unwrap().len(), 1);
+        assert_eq!(no_enter.payload["actions"][0]["paste_text"], "echo hi");
+
+        // Empty target and empty text are rejected up front.
+        assert!(agent_broadcast_input_request(
+            "   ".to_string(),
+            "x".to_string(),
+            true
+        )
+        .is_err());
+        assert!(agent_broadcast_input_request(
+            "broadcast".to_string(),
+            String::new(),
+            true
+        )
+        .is_err());
+    }
+
+    #[test]
     fn sessions_list_request_targets_daemon_status() {
         let request = sessions_list_request();
 

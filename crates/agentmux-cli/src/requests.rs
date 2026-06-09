@@ -207,6 +207,44 @@ pub(crate) fn agent_send_request(agent_id: String, body: String) -> Result<Clien
     ))
 }
 
+/// Build an `agent.broadcast_input` request: raw input injected verbatim into
+/// every PTY resolved by `target` (the Commands-panel / `synchronize-panes`
+/// path). The text is pasted as one `PasteText` action; unless `submit` is
+/// false a trailing `PressEnter` is appended so the line is submitted.
+///
+/// The wire shape matches `agentmux_agent::InputAction`'s serde encoding:
+/// `PasteText(String)` -> `{"paste_text": "..."}`, the unit variant
+/// `PressEnter` -> the bare string `"press_enter"`.
+pub(crate) fn agent_broadcast_input_request(
+    target: String,
+    text: String,
+    submit: bool,
+) -> Result<ClientRequest> {
+    let target = target.trim();
+    if target.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "broadcast target must not be empty".to_string(),
+        ));
+    }
+    if text.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "broadcast input text must not be empty".to_string(),
+        ));
+    }
+    let mut actions = vec![json!({ "paste_text": text })];
+    if submit {
+        actions.push(json!("press_enter"));
+    }
+    Ok(ClientRequest::new(
+        "req_agent_broadcast_input",
+        IpcCommand::AgentBroadcastInput,
+        json!({
+            "target": target,
+            "actions": actions,
+        }),
+    ))
+}
+
 pub(crate) fn agent_inject_request(message_id: String, agent_id: String) -> ClientRequest {
     ClientRequest::new(
         "req_agent_inject",

@@ -610,6 +610,7 @@ pub(crate) fn parse_start_pane_choice(raw: &str) -> Result<StartupPaneChoice> {
     match raw.to_ascii_lowercase().as_str() {
         "messages" | "message" | "message-bus" | "message_bus" | "conversation-list"
         | "conversation_list" => Ok(StartupPaneChoice::Messages),
+        "commands" | "command" | "broadcast" => Ok(StartupPaneChoice::Commands),
         _ => parse_provider_choice(raw).map(StartupPaneChoice::Agent),
     }
 }
@@ -1029,5 +1030,26 @@ mod tests {
             message.contains("exceeds 100%"),
             "unexpected message: {message}"
         );
+    }
+
+    #[test]
+    fn commands_tokens_resolve_to_commands_pane_choice() {
+        for token in ["commands", "command", "broadcast", "COMMANDS", "Broadcast"] {
+            assert_eq!(
+                parse_start_pane_choice(token).expect("token parses"),
+                StartupPaneChoice::Commands,
+                "token {token:?} should resolve to Commands"
+            );
+        }
+    }
+
+    #[test]
+    fn commands_leaf_parses_inside_a_layout() {
+        let layout = ok("agy | commands");
+        assert_eq!(
+            layout.panes,
+            vec![agent(AgentProviderChoice::Agy), StartupPaneChoice::Commands]
+        );
+        assert_eq!(dir(&layout), SplitDirection::Vertical);
     }
 }

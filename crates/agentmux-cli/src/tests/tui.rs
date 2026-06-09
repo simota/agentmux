@@ -423,3 +423,54 @@ use agentmux_ipc::EVENT_SUBSCRIBE_PROTOCOL_VERSION;
         }));
         assert!(daemon_supports_arena_state(&state));
     }
+
+    #[test]
+    fn commands_input_key_maps_editor_actions() {
+        use crossterm::event::KeyCode;
+        assert_eq!(
+            commands_input_key(KeyCode::Enter),
+            Some(CommandsInputAction::Send)
+        );
+        assert_eq!(
+            commands_input_key(KeyCode::Tab),
+            Some(CommandsInputAction::CycleTarget)
+        );
+        assert_eq!(
+            commands_input_key(KeyCode::Esc),
+            Some(CommandsInputAction::Clear)
+        );
+        assert_eq!(
+            commands_input_key(KeyCode::Backspace),
+            Some(CommandsInputAction::Backspace)
+        );
+        assert_eq!(
+            commands_input_key(KeyCode::Char('a')),
+            Some(CommandsInputAction::Insert('a'))
+        );
+        assert_eq!(commands_input_key(KeyCode::Left), None);
+    }
+
+    #[test]
+    fn tui_stream_frame_records_broadcast_response_in_commands_history() {
+        let mut state = TuiSessionState::default();
+        state.commands_input_push('h');
+        state.begin_commands_broadcast("role:tester", "hi");
+
+        let response = DaemonResponse::ok(
+            "req_agent_broadcast_input",
+            json!({
+                "delivered": ["a1", "a2"],
+                "skipped": ["a3"]
+            }),
+        );
+        let response_id =
+            apply_tui_stream_frame(&mut state, DaemonStreamFrame::Response(response)).unwrap();
+
+        assert_eq!(response_id.as_deref(), Some("req_agent_broadcast_input"));
+        let history = state.commands_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].target, "role:tester");
+        assert_eq!(history[0].text, "hi");
+        assert_eq!(history[0].delivered, 2);
+        assert_eq!(history[0].skipped, 1);
+    }

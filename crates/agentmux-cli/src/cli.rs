@@ -80,6 +80,7 @@ pub(crate) struct StartArgs {
 pub(crate) enum StartupPaneChoice {
     Agent(AgentProviderChoice),
     Messages,
+    Commands,
 }
 
 #[derive(Parser)]
@@ -197,6 +198,17 @@ pub(crate) enum AgentAction {
         no_inject: bool,
         agent_id: String,
         body: String,
+    },
+    /// Broadcast raw input to multiple agents at once (synchronize-panes).
+    Broadcast {
+        /// Target (broadcast, role:<role>, team:<team>, agent:<name|id>). Defaults to broadcast.
+        #[arg(long, default_value = "broadcast")]
+        to: String,
+        /// Do not append a trailing Enter; the text is pasted without submitting.
+        #[arg(long = "no-enter")]
+        no_enter: bool,
+        /// The text to inject into every resolved agent PTY.
+        text: String,
     },
     /// Inject a queued message into an agent immediately.
     Inject {

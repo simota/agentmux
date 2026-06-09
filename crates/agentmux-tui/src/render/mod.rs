@@ -7,6 +7,7 @@
 //! - [`messages`]: message-bus / conversation-list panel and message line formatting
 //! - [`util`]: text/geometry helpers and terminal-to-ratatui style conversion
 
+mod commands;
 mod messages;
 mod overlays;
 mod pane;

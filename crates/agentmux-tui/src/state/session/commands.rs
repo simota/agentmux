@@ -47,6 +47,10 @@ impl TuiSessionState {
                             self.open_conversation_list_pane();
                             CommandEffect::OpenConversationListPane
                         }
+                        NewPaneChoice::Commands => {
+                            self.open_commands_pane();
+                            CommandEffect::OpenCommandsPane
+                        }
                     }
                 })
                 .unwrap_or(CommandEffect::Continue),
@@ -54,7 +58,7 @@ impl TuiSessionState {
                 let Some(focused) = self.layout.focused().map(ToOwned::to_owned) else {
                     return CommandEffect::Continue;
                 };
-                if focused == CONVERSATION_LIST_PANE_ID {
+                if focused == CONVERSATION_LIST_PANE_ID || focused == COMMANDS_PANE_ID {
                     self.layout.remove_pane(&focused);
                     CommandEffect::Continue
                 } else {
@@ -248,6 +252,128 @@ impl TuiSessionState {
         self.clear_copy_selection();
     }
 
+    pub fn open_commands_pane(&mut self) {
+        self.layout.add_pane(COMMANDS_PANE_ID.to_string());
+        self.layout.focus(COMMANDS_PANE_ID);
+        self.keybinding_help_visible = false;
+        self.session_list_visible = false;
+        self.message_bus_visible = false;
+        self.provider_picker_visible = false;
+        #[cfg(feature = "activity-feed")]
+        {
+            self.activity_feed_visible = false;
+        }
+        #[cfg(feature = "arena")]
+        {
+            self.arena_overlay_visible = false;
+        }
+        self.clear_copy_selection();
+    }
+
+    /// Append a printable character to the Commands input buffer.
+    pub fn commands_input_push(&mut self, ch: char) {
+        self.commands_input_buffer.push(ch);
+    }
+
+    /// Remove the last character from the Commands input buffer (no-op if empty).
+    pub fn commands_input_backspace(&mut self) {
+        self.commands_input_buffer.pop();
+    }
+
+    /// Clear the Commands input buffer.
+    pub fn commands_input_clear(&mut self) {
+        self.commands_input_buffer.clear();
+    }
+
+    /// Cycle the broadcast target through `["broadcast", "role:<r>", ...]`.
+    ///
+    /// The role list is the distinct set of roles across live agent panes,
+    /// sorted for a stable cycle order. With no roles available the target stays
+    /// `"broadcast"`.
+    pub fn cycle_commands_target(&mut self) {
+        let targets = self.commands_target_cycle();
+        let next = targets
+            .iter()
+            .position(|candidate| candidate == &self.commands_target)
+            .map(|index| (index + 1) % targets.len())
+            .unwrap_or(0);
+        self.commands_target = targets
+            .get(next)
+            .cloned()
+            .unwrap_or_else(|| "broadcast".to_string());
+    }
+
+    /// Build the broadcast-target cycle: `"broadcast"` followed by each distinct
+    /// live-agent role as `"role:<r>"`, sorted.
+    fn commands_target_cycle(&self) -> Vec<String> {
+        let mut roles: Vec<String> = self
+            .panes()
+            .filter(|pane| pane.process_id().is_some())
+            .filter_map(|pane| pane.role().map(ToOwned::to_owned))
+            .collect();
+        roles.sort();
+        roles.dedup();
+
+        let mut cycle = Vec::with_capacity(roles.len() + 1);
+        cycle.push("broadcast".to_string());
+        cycle.extend(roles.into_iter().map(|role| format!("role:{role}")));
+        cycle
+    }
+
+    /// Record a sent broadcast (with its delivery outcome) in the history log.
+    pub fn push_commands_history(
+        &mut self,
+        target: impl Into<String>,
+        text: impl Into<String>,
+        delivered: usize,
+        skipped: usize,
+    ) {
+        self.commands_history.push(CommandsLogEntry {
+            target: target.into(),
+            text: text.into(),
+            delivered,
+            skipped,
+        });
+    }
+
+    /// Record an in-flight broadcast so its daemon response can be paired with
+    /// the right `target`/`text` when recorded into history. Also clears the
+    /// input buffer, since the request has been handed off to the daemon.
+    pub fn begin_commands_broadcast(&mut self, target: impl Into<String>, text: impl Into<String>) {
+        self.commands_pending_broadcast = Some((target.into(), text.into()));
+        self.commands_input_clear();
+    }
+
+    /// Apply an `AgentBroadcastInput` response payload (`{delivered, skipped}`)
+    /// by pushing a history entry for the matching in-flight broadcast.
+    ///
+    /// Returns `true` when a pending broadcast was matched and recorded.
+    pub fn apply_commands_broadcast_response(&mut self, payload: &Value) -> bool {
+        let Some((target, text)) = self.commands_pending_broadcast.take() else {
+            return false;
+        };
+        let delivered = count_field(payload, "delivered");
+        let skipped = count_field(payload, "skipped");
+        self.push_commands_history(target, text, delivered, skipped);
+        true
+    }
+
+    /// Build a [`CommandEffect::BroadcastInput`] from the current buffer/target,
+    /// returning `None` when the buffer is empty (nothing to send).
+    ///
+    /// The buffer is left untouched; the client loop clears it via
+    /// [`Self::commands_input_clear`] once the daemon round-trip succeeds.
+    pub fn commands_broadcast_effect(&self) -> Option<CommandEffect> {
+        let text = self.commands_input_buffer.trim();
+        if text.is_empty() {
+            return None;
+        }
+        Some(CommandEffect::BroadcastInput {
+            target: self.commands_target.clone(),
+            text: self.commands_input_buffer.clone(),
+        })
+    }
+
     #[cfg(feature = "activity-feed")]
     pub fn open_activity_feed_pane(&mut self) {
         self.activity_feed_visible = true;
@@ -401,4 +527,14 @@ impl TuiSessionState {
             self.session_list_selected = count - 1;
         }
     }
+}
+
+/// Count the entries of a JSON array field (e.g. `delivered` / `skipped`),
+/// treating a missing or non-array field as zero.
+fn count_field(payload: &Value, field: &str) -> usize {
+    payload
+        .get(field)
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0)
 }

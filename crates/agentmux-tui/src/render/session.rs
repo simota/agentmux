@@ -9,6 +9,7 @@ use ratatui::{
 
 use crate::state::TuiSessionState;
 
+use super::commands::render_commands_panel;
 use super::messages::render_message_list_panel;
 #[cfg(feature = "activity-feed")]
 use super::overlays::render_activity_feed;
@@ -32,6 +33,12 @@ impl TuiSessionRenderer {
             if state.is_conversation_list_pane(&pane_id) {
                 let focused = state.layout().focused() == Some(pane_id.as_str());
                 render_message_list_panel(rect, state, "Conversation List", focused, buffer);
+                continue;
+            }
+
+            if state.is_commands_pane(&pane_id) {
+                let focused = state.layout().focused() == Some(pane_id.as_str());
+                render_commands_panel(rect, state, focused, buffer);
                 continue;
             }
 

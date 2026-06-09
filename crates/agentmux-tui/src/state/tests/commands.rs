@@ -124,6 +124,10 @@ use super::*;
         ));
         state.layout_mut().focus("agent_a");
         state.open_provider_picker();
+        // ConversationList is the second-to-last provider option (Commands is the
+        // last), so step back twice from index 0: wrap to Commands, then land on
+        // ConversationList.
+        state.apply_command(TuiCommand::ProviderPrevious);
         state.apply_command(TuiCommand::ProviderPrevious);
 
         assert_eq!(
@@ -147,6 +151,159 @@ use super::*;
         );
         assert!(!state.is_conversation_list_pane(CONVERSATION_LIST_PANE_ID));
         assert_eq!(state.layout().focused(), Some("agent_a"));
+    }
+
+    #[test]
+    fn provider_picker_can_open_and_close_commands_pane() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_a", "name": "a" }),
+        ));
+        state.layout_mut().focus("agent_a");
+        state.open_provider_picker();
+        // Commands is the last provider option.
+        for _ in 0..(state.provider_options().len() - 1) {
+            state.apply_command(TuiCommand::ProviderNext);
+        }
+        assert_eq!(
+            state.provider_options().last().unwrap().choice,
+            crate::state::NewPaneChoice::Commands
+        );
+
+        assert_eq!(
+            state.apply_command(TuiCommand::SelectProvider),
+            CommandEffect::OpenCommandsPane
+        );
+        assert!(!state.provider_picker_visible());
+        assert!(state.is_commands_pane(crate::state::COMMANDS_PANE_ID));
+        assert_eq!(
+            state.layout().focused(),
+            Some(crate::state::COMMANDS_PANE_ID)
+        );
+
+        assert_eq!(
+            state.apply_command(TuiCommand::ClosePane),
+            CommandEffect::Continue
+        );
+        assert!(!state.is_commands_pane(crate::state::COMMANDS_PANE_ID));
+        assert_eq!(state.layout().focused(), Some("agent_a"));
+    }
+
+    #[test]
+    fn commands_input_editing_pushes_backspaces_and_clears() {
+        let mut state = TuiSessionState::default();
+        assert_eq!(state.commands_input_buffer(), "");
+
+        state.commands_input_push('h');
+        state.commands_input_push('i');
+        state.commands_input_push('!');
+        assert_eq!(state.commands_input_buffer(), "hi!");
+
+        state.commands_input_backspace();
+        assert_eq!(state.commands_input_buffer(), "hi");
+
+        state.commands_input_clear();
+        assert_eq!(state.commands_input_buffer(), "");
+        // Backspace on an empty buffer is a no-op.
+        state.commands_input_backspace();
+        assert_eq!(state.commands_input_buffer(), "");
+    }
+
+    #[test]
+    fn cycle_commands_target_walks_broadcast_then_distinct_roles() {
+        let mut state = TuiSessionState::default();
+        // No live agents → only "broadcast" exists; cycling stays put.
+        assert_eq!(state.commands_target(), "broadcast");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "broadcast");
+
+        // Two implementers (same role) and one reviewer → distinct roles only.
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "a1", "name": "impl-1", "role": "implementer", "process_id": 1 }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "a2", "name": "impl-2", "role": "implementer", "process_id": 2 }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "r1", "name": "rev-1", "role": "reviewer", "process_id": 3 }),
+        ));
+
+        // broadcast -> role:implementer -> role:reviewer -> broadcast (sorted).
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "role:implementer");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "role:reviewer");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "broadcast");
+    }
+
+    #[test]
+    fn commands_broadcast_effect_skips_empty_and_carries_target() {
+        let mut state = TuiSessionState::default();
+        // Empty (and whitespace-only) buffers produce no effect.
+        assert_eq!(state.commands_broadcast_effect(), None);
+        state.commands_input_push(' ');
+        assert_eq!(state.commands_broadcast_effect(), None);
+
+        state.commands_input_clear();
+        state.commands_input_push('g');
+        state.commands_input_push('o');
+        assert_eq!(
+            state.commands_broadcast_effect(),
+            Some(CommandEffect::BroadcastInput {
+                target: "broadcast".to_string(),
+                text: "go".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn push_commands_history_accumulates_entries() {
+        let mut state = TuiSessionState::default();
+        assert!(state.commands_history().is_empty());
+
+        state.push_commands_history("broadcast", "run tests", 2, 1);
+        state.push_commands_history("role:tester", "again", 1, 0);
+
+        let history = state.commands_history();
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].target, "broadcast");
+        assert_eq!(history[0].text, "run tests");
+        assert_eq!(history[0].delivered, 2);
+        assert_eq!(history[0].skipped, 1);
+        assert_eq!(history[1].target, "role:tester");
+        assert_eq!(history[1].delivered, 1);
+        assert_eq!(history[1].skipped, 0);
+    }
+
+    #[test]
+    fn broadcast_response_pairs_pending_request_into_history() {
+        let mut state = TuiSessionState::default();
+        state.commands_input_push('x');
+        state.begin_commands_broadcast("broadcast", "x");
+        // begin_* clears the editor buffer (request handed to daemon).
+        assert_eq!(state.commands_input_buffer(), "");
+
+        let applied = state.apply_commands_broadcast_response(&json!({
+            "delivered": ["a1", "a2"],
+            "skipped": ["a3"]
+        }));
+        assert!(applied);
+
+        let history = state.commands_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].target, "broadcast");
+        assert_eq!(history[0].text, "x");
+        assert_eq!(history[0].delivered, 2);
+        assert_eq!(history[0].skipped, 1);
+
+        // A second response with no pending request is a no-op.
+        assert!(!state.apply_commands_broadcast_response(&json!({ "delivered": [] })));
+        assert_eq!(state.commands_history().len(), 1);
     }
 
     #[test]

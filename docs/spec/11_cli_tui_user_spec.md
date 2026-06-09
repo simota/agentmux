@@ -15,7 +15,7 @@ agentmux attach [task|session]
 agentmux daemon start|stop|status
 agentmux project init|open|status|install-result-protocol
 agentmux task run|status|pause|resume|cancel|summary
-agentmux agent ls|spawn|stop|send|inject|focus|interrupt
+agentmux agent ls|spawn|stop|send|inject|focus|interrupt|broadcast
 agentmux message list|history|show|send|inject
 agentmux meeting open|close|list
 agentmux context add|list|show|search|attach|inject|export
@@ -34,7 +34,9 @@ agentmux layout save|load|list
 agentmux start "agy,messages,codex"
 ```
 
-daemon未起動なら起動し、指定されたpaneを開いてからTUIを表示する。指定はcomma-separatedで、provider sessionの `claude`, `codex`, `agy` と、message履歴paneの `messages` を受け付ける。provider指定なしの `agentmux start` は通常のTUI起動と同じく、既存sessionがなければprovider pickerを表示する。
+daemon未起動なら起動し、指定されたpaneを開いてからTUIを表示する。指定はcomma-separatedで、provider sessionの `claude`, `codex`, `agy` と、message履歴paneの `messages`、broadcast コマンドパネルの `commands`（別名 `command` / `broadcast`）を受け付ける。provider指定なしの `agentmux start` は通常のTUI起動と同じく、既存sessionがなければprovider pickerを表示する。
+
+`commands` トークンはレイアウト記法の葉としても使える（例: `agentmux start "agy | commands"`）。内部的には sentinel pane `COMMANDS_PANE_ID`（`messages` の `CONVERSATION_LIST_PANE_ID` と同様）として扱われる。
 
 `agy` provider は既定で `--dangerously-skip-permissions` を付けて起動し、tool permission prompt で停止しにくい強いpermission modeにする。`agent.spawn` payloadで明示的に `args` を渡した場合は、その指定を優先する。
 
@@ -234,6 +236,18 @@ agentmux meeting close thread_01HX...
 `--max-turns`(既定 5)で制限され、上限到達後の投稿は拒否される。
 詳細は `06_message_bus_context_broker.md §3.6`。
 
+### 3.9 agent broadcast
+
+```bash
+agentmux agent broadcast "<text>"
+agentmux agent broadcast --to role:tester "<text>"
+agentmux agent broadcast --no-enter "<text>"
+```
+
+起動中の全エージェント（または `--to` で絞り込んだ対象）の PTY へテキストを生のまま一括注入する。`--to` 省略時は `broadcast`（全エージェント）。`--no-enter` を指定すると末尾の Enter キー送信を抑止する。バスメッセージ化ではなく生入力の直接注入であり、tmux の synchronize-panes に相当する。
+
+人間が typing 中の pane への注入はスキップされ（`human_input_quiet` ガード）、結果の `delivered` / `skipped` カウントが出力される。すべての注入は JSONL event log に記録される。
+
 ## 4. TUI画面構成
 
 標準layout:
@@ -258,6 +272,7 @@ agentmux meeting close thread_01HX...
 | AgentTui | Claude/Codex TUI |
 | Shell | test runner, git commands |
 | MessageBus | message一覧 |
+| Commands | 入力欄付きの専用 pane。全エージェントまたは role 絞り込みで生入力を一括 broadcast する（tmux synchronize-panes 相当）。上部に送信履歴ログ、下部に入力フィールドと現在の送信対象を表示する。 |
 | ContextBoard | context item一覧 |
 | ApprovalQueue | 承認待ち |
 | WorktreeDiff | diff表示 |
@@ -297,7 +312,18 @@ Ctrl-g r        resize mode
 Ctrl-g Space    rotate layout
 ```
 
-`Ctrl-g %` / `Ctrl-g "` は空のshell paneを作らず、provider pickerを表示する。選択肢は `Claude Code`, `Codex`, `Antigravity`, `Conversation List`。coding agentをEnterで選択すると起動してそのpaneへattachする。`Conversation List` はmessage履歴を通常paneとして開く。`Enter` / `Space` / `d` でcompact/detail表示を切り替える。`Ctrl-g x` で閉じる。
+`Ctrl-g %` / `Ctrl-g "` は空のshell paneを作らず、provider pickerを表示する。選択肢は `Claude Code`, `Codex`, `Antigravity`, `Conversation List`, `Broadcast commands`。coding agentをEnterで選択すると起動してそのpaneへattachする。`Conversation List` はmessage履歴を通常paneとして開く。`Broadcast commands` はCommandsパネルを開く。`Enter` / `Space` / `d` でcompact/detail表示を切り替える。`Ctrl-g x` で閉じる。
+
+**Commands パネル操作キー（focused 時）:**
+
+```text
+Enter           テキストを送信対象へ broadcast
+Tab             送信対象を巡回（broadcast → role:<role> → …）
+Esc             入力フィールドをクリア
+Backspace / 印字文字   入力フィールドを編集
+```
+
+prefix（`Ctrl-g`）コマンドはCommands pane上でも従来どおり機能する。
 
 ### 6.3 Agent操作
 

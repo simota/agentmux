@@ -34,9 +34,10 @@ use tokio::task::JoinHandle;
 use crate::daemon::ensure_daemon;
 use crate::output::response_error;
 use crate::requests::{
-    agent_resize_request, agent_spawn_for_provider_request_with_id,
-    agent_spawn_for_provider_request_with_size, agent_stop_request, attach_request,
-    detach_request, message_list_request, snapshot_request, tui_daemon_status_request,
+    agent_broadcast_input_request, agent_resize_request,
+    agent_spawn_for_provider_request_with_id, agent_spawn_for_provider_request_with_size,
+    agent_stop_request, attach_request, detach_request, message_list_request, snapshot_request,
+    tui_daemon_status_request,
 };
 #[cfg(feature = "activity-feed")]
 use crate::requests::event_subscribe_request;
@@ -49,7 +50,7 @@ use crate::daemon::daemon_supports_arena_state;
 use crate::cli::StartupPaneChoice;
 use crate::parse::{StartupLayout, StartupLayoutNode};
 use agentmux_tui::layout::LayoutNode;
-use agentmux_tui::state::CONVERSATION_LIST_PANE_ID;
+use agentmux_tui::state::{COMMANDS_PANE_ID, CONVERSATION_LIST_PANE_ID};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuiSignal {
@@ -131,12 +132,15 @@ pub(crate) async fn run_tui_session_inner(
     let open_startup_messages = startup_panes
         .iter()
         .any(|pane| matches!(pane, StartupPaneChoice::Messages));
+    let open_startup_commands = startup_panes
+        .iter()
+        .any(|pane| matches!(pane, StartupPaneChoice::Commands));
     let startup_spawn_requests = startup_panes
         .iter()
         .copied()
         .filter_map(|pane| match pane {
             StartupPaneChoice::Agent(provider) => Some(provider),
-            StartupPaneChoice::Messages => None,
+            StartupPaneChoice::Messages | StartupPaneChoice::Commands => None,
         })
         .enumerate()
         .map(|(index, provider)| {
@@ -210,6 +214,8 @@ pub(crate) async fn run_tui_session_inner(
             state.apply_startup_layout(root);
         } else if open_startup_messages {
             state.open_conversation_list_pane();
+        } else if open_startup_commands {
+            state.open_commands_pane();
         }
         if state.layout().panes().is_empty() {
             state.open_provider_picker();
@@ -374,6 +380,10 @@ pub(crate) async fn run_tui_session_inner(
                 .layout()
                 .focused()
                 .is_some_and(|pane_id| state.is_conversation_list_pane(pane_id));
+            let commands_pane_focused = state
+                .layout()
+                .focused()
+                .is_some_and(|pane_id| state.is_commands_pane(pane_id));
             #[cfg(feature = "activity-feed")]
             let activity_feed_focused = state
                 .layout()
@@ -421,6 +431,43 @@ pub(crate) async fn run_tui_session_inner(
             // status bar can show the PREFIX indicator (single source of truth
             // stays in the dispatcher; this just reflects it each key event).
             state.set_prefix_active(keymap.is_awaiting_prefix_command());
+
+            // Commands pane owns plain keystrokes: route them to the local input
+            // editor instead of an agent PTY. Prefix-mode commands (pane switch,
+            // close, etc.) still flow through `apply_command` below, because the
+            // dispatcher classifies them as `Command`/`PrefixStarted` rather than
+            // forwarded/consumed input.
+            if commands_pane_focused
+                && matches!(
+                    dispatch,
+                    agentmux_tui::keymap::KeyDispatch::ForwardToFocusedPane(_)
+                        | agentmux_tui::keymap::KeyDispatch::Consumed
+                )
+            {
+                match commands_input_key(key.code) {
+                    Some(CommandsInputAction::Send) => {
+                        if let Some(CommandEffect::BroadcastInput { target, text }) =
+                            state.commands_broadcast_effect()
+                        {
+                            match agent_broadcast_input_request(target.clone(), text.clone(), true) {
+                                Ok(request) => {
+                                    state.begin_commands_broadcast(target, text);
+                                    writer.write(&request).await?;
+                                }
+                                Err(error) => state.set_runtime_notice(error.to_string()),
+                            }
+                        }
+                    }
+                    Some(CommandsInputAction::CycleTarget) => state.cycle_commands_target(),
+                    Some(CommandsInputAction::Clear) => state.commands_input_clear(),
+                    Some(CommandsInputAction::Backspace) => state.commands_input_backspace(),
+                    Some(CommandsInputAction::Insert(ch)) => state.commands_input_push(ch),
+                    None => {}
+                }
+                draw_tui_frame(&mut terminal, &renderer, &state)?;
+                continue;
+            }
+
             if let Some(command) = match &dispatch {
                 agentmux_tui::keymap::KeyDispatch::Command(command) => Some(*command),
                 _ => None,
@@ -454,6 +501,29 @@ pub(crate) async fn run_tui_session_inner(
                         )
                         .await?;
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                    CommandEffect::OpenCommandsPane => {
+                        sync_current_terminal_pane_sizes(
+                            &mut writer,
+                            &mut state,
+                            &mut resize_sequence,
+                        )
+                        .await?;
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                    CommandEffect::BroadcastInput { target, text } => {
+                        // Plain-key path emits this directly; this arm covers the
+                        // (currently unused) command path and keeps the match total.
+                        match agent_broadcast_input_request(target.clone(), text.clone(), true) {
+                            Ok(request) => {
+                                state.begin_commands_broadcast(target, text);
+                                writer.write(&request).await?;
+                            }
+                            Err(error) => {
+                                state.set_runtime_notice(error.to_string());
+                                draw_tui_frame(&mut terminal, &renderer, &state)?;
+                            }
+                        }
                     }
                     #[cfg(feature = "activity-feed")]
                     CommandEffect::ToggleActivityFeedPane { visible } => {
@@ -636,6 +706,11 @@ pub(crate) fn apply_tui_stream_frame(
                     state.apply_daemon_status(&json!({ "agents": [payload] }));
                 }
             }
+            if response.id == "req_agent_broadcast_input" {
+                state.apply_commands_broadcast_response(
+                    &response.payload.clone().unwrap_or_else(|| json!({})),
+                );
+            }
             Ok(Some(response.id))
         }
         DaemonStreamFrame::Event(event) => {
@@ -754,6 +829,7 @@ fn resolve_startup_layout(
             }
         }
         StartupPaneChoice::Messages => CONVERSATION_LIST_PANE_ID.to_string(),
+        StartupPaneChoice::Commands => COMMANDS_PANE_ID.to_string(),
     });
 
     if resolution_failed {
@@ -813,6 +889,31 @@ pub(crate) fn mouse_scroll_delta(kind: MouseEventKind) -> Option<isize> {
 pub(crate) enum CopyModeAction {
     Redraw,
     CopyAndExit(String),
+}
+
+/// A Commands-panel input editor action derived from a single key press.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum CommandsInputAction {
+    Send,
+    CycleTarget,
+    Clear,
+    Backspace,
+    Insert(char),
+}
+
+/// Map a key code to a Commands-panel input action.
+///
+/// `Enter` submits, `Tab` cycles the broadcast target, `Esc` clears, `Backspace`
+/// deletes, and printable characters are inserted. Other keys are ignored.
+pub(crate) fn commands_input_key(code: KeyCode) -> Option<CommandsInputAction> {
+    match code {
+        KeyCode::Enter => Some(CommandsInputAction::Send),
+        KeyCode::Tab => Some(CommandsInputAction::CycleTarget),
+        KeyCode::Esc => Some(CommandsInputAction::Clear),
+        KeyCode::Backspace => Some(CommandsInputAction::Backspace),
+        KeyCode::Char(ch) => Some(CommandsInputAction::Insert(ch)),
+        _ => None,
+    }
 }
 
 pub(crate) fn copy_mode_key_exits(code: KeyCode, modifiers: KeyModifiers) -> bool {

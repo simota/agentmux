@@ -339,6 +339,86 @@ pub(crate) async fn handle_request(
                 ),
             }
         }
+        IpcCommand::AgentBroadcastInput => {
+            let target = match request
+                .payload
+                .get("target")
+                .and_then(|value| value.as_str())
+            {
+                Some(raw) => match parse_message_target(raw) {
+                    Ok(target) => target,
+                    Err(error) => {
+                        return DaemonResponse::error(
+                            request.id,
+                            ErrorBody::new("INVALID_BROADCAST_TARGET", error.to_string()),
+                        );
+                    }
+                },
+                None => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new(
+                            "INVALID_BROADCAST_TARGET",
+                            "agent.broadcast_input requires target",
+                        )
+                        .with_hint("use target=broadcast or role:<role>"),
+                    );
+                }
+            };
+            let actions = match request.payload.get("actions") {
+                Some(value) => match serde_json::from_value::<Vec<InputAction>>(value.clone()) {
+                    Ok(actions) => actions,
+                    Err(error) => {
+                        return DaemonResponse::error(
+                            request.id,
+                            ErrorBody::new(
+                                "INVALID_BROADCAST_ACTIONS",
+                                format!("agent.broadcast_input actions are invalid: {error}"),
+                            ),
+                        );
+                    }
+                },
+                None => {
+                    return DaemonResponse::error(
+                        request.id,
+                        ErrorBody::new(
+                            "INVALID_BROADCAST_ACTIONS",
+                            "agent.broadcast_input requires a non-empty actions array",
+                        ),
+                    );
+                }
+            };
+            if actions.is_empty() {
+                return DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new(
+                        "INVALID_BROADCAST_ACTIONS",
+                        "agent.broadcast_input requires a non-empty actions array",
+                    ),
+                );
+            }
+            match runtime.broadcast_input(&target, &actions).await {
+                Ok(outcome) => DaemonResponse::ok(
+                    request.id,
+                    json!({
+                        "delivered": outcome
+                            .delivered
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>(),
+                        "skipped": outcome
+                            .skipped
+                            .iter()
+                            .map(|id| id.to_string())
+                            .collect::<Vec<_>>(),
+                    }),
+                ),
+                Err(error) => DaemonResponse::error(
+                    request.id,
+                    ErrorBody::new("BROADCAST_INPUT_FAILED", error.to_string()),
+                ),
+            }
+        }
         IpcCommand::MeetingOpen => {
             let Some(topic) = payload_string_field(&request.payload, "topic")
                 .filter(|topic| !topic.trim().is_empty())

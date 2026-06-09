@@ -239,6 +239,8 @@ pub enum IpcCommand {
     AgentFocus,
     #[serde(rename = "agent.send_input_script")]
     AgentSendInputScript,
+    #[serde(rename = "agent.broadcast_input")]
+    AgentBroadcastInput,
     #[serde(rename = "agent.snapshot")]
     AgentSnapshot,
     #[serde(rename = "meeting.open")]
@@ -491,6 +493,36 @@ mod tests {
             let encoded = serde_json::to_value(event).unwrap();
             assert_eq!(encoded["type"], expected);
         }
+    }
+
+    #[test]
+    fn agent_broadcast_input_command_round_trips_payload() {
+        // The broadcast-input wire shape: a target string (broadcast / role:<r>
+        // / agent:<id> ...) plus a list of InputAction values. The daemon writes
+        // these actions verbatim into every resolved-and-quiet agent PTY.
+        let request = ClientRequest::new(
+            "req_agent_broadcast",
+            IpcCommand::AgentBroadcastInput,
+            json!({
+                "target": "broadcast",
+                "actions": [
+                    { "paste_text": "ls -la" },
+                    "press_enter"
+                ]
+            }),
+        );
+
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(encoded["type"], "agent.broadcast_input");
+        assert_eq!(encoded["payload"]["target"], "broadcast");
+        assert_eq!(encoded["payload"]["actions"][0]["paste_text"], "ls -la");
+
+        let decoded: ClientRequest = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.command, IpcCommand::AgentBroadcastInput);
+        assert_eq!(
+            decoded.protocol_compatibility(),
+            ProtocolCompatibility::Compatible
+        );
     }
 
     #[test]
