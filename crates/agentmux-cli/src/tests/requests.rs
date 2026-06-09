@@ -138,7 +138,8 @@ use super::*;
         assert_eq!(request.id, "req_agent_spawn_provider");
         assert_eq!(request.command, IpcCommand::AgentSpawn);
         assert_eq!(request.payload["provider"], "codex");
-        assert_eq!(request.payload["role"], "implementer");
+        // No role is sent: the daemon assigns the initial role "default".
+        assert!(request.payload.get("role").is_none());
         let name = request.payload["name"].as_str().unwrap();
         assert!(name.starts_with("codex-"));
         assert_eq!(name.len(), "codex-".len() + 6);
@@ -151,7 +152,8 @@ use super::*;
         assert_eq!(request.id, "req_agent_spawn_provider");
         assert_eq!(request.command, IpcCommand::AgentSpawn);
         assert_eq!(request.payload["provider"], "agy");
-        assert_eq!(request.payload["role"], "implementer");
+        // No role is sent: the daemon assigns the initial role "default".
+        assert!(request.payload.get("role").is_none());
         let name = request.payload["name"].as_str().unwrap();
         assert!(name.starts_with("agy-"));
         assert_eq!(name.len(), "agy-".len() + 6);

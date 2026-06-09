@@ -137,9 +137,10 @@ pub(crate) fn agent_spawn_for_provider_request_with_id(
     provider: AgentProviderChoice,
     size: Option<TuiTerminalSize>,
 ) -> ClientRequest {
+    // No explicit role: the daemon assigns the initial role "default". Roles are
+    // changed later via `agent set-role` / the commands panel `/role` command.
     let mut payload = json!({
         "provider": provider.provider(),
-        "role": "implementer",
         "name": unique_agent_name(provider.default_name()),
     });
     if let Some(size) = size {
