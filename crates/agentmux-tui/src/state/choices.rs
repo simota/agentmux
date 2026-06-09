@@ -27,6 +27,14 @@ pub enum CommandEffect {
         target: String,
         text: String,
     },
+    /// Assign `role` to the single live session resolved by the Commands-panel
+    /// target. Emitted when the operator submits `/role <newrole>` with an
+    /// `agent:<name>` target. The client loop performs the `agent.set_role`
+    /// IPC round-trip and records the result via the Commands history.
+    AssignRole {
+        agent_id: String,
+        role: String,
+    },
     #[cfg(feature = "activity-feed")]
     ToggleActivityFeedPane {
         visible: bool,

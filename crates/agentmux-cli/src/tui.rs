@@ -16,7 +16,7 @@ use agentmux_tui::{
     layout::{PaneLayout, Rect, SplitDirection},
     render::TuiSessionRenderer,
     state::{
-        CommandEffect, CopyPoint, CopySelection, StateChange,
+        CommandEffect, CommandsSubmit, CopyPoint, CopySelection, StateChange,
         TerminalSize as TuiTerminalSize, TuiSessionState,
     },
     terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
@@ -34,7 +34,7 @@ use tokio::task::JoinHandle;
 use crate::daemon::ensure_daemon;
 use crate::output::response_error;
 use crate::requests::{
-    agent_broadcast_input_request, agent_resize_request,
+    agent_broadcast_input_request, agent_resize_request, agent_set_role_request,
     agent_spawn_for_provider_request_with_id, agent_spawn_for_provider_request_with_size,
     agent_stop_request, attach_request, detach_request, message_list_request, snapshot_request,
     tui_daemon_status_request,
@@ -460,10 +460,9 @@ pub(crate) async fn run_tui_session_inner(
                 )
             {
                 match commands_input_key(key.code) {
-                    Some(CommandsInputAction::Send) => {
-                        if let Some(CommandEffect::BroadcastInput { target, text }) =
-                            state.commands_broadcast_effect()
-                        {
+                    Some(CommandsInputAction::Send) => match state.parse_commands_input() {
+                        Some(CommandsSubmit::Broadcast(text)) => {
+                            let target = state.commands_target().to_string();
                             match agent_broadcast_input_request(target.clone(), text.clone(), true) {
                                 Ok(request) => {
                                     state.begin_commands_broadcast(target, text);
@@ -472,7 +471,20 @@ pub(crate) async fn run_tui_session_inner(
                                 Err(error) => state.set_runtime_notice(error.to_string()),
                             }
                         }
-                    }
+                        Some(CommandsSubmit::AssignRole { agent_id, role }) => {
+                            match agent_set_role_request(agent_id, role.clone()) {
+                                Ok(request) => {
+                                    state.begin_commands_role_assign(role);
+                                    writer.write(&request).await?;
+                                }
+                                Err(error) => state.fail_commands_role_assign(error.to_string()),
+                            }
+                        }
+                        Some(CommandsSubmit::Error(message)) => {
+                            state.fail_commands_role_assign(message);
+                        }
+                        None => {}
+                    },
                     Some(CommandsInputAction::CycleTarget) => state.cycle_commands_target(),
                     Some(CommandsInputAction::Clear) => state.commands_input_clear(),
                     Some(CommandsInputAction::Backspace) => state.commands_input_backspace(),
@@ -536,6 +548,20 @@ pub(crate) async fn run_tui_session_inner(
                             }
                             Err(error) => {
                                 state.set_runtime_notice(error.to_string());
+                                draw_tui_frame(&mut terminal, &renderer, &state)?;
+                            }
+                        }
+                    }
+                    CommandEffect::AssignRole { agent_id, role } => {
+                        // Plain-key path emits this directly; this arm covers the
+                        // (currently unused) command path and keeps the match total.
+                        match agent_set_role_request(agent_id, role.clone()) {
+                            Ok(request) => {
+                                state.begin_commands_role_assign(role);
+                                writer.write(&request).await?;
+                            }
+                            Err(error) => {
+                                state.fail_commands_role_assign(error.to_string());
                                 draw_tui_frame(&mut terminal, &renderer, &state)?;
                             }
                         }
@@ -723,6 +749,11 @@ pub(crate) fn apply_tui_stream_frame(
             }
             if response.id == "req_agent_broadcast_input" {
                 state.apply_commands_broadcast_response(
+                    &response.payload.clone().unwrap_or_else(|| json!({})),
+                );
+            }
+            if response.id == "req_agent_set_role" {
+                state.apply_commands_role_response(
                     &response.payload.clone().unwrap_or_else(|| json!({})),
                 );
             }

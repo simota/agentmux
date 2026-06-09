@@ -60,6 +60,11 @@ impl AgentPaneState {
         self.role.as_deref()
     }
 
+    /// Overwrite this pane's role label (driven by `agent.role_changed`).
+    pub(crate) fn set_role(&mut self, role: impl Into<String>) {
+        self.role = Some(role.into());
+    }
+
     pub fn status(&self) -> Option<&str> {
         self.status.as_deref()
     }

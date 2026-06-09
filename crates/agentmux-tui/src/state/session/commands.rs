@@ -352,8 +352,34 @@ impl TuiSessionState {
         self.commands_history.push(CommandsLogEntry {
             target: target.into(),
             text: text.into(),
-            delivered,
-            skipped,
+            kind: CommandsLogKind::Broadcast { delivered, skipped },
+        });
+    }
+
+    /// Record a successful role assignment in the history log.
+    pub fn push_commands_role_history(
+        &mut self,
+        target: impl Into<String>,
+        role: impl Into<String>,
+    ) {
+        let role = role.into();
+        self.commands_history.push(CommandsLogEntry {
+            target: target.into(),
+            text: format!("/role {role}"),
+            kind: CommandsLogKind::RoleAssigned { role },
+        });
+    }
+
+    /// Record an error line (rejected `/role` submission etc.) in the history log.
+    pub fn push_commands_error_history(
+        &mut self,
+        target: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.commands_history.push(CommandsLogEntry {
+            target: target.into(),
+            text: message.into(),
+            kind: CommandsLogKind::Error,
         });
     }
 
@@ -393,6 +419,108 @@ impl TuiSessionState {
             target: self.commands_target.clone(),
             text: self.commands_input_buffer.clone(),
         })
+    }
+
+    /// Interpret the current Commands-panel input against the current target.
+    ///
+    /// The panel is command-oriented: every submission is a slash command.
+    ///
+    /// - `/send "<text>"` (quotes optional) broadcasts the raw text to the
+    ///   current target. Empty text -> [`CommandsSubmit::Error`].
+    /// - `/role <newrole>` assigns a role to the selected session. The target
+    ///   must be a single live session (`agent:<name>` resolving to a live
+    ///   pane); anything else (`broadcast`, `role:<…>`, or an unresolved
+    ///   `agent:<name>`) -> [`CommandsSubmit::Error`]. Empty role -> Error.
+    /// - Plain (non-slash) text or an unknown `/command` -> [`CommandsSubmit::Error`];
+    ///   text is never broadcast implicitly — use `/send`.
+    /// - An empty buffer yields `None` (nothing to submit).
+    pub fn parse_commands_input(&self) -> Option<CommandsSubmit> {
+        let trimmed = self.commands_input_buffer.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+
+        let Some(without_slash) = trimmed.strip_prefix('/') else {
+            return Some(CommandsSubmit::Error(
+                "commands start with '/'; use /send \"<text>\" to broadcast".to_string(),
+            ));
+        };
+
+        let (command, rest) = match without_slash.split_once(char::is_whitespace) {
+            Some((command, rest)) => (command, rest.trim()),
+            None => (without_slash, ""),
+        };
+
+        match command {
+            "send" => {
+                let text = unquote(rest);
+                if text.is_empty() {
+                    return Some(CommandsSubmit::Error(
+                        "/send requires text, e.g. /send \"hello\"".to_string(),
+                    ));
+                }
+                Some(CommandsSubmit::Broadcast(text.to_string()))
+            }
+            "role" => {
+                if rest.is_empty() {
+                    return Some(CommandsSubmit::Error(
+                        "/role requires a role name".to_string(),
+                    ));
+                }
+                let Some(name) = self.commands_target.strip_prefix("agent:") else {
+                    return Some(CommandsSubmit::Error(
+                        "select a single session (agent:<name>) first".to_string(),
+                    ));
+                };
+                match self.live_agent_id_by_name(name) {
+                    Some(agent_id) => Some(CommandsSubmit::AssignRole {
+                        agent_id,
+                        role: rest.to_string(),
+                    }),
+                    None => Some(CommandsSubmit::Error(format!("no live session named {name}"))),
+                }
+            }
+            other => Some(CommandsSubmit::Error(format!("unknown command: /{other}"))),
+        }
+    }
+
+    /// Resolve a live pane's `agent_id` from its session name. Returns `None`
+    /// when no live (process-backed) pane carries that exact name.
+    fn live_agent_id_by_name(&self, name: &str) -> Option<String> {
+        self.panes()
+            .filter(|pane| pane.process_id().is_some())
+            .find(|pane| pane.name() == name)
+            .map(|pane| pane.agent_id().to_string())
+    }
+
+    /// Record an in-flight role assignment so its `agent.set_role` response can
+    /// be paired with the right `target`/`role` when recorded into history. Also
+    /// clears the input buffer, since the request has been handed off.
+    pub fn begin_commands_role_assign(&mut self, role: impl Into<String>) {
+        self.commands_pending_role = Some((self.commands_target.clone(), role.into()));
+        self.commands_input_clear();
+    }
+
+    /// Apply an `agent.set_role` response payload (`{agent_id, role}`) by pushing
+    /// a success history entry for the matching in-flight role assignment. The
+    /// response `role` (the canonical label) is preferred over the requested one.
+    ///
+    /// Returns `true` when a pending role assignment was matched and recorded.
+    pub fn apply_commands_role_response(&mut self, payload: &Value) -> bool {
+        let Some((target, requested_role)) = self.commands_pending_role.take() else {
+            return false;
+        };
+        let role = string_field(payload, "role").unwrap_or(requested_role);
+        self.push_commands_role_history(target, role);
+        true
+    }
+
+    /// Record an error line for a rejected role assignment and clear the input.
+    pub fn fail_commands_role_assign(&mut self, message: impl Into<String>) {
+        let target = self.commands_target.clone();
+        self.push_commands_error_history(target, message);
+        self.commands_pending_role = None;
+        self.commands_input_clear();
     }
 
     #[cfg(feature = "activity-feed")]
@@ -558,4 +686,19 @@ fn count_field(payload: &Value, field: &str) -> usize {
         .and_then(Value::as_array)
         .map(Vec::len)
         .unwrap_or(0)
+}
+
+/// Strip one pair of matching surrounding quotes (`"` or `'`) from an already
+/// trimmed string; otherwise return it unchanged. Lets `/send "hi"` and
+/// `/send hi` both broadcast `hi`.
+fn unquote(value: &str) -> &str {
+    let bytes = value.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return &value[1..value.len() - 1];
+        }
+    }
+    value
 }

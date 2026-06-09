@@ -304,11 +304,21 @@ use super::*;
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].target, "broadcast");
         assert_eq!(history[0].text, "run tests");
-        assert_eq!(history[0].delivered, 2);
-        assert_eq!(history[0].skipped, 1);
+        assert_eq!(
+            history[0].kind,
+            CommandsLogKind::Broadcast {
+                delivered: 2,
+                skipped: 1
+            }
+        );
         assert_eq!(history[1].target, "role:tester");
-        assert_eq!(history[1].delivered, 1);
-        assert_eq!(history[1].skipped, 0);
+        assert_eq!(
+            history[1].kind,
+            CommandsLogKind::Broadcast {
+                delivered: 1,
+                skipped: 0
+            }
+        );
     }
 
     #[test]
@@ -329,8 +339,13 @@ use super::*;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].target, "broadcast");
         assert_eq!(history[0].text, "x");
-        assert_eq!(history[0].delivered, 2);
-        assert_eq!(history[0].skipped, 1);
+        assert_eq!(
+            history[0].kind,
+            CommandsLogKind::Broadcast {
+                delivered: 2,
+                skipped: 1
+            }
+        );
 
         // A second response with no pending request is a no-op.
         assert!(!state.apply_commands_broadcast_response(&json!({ "delivered": [] })));
@@ -626,5 +641,229 @@ use super::*;
         assert!(options.contains(&"agent:plan".to_string()));
         assert!(options.contains(&"agent:impl".to_string()));
         assert_eq!(options.len(), 5); // broadcast + 2 roles + 2 agents
+    }
+
+    /// Cycle the broadcast target until it equals `want` (panics if unreachable).
+    fn select_target(state: &mut TuiSessionState, want: &str) {
+        for _ in 0..state.commands_target_options().len() {
+            if state.commands_target() == want {
+                return;
+            }
+            state.cycle_commands_target();
+        }
+        assert_eq!(state.commands_target(), want, "target {want} not reachable");
+    }
+
+    fn type_input(state: &mut TuiSessionState, text: &str) {
+        for ch in text.chars() {
+            state.commands_input_push(ch);
+        }
+    }
+
+    #[test]
+    fn parse_commands_input_returns_none_when_buffer_empty() {
+        let mut state = TuiSessionState::default();
+        assert_eq!(state.parse_commands_input(), None);
+        state.commands_input_push(' ');
+        assert_eq!(state.parse_commands_input(), None);
+    }
+
+    #[test]
+    fn parse_commands_input_role_assigns_to_resolved_live_agent() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+
+        type_input(&mut state, "/role qa-lead");
+        assert_eq!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::AssignRole {
+                agent_id: "agent_foo".to_string(),
+                role: "qa-lead".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_commands_input_empty_role_is_error() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+
+        type_input(&mut state, "/role ");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn parse_commands_input_role_against_broadcast_target_is_error() {
+        let mut state = TuiSessionState::default();
+        assert_eq!(state.commands_target(), "broadcast");
+        type_input(&mut state, "/role x");
+        match state.parse_commands_input() {
+            Some(CommandsSubmit::Error(message)) => {
+                assert!(message.contains("agent:<name>"), "message: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_commands_input_role_against_unresolved_agent_is_error() {
+        let mut state = TuiSessionState::default();
+        // Spawn a live pane so the target group is non-empty, then point the
+        // target at a ghost name that no pane carries (manually, since cycling
+        // only ever yields live names).
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+        // Remove the only live session so `agent:foo` no longer resolves.
+        state.apply_event(&event(
+            IpcEventKind::AgentExited,
+            json!({ "agent_id": "agent_foo" }),
+        ));
+
+        type_input(&mut state, "/role qa");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn parse_commands_input_send_broadcasts_quoted_and_unquoted() {
+        let mut state = TuiSessionState::default();
+        type_input(&mut state, "/send \"hello world\"");
+        assert_eq!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Broadcast("hello world".to_string()))
+        );
+
+        state.commands_input_clear();
+        type_input(&mut state, "/send hi");
+        assert_eq!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Broadcast("hi".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_commands_input_send_without_text_is_error() {
+        let mut state = TuiSessionState::default();
+        type_input(&mut state, "/send");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn parse_commands_input_plain_text_is_error() {
+        let mut state = TuiSessionState::default();
+        // Plain text is never broadcast implicitly — it must go through /send.
+        type_input(&mut state, "hello world");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn parse_commands_input_unknown_command_is_error() {
+        let mut state = TuiSessionState::default();
+        // `/rolex foo` parses to the unknown command `rolex`, not a broadcast.
+        type_input(&mut state, "/rolex foo");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn apply_agent_role_changed_updates_matching_pane() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        assert_eq!(state.pane("agent_foo").and_then(|p| p.role()), Some("implementer"));
+
+        let change = state.apply_event(&event(
+            IpcEventKind::AgentRoleChanged,
+            json!({ "agent_id": "agent_foo", "role": "qa-lead" }),
+        ));
+        assert_eq!(change, StateChange::UpdatedPane("agent_foo".to_string()));
+        assert_eq!(state.pane("agent_foo").and_then(|p| p.role()), Some("qa-lead"));
+        // The role group of the target options now reflects the new role.
+        assert!(state
+            .commands_target_options()
+            .contains(&"role:qa-lead".to_string()));
+    }
+
+    #[test]
+    fn apply_agent_role_changed_ignores_unknown_agent() {
+        let mut state = TuiSessionState::default();
+        let change = state.apply_event(&event(
+            IpcEventKind::AgentRoleChanged,
+            json!({ "agent_id": "ghost", "role": "qa-lead" }),
+        ));
+        assert_eq!(change, StateChange::Ignored);
+        assert!(state.pane("ghost").is_none());
+    }
+
+    #[test]
+    fn role_assign_response_records_success_history_entry() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+
+        state.begin_commands_role_assign("qa-lead");
+        // begin_* clears the editor buffer (request handed to daemon).
+        assert_eq!(state.commands_input_buffer(), "");
+
+        let applied = state.apply_commands_role_response(&json!({
+            "agent_id": "agent_foo",
+            "role": "qa-lead"
+        }));
+        assert!(applied);
+
+        let history = state.commands_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].target, "agent:foo");
+        assert_eq!(
+            history[0].kind,
+            CommandsLogKind::RoleAssigned {
+                role: "qa-lead".to_string()
+            }
+        );
+
+        // A second response with no pending assignment is a no-op.
+        assert!(!state.apply_commands_role_response(&json!({ "role": "x" })));
+        assert_eq!(state.commands_history().len(), 1);
+    }
+
+    #[test]
+    fn fail_commands_role_assign_records_error_history_entry() {
+        let mut state = TuiSessionState::default();
+        type_input(&mut state, "/role x");
+        state.fail_commands_role_assign("select a single session (agent:<name>) first");
+
+        let history = state.commands_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kind, CommandsLogKind::Error);
+        assert_eq!(state.commands_input_buffer(), "");
     }
 

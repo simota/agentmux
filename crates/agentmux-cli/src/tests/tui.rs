@@ -471,6 +471,43 @@ use agentmux_ipc::EVENT_SUBSCRIBE_PROTOCOL_VERSION;
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].target, "role:tester");
         assert_eq!(history[0].text, "hi");
-        assert_eq!(history[0].delivered, 2);
-        assert_eq!(history[0].skipped, 1);
+        assert_eq!(
+            history[0].kind,
+            agentmux_tui::state::CommandsLogKind::Broadcast {
+                delivered: 2,
+                skipped: 1
+            }
+        );
+    }
+
+    #[test]
+    fn tui_stream_frame_records_role_assign_response_in_commands_history() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&agentmux_ipc::DaemonEvent::new(
+            agentmux_ipc::protocol::IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        // Point the broadcast target at the live session before assigning.
+        while state.commands_target() != "agent:foo" {
+            state.cycle_commands_target();
+        }
+        state.begin_commands_role_assign("qa-lead");
+
+        let response = DaemonResponse::ok(
+            "req_agent_set_role",
+            json!({ "agent_id": "agent_foo", "role": "qa-lead" }),
+        );
+        let response_id =
+            apply_tui_stream_frame(&mut state, DaemonStreamFrame::Response(response)).unwrap();
+
+        assert_eq!(response_id.as_deref(), Some("req_agent_set_role"));
+        let history = state.commands_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].target, "agent:foo");
+        assert_eq!(
+            history[0].kind,
+            agentmux_tui::state::CommandsLogKind::RoleAssigned {
+                role: "qa-lead".to_string()
+            }
+        );
     }

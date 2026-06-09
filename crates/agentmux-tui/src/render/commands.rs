@@ -9,7 +9,7 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::state::TuiSessionState;
+use crate::state::{CommandsLogKind, TuiSessionState};
 
 use super::util::truncate_cell;
 
@@ -144,7 +144,7 @@ pub(crate) fn commands_panel_lines(
 
     // ── Fixed bottom elements ─────────────────────────────────────────────
     let separator = "─".repeat(content_width.min(40));
-    let hint = "Enter: send  Tab: target  Esc: clear  Ctrl-g x: close".to_string();
+    let hint = "/send \"text\"  /role <r>  Tab: target  Esc: clear".to_string();
     let input_line = truncate_cell(
         &format!("> {}\u{2588}", state.commands_input_buffer()),
         content_width,
@@ -164,10 +164,13 @@ pub(crate) fn commands_panel_lines(
     if !state.commands_history().is_empty() {
         for entry in state.commands_history() {
             let head = format!("[{}] {}", entry.target, entry.text);
-            let outcome = format!(
-                "  -> delivered {}, skipped {}",
-                entry.delivered, entry.skipped
-            );
+            let outcome = match &entry.kind {
+                CommandsLogKind::Broadcast { delivered, skipped } => {
+                    format!("  -> delivered {delivered}, skipped {skipped}")
+                }
+                CommandsLogKind::RoleAssigned { role } => format!("  -> set role {role}"),
+                CommandsLogKind::Error => "  -> error".to_string(),
+            };
             history.push(truncate_cell(&head, content_width));
             history.push(truncate_cell(&outcome, content_width));
         }
@@ -233,7 +236,7 @@ mod tests {
         // No sessions: targets section shows "▸ broadcast" + "(no sessions)".
         assert_eq!(lines[0], "▸ broadcast");
         assert_eq!(lines[1], "  (no sessions)");
-        assert!(lines[lines.len() - 2].starts_with("Enter: send"));
+        assert!(lines[lines.len() - 2].starts_with("/send"));
         assert!(lines[lines.len() - 1].starts_with("> "));
         assert!(lines[lines.len() - 1].contains('\u{2588}'));
     }

@@ -15,7 +15,7 @@ agentmux attach [task|session]
 agentmux daemon start|stop|status
 agentmux project init|open|status|install-result-protocol
 agentmux task run|status|pause|resume|cancel|summary
-agentmux agent ls|spawn|stop|send|inject|focus|interrupt|broadcast
+agentmux agent ls|spawn|stop|send|inject|focus|interrupt|broadcast|set-role
 agentmux message list|history|show|send|inject
 agentmux meeting open|close|list
 agentmux context add|list|show|search|attach|inject|export
@@ -130,7 +130,9 @@ agentmux project install-result-protocol --global
 
 ### 3.1.2 agent role registration
 
-`agent spawn --role <role>` と TUI/provider picker から生成される agent は、daemon 側の session metadata に role を保存する。message bus の `to: "role:<role>"` はこの metadata を使って解決し、agent 名からの推定は role が明示されない場合の fallback とする。`agentmux sessions` と TUI の session list は role を表示し、agent / human が利用可能な宛先を確認できるようにする。
+`agent spawn --role <role>` と config team template で明示された role は daemon 側の session metadata に保存する。**role が明示されないセッション（TUI/provider picker からの起動を含む）の初期 role は `default`**（agent 名からの推定は行わない）。message bus の `to: "role:<role>"` はこの metadata を使って解決する。`agentmux sessions` と TUI の session list は role を表示し、agent / human が利用可能な宛先を確認できるようにする。
+
+role は実行時に変更できる（`agentmux agent set-role <agent_id> <role>`、または Commands パネルで `agent:<name>` を選び `/role <newrole>` を送信）。既知ラベル（planner / implementer / reviewer / tester / debugger / refactorer / security_reviewer / docs_writer / integrator / context_manager）以外は任意のカスタム role 文字列として保存される。変更は session metadata と `role:<role>` 解決に即時反映され、`agent.role_changed` イベントで TUI の表示も更新される。
 
 ### 3.2 task run
 
@@ -249,6 +251,15 @@ agentmux agent broadcast --no-enter "<text>"
 
 人間が typing 中の pane への注入はスキップされ（`human_input_quiet` ガード）、結果の `delivered` / `skipped` カウントが出力される。すべての注入は JSONL event log に記録される。
 
+### 3.10 agent set-role
+
+```bash
+agentmux agent set-role <agent_id> reviewer
+agentmux agent set-role <agent_id> qa-lead
+```
+
+指定セッションの role を実行時に変更する。既知ラベルは対応する role に、それ以外は任意のカスタム role として保存される。daemon は session metadata を更新し、`role:<role>` 解決に即時反映、`agent.role_changed` イベントを publish する（TUI の session list 表示が更新される）。Commands パネルからは `agent:<name>` を選択した状態で入力欄に `/role <newrole>` と打って Enter することで同じ操作ができる。
+
 ## 4. TUI画面構成
 
 標準layout:
@@ -319,11 +330,14 @@ Ctrl-g Space    rotate layout
 **Commands パネル操作キー（focused 時）:**
 
 ```text
-Enter           テキストを送信対象へ broadcast
+/send "<text>"  入力テキストを送信対象へ broadcast（生入力の一括注入）
+/role <newrole> 送信対象 agent:<name> に role を割り当てる
 Tab             送信対象を巡回（broadcast → role:<role> → agent:<name>）
 Esc             入力フィールドをクリア
 Backspace / 印字文字   入力フィールドを編集
 ```
+
+Commands パネルは**コマンド指向**で、Enter での送信はすべて `/` コマンドとして解釈する。`/send "<text>"`（クォートは任意）で送信対象へ生入力を broadcast し、`/role <newrole>` で（送信対象が `agent:<name>` のとき）そのセッションへ role を割り当てる（`agent.set_role`）。`/` で始まらないプレーンテキストや未知のコマンドは broadcast されず履歴にエラー行を表示する（テキスト送信は必ず `/send` を使う）。`/role` で対象が `broadcast` / `role:<...>` や role が空のときも同様にエラー。
 
 prefix（`Ctrl-g`）コマンドはCommands pane上でも従来どおり機能する。
 

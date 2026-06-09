@@ -36,17 +36,41 @@ mod accessors;
 mod apply;
 mod commands;
 
-/// One sent broadcast recorded in the Commands panel's history log.
+/// One entry recorded in the Commands panel's history log.
 ///
-/// `delivered` / `skipped` mirror the daemon's `AgentBroadcastInput` response:
-/// `skipped` counts agents that were not injected because a human was typing
-/// into them (the daemon owns that safety decision; the UI only reports it).
+/// An entry is either a broadcast (with its delivery outcome), a successful
+/// role assignment, or an error line. `target` / `text` carry the human-facing
+/// head of the entry; `kind` distinguishes how the tail outcome renders.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CommandsLogEntry {
     pub target: String,
     pub text: String,
-    pub delivered: usize,
-    pub skipped: usize,
+    pub kind: CommandsLogKind,
+}
+
+/// Outcome variant of a [`CommandsLogEntry`].
+///
+/// `Broadcast.delivered` / `Broadcast.skipped` mirror the daemon's
+/// `AgentBroadcastInput` response: `skipped` counts agents that were not
+/// injected because a human was typing into them (the daemon owns that safety
+/// decision; the UI only reports it).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandsLogKind {
+    Broadcast { delivered: usize, skipped: usize },
+    RoleAssigned { role: String },
+    Error,
+}
+
+/// Outcome of interpreting a Commands-panel submission
+/// ([`TuiSessionState::parse_commands_input`]).
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CommandsSubmit {
+    /// Send the (verbatim) text to the current broadcast target.
+    Broadcast(String),
+    /// Assign `role` to the single resolved live session `agent_id`.
+    AssignRole { agent_id: String, role: String },
+    /// The submission was rejected; show `message` as an error history line.
+    Error(String),
 }
 
 pub struct TuiSessionState {
@@ -91,6 +115,9 @@ pub struct TuiSessionState {
     /// The client loop records the request before sending, then the response
     /// handler pairs it with the `delivered`/`skipped` counts for the history.
     commands_pending_broadcast: Option<(String, String)>,
+    /// `(target, role)` of an in-flight role assignment awaiting its
+    /// `agent.set_role` response, paired with the right history entry on reply.
+    commands_pending_role: Option<(String, String)>,
     daemon_protocol_version: Option<u32>,
     runtime_notice: Option<String>,
     /// Render mirror of the keymap dispatcher's `awaiting_prefix_command` flag.

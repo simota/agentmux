@@ -167,6 +167,7 @@ fn event_kind_label(kind: &IpcEventKind) -> &'static str {
         IpcEventKind::AgentStatusSignal => "agent.status_signal",
         IpcEventKind::AgentStatusChanged => "agent.status_changed",
         IpcEventKind::AgentExited => "agent.exited",
+        IpcEventKind::AgentRoleChanged => "agent.role_changed",
         IpcEventKind::PtyOutputChunk => "pty.output_chunk",
         IpcEventKind::ScreenDiff => "screen.diff",
         IpcEventKind::TerminalSnapshotSaved => "terminal.snapshot_saved",

@@ -182,6 +182,7 @@ impl TuiSessionState {
             IpcEventKind::PtyOutputChunk | IpcEventKind::ScreenDiff => self.apply_output(event),
             IpcEventKind::TerminalSnapshotSaved => self.apply_snapshot(&event.payload),
             IpcEventKind::AgentExited => self.apply_agent_exited(event),
+            IpcEventKind::AgentRoleChanged => self.apply_agent_role_changed(event),
             IpcEventKind::MessageCreated | IpcEventKind::MessageDelivered => {
                 self.apply_message_event(event)
             }
@@ -399,6 +400,24 @@ impl TuiSessionState {
         if !is_focused {
             pane.has_unseen_output = true;
         }
+        pane.last_event = Some(event.kind.clone());
+        StateChange::UpdatedPane(agent_id)
+    }
+
+    /// Apply an `agent.role_changed` event by updating the matching pane's role
+    /// label so the Commands-panel session list and target cycle reflect it.
+    /// Events for unknown agents (or without a role) are ignored.
+    fn apply_agent_role_changed(&mut self, event: &DaemonEvent) -> StateChange {
+        let Some(agent_id) = string_field(&event.payload, "agent_id") else {
+            return StateChange::Ignored;
+        };
+        let Some(role) = string_field(&event.payload, "role") else {
+            return StateChange::Ignored;
+        };
+        let Some(pane) = self.panes.get_mut(&agent_id) else {
+            return StateChange::Ignored;
+        };
+        pane.set_role(role);
         pane.last_event = Some(event.kind.clone());
         StateChange::UpdatedPane(agent_id)
     }

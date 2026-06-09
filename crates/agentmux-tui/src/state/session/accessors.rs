@@ -40,6 +40,7 @@ impl TuiSessionState {
             commands_target: "broadcast".to_string(),
             commands_history: Vec::new(),
             commands_pending_broadcast: None,
+            commands_pending_role: None,
             daemon_protocol_version: None,
             runtime_notice: None,
             prefix_active: false,
