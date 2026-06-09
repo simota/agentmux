@@ -84,6 +84,60 @@ impl DaemonRuntime {
         if !send_delay.is_zero() {
             tokio::time::sleep(send_delay).await;
         }
+        self.settle_write_and_finish_after_delay(prepared, now)
+            .await
+    }
+
+    /// Idle-delivery variant of [`Self::settle_write_and_finish`]: after the
+    /// settle delay, re-check the human quiet window before touching the PTY.
+    ///
+    /// The caller's quiet check runs *before* the settle sleep, so a human may
+    /// start typing into the target pane while we sleep. Writing anyway would
+    /// violate the spec invariant "never auto-inject into a pane where a human
+    /// is currently typing". When the re-check fails the prepared message is
+    /// returned to `WaitingForAgent` (still eligible for idle delivery) and a
+    /// later idle/status poll retries once the human goes quiet.
+    async fn settle_recheck_write_and_finish(
+        &self,
+        prepared: &PreparedInjection,
+        now: DateTimeUtc,
+    ) -> Result<Option<AgentMessage>> {
+        let send_delay = self.state.read().await.injection_timing.send_delay;
+        if !send_delay.is_zero() {
+            tokio::time::sleep(send_delay).await;
+            let recheck_at = DateTimeUtc::now_utc();
+            let human_typing = {
+                let state = self.state.read().await;
+                state.agents.get(&prepared.agent_id).is_some_and(|agent| {
+                    !agent
+                        .input_activity
+                        .quiet_for_at(recheck_at, state.injection_timing.human_input_quiet)
+                })
+            };
+            if human_typing {
+                let mut state = self.state.write().await;
+                state.messages.update_delivery_status(
+                    &prepared.message_id,
+                    DeliveryStatus::WaitingForAgent,
+                    recheck_at,
+                )?;
+                return Ok(None);
+            }
+        }
+        let message = self
+            .settle_write_and_finish_after_delay(prepared, now)
+            .await?;
+        Ok(Some(message))
+    }
+
+    /// Write the prepared injection into the target PTY and finish/emit the
+    /// delivery event. Shared tail of the settle paths (the settle delay has
+    /// already elapsed when this is called).
+    async fn settle_write_and_finish_after_delay(
+        &self,
+        prepared: &PreparedInjection,
+        now: DateTimeUtc,
+    ) -> Result<AgentMessage> {
         let write_result = self.write_prepared_message_injection(prepared).await;
         self.finish_and_emit_message_injection(
             &prepared.message_id,
@@ -185,8 +239,7 @@ impl DaemonRuntime {
             return Ok(None);
         };
 
-        let message = self.settle_write_and_finish(&prepared, now).await?;
-        Ok(Some(message))
+        self.settle_recheck_write_and_finish(&prepared, now).await
     }
 
     pub async fn apply_agent_status_signal(
@@ -330,7 +383,10 @@ impl DaemonRuntime {
         pty.write_bytes(bytes)
     }
 
-    pub(crate) async fn write_prepared_message_injection(&self, prepared: &PreparedInjection) -> Result<()> {
+    pub(crate) async fn write_prepared_message_injection(
+        &self,
+        prepared: &PreparedInjection,
+    ) -> Result<()> {
         let paste_enter_delay = self.state.read().await.injection_timing.paste_enter_delay;
         let script = message_input_script(prepared, paste_enter_delay);
         self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_CREATED, &script)?;
@@ -500,9 +556,7 @@ impl DaemonRuntime {
             let mut skipped = Vec::new();
             for agent_id in recipients {
                 match state.agents.get(&agent_id) {
-                    Some(agent)
-                        if !agent.input_activity.quiet_for_at(now, quiet_period) =>
-                    {
+                    Some(agent) if !agent.input_activity.quiet_for_at(now, quiet_period) => {
                         // Human is typing into this pane right now: skip it.
                         skipped.push(agent_id);
                     }
@@ -519,16 +573,10 @@ impl DaemonRuntime {
         let mut delivered = Vec::new();
         for agent_id in deliverable {
             let script = broadcast_input_script(&agent_id, actions);
-            self.append_input_script_event(
-                agentmux_store::EVENT_INPUT_SCRIPT_CREATED,
-                &script,
-            )?;
+            self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_CREATED, &script)?;
             self.write_input_actions_to_agent_pty(&agent_id, &script.actions)
                 .await?;
-            self.append_input_script_event(
-                agentmux_store::EVENT_INPUT_SCRIPT_INJECTED,
-                &script,
-            )?;
+            self.append_input_script_event(agentmux_store::EVENT_INPUT_SCRIPT_INJECTED, &script)?;
             self.publish(DaemonEvent::new(
                 IpcEventKind::InputInjected,
                 json!({
@@ -543,7 +591,6 @@ impl DaemonRuntime {
 
         Ok(BroadcastInputOutcome { delivered, skipped })
     }
-
 }
 
 /// Result of a broadcast-input write: which target PTYs received the actions
@@ -641,7 +688,9 @@ pub(crate) fn delivery_render_inputs(
     Ok((provider, context))
 }
 
-pub(crate) fn message_prompt_context_from_pack(pack: agentmux_context::ContextPack) -> PromptContext {
+pub(crate) fn message_prompt_context_from_pack(
+    pack: agentmux_context::ContextPack,
+) -> PromptContext {
     PromptContext {
         inline_items: pack
             .inline_items
@@ -660,7 +709,10 @@ pub(crate) fn message_prompt_context_from_pack(pack: agentmux_context::ContextPa
 /// land in separate PTY read chunks; without it Codex's crossterm bracketed-paste
 /// handler coalesces the `\r` into the paste buffer instead of treating it as a
 /// submit keypress.  The delay is sourced from `InjectionTiming` (config-driven).
-pub(crate) fn message_input_script(prepared: &PreparedInjection, paste_enter_delay: Duration) -> InputScript {
+pub(crate) fn message_input_script(
+    prepared: &PreparedInjection,
+    paste_enter_delay: Duration,
+) -> InputScript {
     InputScript {
         id: InputScriptId::new(),
         target_agent_id: prepared.agent_id.clone(),
@@ -739,4 +791,3 @@ pub(crate) fn agent_input_ready(agent: &LiveAgentSession) -> bool {
                 | Some(AgentStatus::CompletedTurn)
         )
 }
-

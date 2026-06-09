@@ -499,7 +499,10 @@ fn status_bar_shows_prefix_indicator_and_focus_label() {
 
     let status = row_text(&buffer, 5, 60);
     assert!(status.contains("PREFIX (Ctrl-g)"), "status was {status:?}");
-    assert!(status.contains("focus: impl [2/2]"), "status was {status:?}");
+    assert!(
+        status.contains("focus: impl [2/2]"),
+        "status was {status:?}"
+    );
     // Prefix segment is rendered on a highlighted background.
     let cell = buffer.cell((0, 5)).expect("status cell");
     assert_eq!(cell.bg, Color::Yellow);
@@ -518,7 +521,10 @@ fn status_bar_hides_prefix_segment_when_not_armed() {
 
     let status = row_text(&buffer, 4, 40);
     assert!(!status.contains("PREFIX"), "status was {status:?}");
-    assert!(status.contains("focus: solo [1/1]"), "status was {status:?}");
+    assert!(
+        status.contains("focus: solo [1/1]"),
+        "status was {status:?}"
+    );
 }
 
 #[test]
@@ -569,7 +575,7 @@ fn render_grid_returns_cursor_position_when_visible() {
         pos,
         Some(Position {
             x: 5 + 1, // area.x + cursor.col
-            y: 3 + 0, // area.y + cursor.row
+            y: 3,     // area.y + cursor.row (row 0)
         }),
         "expected cursor at (6, 3)"
     );
@@ -593,7 +599,7 @@ fn render_grid_returns_cursor_position_after_wide_chars() {
         pos,
         Some(Position {
             x: 2 + 4, // area.x + 4 (two wide chars)
-            y: 1 + 0,
+            y: 1,
         }),
         "expected cursor at (6, 1) after two wide chars"
     );

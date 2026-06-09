@@ -109,10 +109,7 @@ impl StartupLayout {
     /// leaf in depth-first order — the same order as [`StartupLayout::panes`] — so
     /// callers can hand back spawned agent ids (and the conversation-list id) in
     /// sequence.
-    pub fn resolve_root(
-        &self,
-        mut resolve: impl FnMut(StartupPaneChoice) -> PaneId,
-    ) -> LayoutNode {
+    pub fn resolve_root(&self, mut resolve: impl FnMut(StartupPaneChoice) -> PaneId) -> LayoutNode {
         resolve_node(&self.root, &mut resolve)
     }
 }
@@ -212,7 +209,9 @@ fn tokenize_layout(raw: &str) -> Result<Vec<LayoutToken>> {
                 }
                 let text: String = chars[start..index].iter().collect();
                 let value: u16 = text.parse().map_err(|_| {
-                    AgentmuxError::UserError(format!("invalid pane size '{text}' (expected 1..=100)"))
+                    AgentmuxError::UserError(format!(
+                        "invalid pane size '{text}' (expected 1..=100)"
+                    ))
                 })?;
                 tokens.push(LayoutToken::Number(value));
             }
@@ -387,6 +386,11 @@ impl<'a> LayoutParser<'a> {
                         "pane size must be at least 1 (':0' is not allowed)".to_string(),
                     ));
                 }
+                Some(LayoutToken::Number(value)) if *value > 100 => {
+                    return Err(AgentmuxError::UserError(format!(
+                        "invalid pane size '{value}' (expected 1..=100)"
+                    )));
+                }
                 Some(LayoutToken::Number(value)) => Some(*value),
                 _ => {
                     return Err(AgentmuxError::UserError(
@@ -545,6 +549,11 @@ fn parse_comma_list(tokens: &[LayoutToken], raw: &str) -> Result<StartupLayout> 
                             return Err(AgentmuxError::UserError(
                                 "pane size must be at least 1 (':0' is not allowed)".to_string(),
                             ));
+                        }
+                        Some(LayoutToken::Number(value)) if *value > 100 => {
+                            return Err(AgentmuxError::UserError(format!(
+                                "invalid pane size '{value}' (expected 1..=100)"
+                            )));
                         }
                         Some(LayoutToken::Number(value)) => Some(*value),
                         _ => {
@@ -753,9 +762,8 @@ fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>> {
     (0..hex.len())
         .step_by(2)
         .map(|index| {
-            u8::from_str_radix(&hex[index..index + 2], 16).map_err(|_| {
-                AgentmuxError::UserError(format!("invalid hex byte in raw:'{hex}'"))
-            })
+            u8::from_str_radix(&hex[index..index + 2], 16)
+                .map_err(|_| AgentmuxError::UserError(format!("invalid hex byte in raw:'{hex}'")))
         })
         .collect()
 }
@@ -908,7 +916,10 @@ mod tests {
 
     #[test]
     fn left_right_bar_is_vertical_with_and_without_spaces() {
-        let expected = vec![agent(AgentProviderChoice::Agy), agent(AgentProviderChoice::Codex)];
+        let expected = vec![
+            agent(AgentProviderChoice::Agy),
+            agent(AgentProviderChoice::Codex),
+        ];
         let spaced = ok("agy | codex");
         assert_eq!(spaced.panes, expected);
         assert_eq!(dir(&spaced), SplitDirection::Vertical);
@@ -919,7 +930,10 @@ mod tests {
 
     #[test]
     fn left_right_slash_alias_is_vertical_with_and_without_spaces() {
-        let expected = vec![agent(AgentProviderChoice::Agy), agent(AgentProviderChoice::Codex)];
+        let expected = vec![
+            agent(AgentProviderChoice::Agy),
+            agent(AgentProviderChoice::Codex),
+        ];
         let spaced = ok("agy / codex");
         assert_eq!(spaced.panes, expected);
         assert_eq!(dir(&spaced), SplitDirection::Vertical);
@@ -933,7 +947,10 @@ mod tests {
         let layout = ok("agy ― codex");
         assert_eq!(
             layout.panes,
-            vec![agent(AgentProviderChoice::Agy), agent(AgentProviderChoice::Codex)]
+            vec![
+                agent(AgentProviderChoice::Agy),
+                agent(AgentProviderChoice::Codex)
+            ]
         );
         assert_eq!(dir(&layout), SplitDirection::Horizontal);
     }
@@ -943,7 +960,10 @@ mod tests {
         let layout = ok("agy - codex");
         assert_eq!(
             layout.panes,
-            vec![agent(AgentProviderChoice::Agy), agent(AgentProviderChoice::Codex)]
+            vec![
+                agent(AgentProviderChoice::Agy),
+                agent(AgentProviderChoice::Codex)
+            ]
         );
         assert_eq!(dir(&layout), SplitDirection::Horizontal);
     }
@@ -953,7 +973,10 @@ mod tests {
         let layout = ok("claude-code | codex");
         assert_eq!(
             layout.panes,
-            vec![agent(AgentProviderChoice::Claude), agent(AgentProviderChoice::Codex)]
+            vec![
+                agent(AgentProviderChoice::Claude),
+                agent(AgentProviderChoice::Codex)
+            ]
         );
         assert_eq!(dir(&layout), SplitDirection::Vertical);
     }
@@ -1035,7 +1058,10 @@ mod tests {
         let layout = ok("AGY | CODEX");
         assert_eq!(
             layout.panes,
-            vec![agent(AgentProviderChoice::Agy), agent(AgentProviderChoice::Codex)]
+            vec![
+                agent(AgentProviderChoice::Agy),
+                agent(AgentProviderChoice::Codex)
+            ]
         );
         assert_eq!(dir(&layout), SplitDirection::Vertical);
     }
@@ -1174,6 +1200,22 @@ mod tests {
         assert!(
             message.contains("exceeds 100%"),
             "unexpected message: {message}"
+        );
+    }
+
+    #[test]
+    fn single_size_above_one_hundred_is_rejected() {
+        // A solitary sized leaf never joins a split, so the per-split sum check
+        // does not see it; the parser itself must enforce the 1..=100 range.
+        let message = err("agy:10000");
+        assert!(
+            message.contains("expected 1..=100"),
+            "unexpected message: {message}"
+        );
+        let legacy = err("agy:10000,codex");
+        assert!(
+            legacy.contains("expected 1..=100"),
+            "unexpected message: {legacy}"
         );
     }
 
