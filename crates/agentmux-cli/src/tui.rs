@@ -780,7 +780,12 @@ pub(crate) fn draw_tui_frame<T: TerminalIo>(
 ) -> Result<()> {
     terminal
         .io_mut()
-        .draw(|frame| renderer.render(frame.area(), state, frame.buffer_mut()))
+        .draw(|frame| {
+            let cursor = renderer.render(frame.area(), state, frame.buffer_mut());
+            if let Some(pos) = cursor {
+                frame.set_cursor_position(pos);
+            }
+        })
         .map_err(|error| AgentmuxError::TerminalError(format!("failed to draw TUI: {error}")))
 }
 

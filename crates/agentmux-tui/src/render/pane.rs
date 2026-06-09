@@ -3,7 +3,7 @@
 use agentmux_terminal::{Cell, CellWidth, ScreenGrid};
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Widget},
 };
@@ -38,10 +38,20 @@ impl PaneChrome {
 pub struct AgentPaneRenderer;
 
 impl AgentPaneRenderer {
-    pub fn render(&self, area: Rect, grid: &ScreenGrid, chrome: &PaneChrome, buffer: &mut Buffer) {
-        self.render_scrolled(area, grid, 0, chrome, buffer);
+    /// Renders the pane and returns the visible cursor's screen [`Position`] if
+    /// the cursor is visible within the rendered area, or [`None`] otherwise.
+    pub fn render(
+        &self,
+        area: Rect,
+        grid: &ScreenGrid,
+        chrome: &PaneChrome,
+        buffer: &mut Buffer,
+    ) -> Option<Position> {
+        self.render_scrolled(area, grid, 0, chrome, buffer)
     }
 
+    /// Renders the pane with scroll offset and returns the visible cursor
+    /// screen [`Position`], or [`None`] if the cursor is not visible.
     pub fn render_scrolled(
         &self,
         area: Rect,
@@ -49,10 +59,13 @@ impl AgentPaneRenderer {
         scroll_offset: usize,
         chrome: &PaneChrome,
         buffer: &mut Buffer,
-    ) {
-        self.render_scrolled_with_selection(area, grid, scroll_offset, chrome, None, buffer);
+    ) -> Option<Position> {
+        self.render_scrolled_with_selection(area, grid, scroll_offset, chrome, None, buffer)
     }
 
+    /// Renders the pane with scroll offset and optional copy selection, and
+    /// returns the visible cursor screen [`Position`], or [`None`] if the
+    /// cursor is not visible.
     pub fn render_scrolled_with_selection(
         &self,
         area: Rect,
@@ -61,9 +74,9 @@ impl AgentPaneRenderer {
         chrome: &PaneChrome,
         selection: Option<&CopySelection>,
         buffer: &mut Buffer,
-    ) {
+    ) -> Option<Position> {
         if area.width == 0 || area.height == 0 {
-            return;
+            return None;
         }
 
         let block_style = if chrome.focused {
@@ -78,23 +91,35 @@ impl AgentPaneRenderer {
         let inner = block.inner(area);
         block.render(area, buffer);
 
-        self.render_grid_scrolled_with_selection(inner, grid, scroll_offset, selection, buffer);
+        self.render_grid_scrolled_with_selection(inner, grid, scroll_offset, selection, buffer)
     }
 
-    pub fn render_grid(&self, area: Rect, grid: &ScreenGrid, buffer: &mut Buffer) {
-        self.render_grid_scrolled(area, grid, 0, buffer);
+    /// Renders only the grid (no border chrome) and returns the visible cursor
+    /// screen [`Position`], or [`None`] if the cursor is not visible.
+    pub fn render_grid(
+        &self,
+        area: Rect,
+        grid: &ScreenGrid,
+        buffer: &mut Buffer,
+    ) -> Option<Position> {
+        self.render_grid_scrolled(area, grid, 0, buffer)
     }
 
+    /// Renders the grid with scroll offset and returns the visible cursor
+    /// screen [`Position`], or [`None`] if the cursor is not visible.
     pub fn render_grid_scrolled(
         &self,
         area: Rect,
         grid: &ScreenGrid,
         scroll_offset: usize,
         buffer: &mut Buffer,
-    ) {
-        self.render_grid_scrolled_with_selection(area, grid, scroll_offset, None, buffer);
+    ) -> Option<Position> {
+        self.render_grid_scrolled_with_selection(area, grid, scroll_offset, None, buffer)
     }
 
+    /// Renders the grid with scroll offset and optional copy selection, and
+    /// returns the visible cursor screen [`Position`], or [`None`] if the
+    /// cursor is not visible.
     pub fn render_grid_scrolled_with_selection(
         &self,
         area: Rect,
@@ -102,14 +127,13 @@ impl AgentPaneRenderer {
         scroll_offset: usize,
         selection: Option<&CopySelection>,
         buffer: &mut Buffer,
-    ) {
+    ) -> Option<Position> {
         if scroll_offset == 0 {
-            render_current_grid(area, grid, selection, buffer);
-            return;
+            return render_current_grid(area, grid, selection, buffer);
         }
 
         if area.width == 0 || area.height == 0 {
-            return;
+            return None;
         }
 
         let cols = area.width.min(grid.cols());
@@ -153,19 +177,26 @@ impl AgentPaneRenderer {
                     buffer.cell_mut((area.x + cursor.col, area.y + cursor_screen_row))
             {
                 cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+                return Some(Position {
+                    x: area.x + cursor.col,
+                    y: area.y + cursor_screen_row,
+                });
             }
         }
+        None
     }
 }
 
+/// Renders the current (non-scrolled) grid and returns the visible cursor
+/// screen [`Position`], or [`None`] if the cursor is hidden or out of bounds.
 fn render_current_grid(
     area: Rect,
     grid: &ScreenGrid,
     selection: Option<&CopySelection>,
     buffer: &mut Buffer,
-) {
+) -> Option<Position> {
     if area.width == 0 || area.height == 0 {
-        return;
+        return None;
     }
 
     let rows = area.height.min(grid.rows());
@@ -200,7 +231,12 @@ fn render_current_grid(
         && let Some(cell) = buffer.cell_mut((area.x + cursor.col, area.y + cursor.row))
     {
         cell.set_style(Style::default().add_modifier(Modifier::REVERSED));
+        return Some(Position {
+            x: area.x + cursor.col,
+            y: area.y + cursor.row,
+        });
     }
+    None
 }
 
 fn history_cell(grid: &ScreenGrid, history_row: usize, col: u16) -> Option<&Cell> {

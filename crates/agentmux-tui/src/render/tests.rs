@@ -1,5 +1,6 @@
 use super::*;
 use agentmux_terminal::{CellStyle, TerminalColor, TerminalParser};
+use ratatui::layout::Position;
 use serde_json::json;
 
 use crate::state::TuiSessionState;
@@ -546,4 +547,156 @@ fn pane_title_marks_focus_glyph_and_unseen_output() {
     // The unseen marker sits on the unfocused (right) pane's title row.
     let right_title = row_text(&buffer, 0, 40);
     assert!(right_title.contains('●'), "right title was {right_title:?}");
+}
+
+// --- Cursor position tests ---
+
+/// Focused agent pane with a visible cursor returns the correct screen Position.
+#[test]
+fn render_grid_returns_cursor_position_when_visible() {
+    // Grid with one row and enough columns; write one ASCII char so cursor is
+    // at col=1.
+    let mut grid = ScreenGrid::new(1, 10);
+    grid.write_char('x', CellStyle::default());
+    // cursor.col == 1, cursor.row == 0, cursor.visible == true (default)
+
+    // Render at an offset to verify the area origin is included.
+    let area = Rect::new(5, 3, 10, 1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 10));
+    let pos = AgentPaneRenderer.render_grid(area, &grid, &mut buffer);
+
+    assert_eq!(
+        pos,
+        Some(Position {
+            x: 5 + 1, // area.x + cursor.col
+            y: 3 + 0, // area.y + cursor.row
+        }),
+        "expected cursor at (6, 3)"
+    );
+}
+
+/// Wide (full-width) characters advance the cursor by 2 cells; the returned X
+/// must reflect the display-width-based column, not a character count.
+#[test]
+fn render_grid_returns_cursor_position_after_wide_chars() {
+    // Write two wide characters: each occupies 2 columns, so after both the
+    // cursor is at col=4.
+    let mut grid = ScreenGrid::new(1, 10);
+    grid.write_char('あ', CellStyle::default()); // col advances to 2
+    grid.write_char('い', CellStyle::default()); // col advances to 4
+
+    let area = Rect::new(2, 1, 10, 1);
+    let mut buffer = Buffer::empty(Rect::new(0, 0, 20, 5));
+    let pos = AgentPaneRenderer.render_grid(area, &grid, &mut buffer);
+
+    assert_eq!(
+        pos,
+        Some(Position {
+            x: 2 + 4, // area.x + 4 (two wide chars)
+            y: 1 + 0,
+        }),
+        "expected cursor at (6, 1) after two wide chars"
+    );
+}
+
+/// When the cursor is not visible the function returns None.
+#[test]
+fn render_grid_returns_none_when_cursor_hidden() {
+    let mut grid = ScreenGrid::new(1, 6);
+    grid.write_char('A', CellStyle::default());
+    grid.set_cursor_visible(false);
+
+    let area = Rect::new(0, 0, 6, 1);
+    let mut buffer = Buffer::empty(area);
+    let pos = AgentPaneRenderer.render_grid(area, &grid, &mut buffer);
+
+    assert_eq!(pos, None, "hidden cursor should return None");
+}
+
+/// The focused agent pane propagates its cursor position through
+/// TuiSessionRenderer::render, and a non-focused pane does not.
+#[test]
+fn session_render_returns_cursor_for_focused_agent_pane_only() {
+    let mut state = TuiSessionState::default();
+    state.apply_daemon_status(&json!({
+        "agents": [
+            {"id": "left", "name": "planner"},
+            {"id": "right", "name": "impl"}
+        ]
+    }));
+    // Focus the right pane.
+    assert!(state.layout_mut().focus("right"));
+
+    // Push a character into the right (focused) pane so its cursor is at col=1.
+    state.apply_event(&agentmux_ipc::protocol::DaemonEvent::new(
+        agentmux_ipc::protocol::IpcEventKind::PtyOutputChunk,
+        json!({ "agent_id": "right", "text": "z" }),
+    ));
+
+    // A wide area so both panes get a border + interior.
+    let area = Rect::new(0, 0, 40, 6);
+    let mut buffer = Buffer::empty(area);
+    let pos = TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+    // pos must be Some and within the right pane's inner area (x >= 21 for a
+    // 20-col left split; y must be between 1 and 4 inclusive for the inner rows).
+    let pos = pos.expect("focused agent pane should yield a cursor position");
+    assert!(
+        pos.x >= 20,
+        "cursor x={} should be inside the right pane (x>=20)",
+        pos.x
+    );
+    assert!(pos.y >= 1 && pos.y <= 4, "cursor y={} out of range", pos.y);
+}
+
+/// When the focused pane is a conversation-list pane (not an agent pane),
+/// render must return None so the hardware cursor is hidden.
+#[test]
+fn session_render_returns_none_for_conversation_list_focus() {
+    let mut state = TuiSessionState::default();
+    state.open_conversation_list_pane();
+
+    let area = Rect::new(0, 0, 40, 6);
+    let mut buffer = Buffer::empty(area);
+    let pos = TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+    assert_eq!(
+        pos, None,
+        "conversation-list pane focus should not set hardware cursor"
+    );
+}
+
+/// When multiple panes exist but only the focused one has a visible cursor,
+/// the non-focused pane's cursor does not influence the return value.
+#[test]
+fn session_render_ignores_non_focused_pane_cursor() {
+    let mut state = TuiSessionState::default();
+    state.apply_daemon_status(&json!({
+        "agents": [
+            {"id": "left", "name": "planner"},
+            {"id": "right", "name": "impl"}
+        ]
+    }));
+    // Focus the left pane.
+    assert!(state.layout_mut().focus("left"));
+
+    // Output to the unfocused right pane (cursor would be at col=1 there).
+    state.apply_event(&agentmux_ipc::protocol::DaemonEvent::new(
+        agentmux_ipc::protocol::IpcEventKind::PtyOutputChunk,
+        json!({ "agent_id": "right", "text": "q" }),
+    ));
+    // No output to left pane: its cursor stays at col=0.
+
+    let area = Rect::new(0, 0, 40, 6);
+    let mut buffer = Buffer::empty(area);
+    let pos = TuiSessionRenderer::default().render(area, &state, &mut buffer);
+
+    // The result must be from the focused (left) pane, not the right pane.
+    // The left pane occupies x=0..20; inner x starts at 1.
+    let pos = pos.expect("focused agent pane should yield a cursor position");
+    assert!(
+        pos.x < 20,
+        "cursor x={} should be inside the left pane (x<20)",
+        pos.x
+    );
 }

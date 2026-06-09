@@ -3,7 +3,7 @@
 
 use ratatui::{
     buffer::Buffer,
-    layout::Rect,
+    layout::{Position, Rect},
     style::{Color, Style},
 };
 
@@ -28,7 +28,18 @@ pub struct TuiSessionRenderer {
 }
 
 impl TuiSessionRenderer {
-    pub fn render(&self, area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {
+    /// Renders all daemon-backed panes and returns the hardware cursor
+    /// [`Position`] for the focused agent pane, or [`None`] when the focused
+    /// pane is not an agent pane (e.g. conversation list, overlay) or the
+    /// cursor is not visible within the rendered area.
+    pub fn render(
+        &self,
+        area: Rect,
+        state: &TuiSessionState,
+        buffer: &mut Buffer,
+    ) -> Option<Position> {
+        let mut cursor_position: Option<Position> = None;
+
         for (pane_id, rect) in state.layout().pane_rects(area) {
             if state.is_conversation_list_pane(&pane_id) {
                 let focused = state.layout().focused() == Some(pane_id.as_str());
@@ -61,7 +72,7 @@ impl TuiSessionRenderer {
             let selection = state
                 .copy_selection()
                 .filter(|selection| selection.agent_id == pane.agent_id());
-            self.pane_renderer.render_scrolled_with_selection(
+            let pane_cursor = self.pane_renderer.render_scrolled_with_selection(
                 rect,
                 pane.grid(),
                 pane.scroll_offset(),
@@ -69,6 +80,10 @@ impl TuiSessionRenderer {
                 selection,
                 buffer,
             );
+            // Only the focused agent pane contributes the hardware cursor.
+            if focused {
+                cursor_position = pane_cursor;
+            }
         }
 
         if state.keybinding_help_visible() {
@@ -97,6 +112,22 @@ impl TuiSessionRenderer {
         if let Some(notice) = state.runtime_notice() {
             render_runtime_notice(area, notice, buffer);
         }
+
+        // Overlays suppress the hardware cursor so the IME preedit does not
+        // appear at a stale position inside a covered pane.
+        if state.keybinding_help_visible()
+            || state.session_list_visible()
+            || state.provider_picker_visible()
+            || state.message_bus_visible()
+        {
+            return None;
+        }
+        #[cfg(feature = "arena")]
+        if state.arena_overlay_visible() {
+            return None;
+        }
+
+        cursor_position
     }
 }
 
