@@ -178,7 +178,7 @@ use super::*;
         };
 
         assert_eq!(
-            parse_start_panes(args.providers.as_deref()).unwrap(),
+            parse_start_layout(args.providers.as_deref()).unwrap().panes,
             vec![
                 StartupPaneChoice::Agent(AgentProviderChoice::Agy),
                 StartupPaneChoice::Messages,

@@ -24,6 +24,8 @@ agentmux approval list|approve|reject
 agentmux layout save|load|list
 ```
 
+`start` の引数には `"agy | codex"` / `"(a ― b) | c"` 形式のレイアウト記法も受理する（§3.0.1 参照）。
+
 ## 3. 代表コマンド
 
 ### 3.0 start
@@ -35,6 +37,59 @@ agentmux start "agy,messages,codex"
 daemon未起動なら起動し、指定されたpaneを開いてからTUIを表示する。指定はcomma-separatedで、provider sessionの `claude`, `codex`, `agy` と、message履歴paneの `messages` を受け付ける。provider指定なしの `agentmux start` は通常のTUI起動と同じく、既存sessionがなければprovider pickerを表示する。
 
 `agy` provider は既定で `--dangerously-skip-permissions` を付けて起動し、tool permission prompt で停止しにくい強いpermission modeにする。`agent.spawn` payloadで明示的に `args` を渡した場合は、その指定を優先する。
+
+#### 3.0.1 レイアウト記法（split layout DSL）
+
+`agentmux start` の引数には comma 区切りの従来構文に加え、分割方向を明示した記法を使える（ADR-0007）。
+
+**基本記号**
+
+| 記号 | Unicode | 意味 | ASCII 別名 |
+|------|---------|------|-----------|
+| `\|` | U+007C | pane を**左右**に分割（縦の分割線） | `/` |
+| `―` | U+2015 | pane を**上下**に分割（横の分割線） | `-`（前後に空白が必要） |
+| `()` | — | グルーピング・入れ子（Phase 2） | — |
+| `name:N` | — | サイズ比率 `N`（Phase 2） | — |
+
+視覚的な記憶の手がかり: 縦棒 `|` を pane の間に置くと縦の仕切り線になり左右に分かれる。横棒 `―` を pane の間に置くと横の仕切り線になり上下に分かれる。
+
+**シェルの注意**
+
+- `|` はシェルのパイプ文字のため**クォートが必須**: `agentmux start "agy | codex"`。
+- `/` はクォート不要: `agentmux start agy/codex`（`|` と等価）。
+- `-` を上下分割に使うときは前後に空白を置く: `agy - codex`。ハイフン入り pane 名（`claude-code` 等）と区別するためである。
+
+**使用例**
+
+```bash
+agentmux start "agy | codex"           # 左右2分割（クォート必須）
+agentmux start agy/codex               # 同上（/ はクォート不要）
+agentmux start "agy - codex"           # 上下2分割
+agentmux start "agy | codex | messages" # 左右3分割
+agentmux start "agy,codex"             # 従来構文（| と等価）、引き続き動作
+```
+
+**後方互換**
+
+`,` 区切りの従来構文は `|`（左右並び）と等価なエイリアスとして引き続き動作する。`,` と `|`/`―` の混在は構文エラーになる。
+
+**内部実装との命名対応**
+
+内部の `SplitDirection` enum は TUI レイアウトエンジンの慣習で命名されており、本 DSL の記号と名前が**逆転**している。
+
+| 本 DSL の記号 | 内部 `SplitDirection` |
+|---|---|
+| `\|`（縦棒、左右分割） | `SplitDirection::Vertical` |
+| `―`（横棒、上下分割） | `SplitDirection::Horizontal` |
+
+実装時はこの橋渡し関係を本 ADR-0007 と合わせて参照すること。
+
+**段階導入**
+
+- **Phase 1（現在）**: フラットな方向指定のみ（`agy | codex`、`agy ― codex`、`agy / codex`、`,`互換）。
+- **Phase 2（後続）**: `()` ネストと `:N` サイズ比率（`(agy ― codex) | messages`、`agy:60 | codex:40`）。
+
+Phase 1 では `()` と `:N` は構文エラーとして拒否される。
 
 ### 3.1 project init
 

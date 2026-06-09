@@ -13,7 +13,7 @@ use agentmux_ipc::ClientRequest;
 use agentmux_tui::{
     input::{InputForwardError, dispatch_to_daemon_request},
     keymap::KeymapDispatcher,
-    layout::{PaneLayout, Rect},
+    layout::{PaneLayout, Rect, SplitDirection},
     render::TuiSessionRenderer,
     state::{
         CommandEffect, CopyPoint, CopySelection, StateChange,
@@ -79,20 +79,23 @@ pub(crate) async fn run_bare_tui_session(socket_path: &Path) -> Result<()> {
 }
 
 pub(crate) async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<()> {
-    run_tui_session_inner(socket_path, target, Vec::new()).await
+    // Attach path has no startup panes; the default `Vertical` direction is unused.
+    run_tui_session_inner(socket_path, target, Vec::new(), SplitDirection::Vertical).await
 }
 
 pub(crate) async fn run_tui_session_with_startup_panes(
     socket_path: &Path,
     panes: Vec<StartupPaneChoice>,
+    direction: SplitDirection,
 ) -> Result<()> {
-    run_tui_session_inner(socket_path, None, panes).await
+    run_tui_session_inner(socket_path, None, panes, direction).await
 }
 
 pub(crate) async fn run_tui_session_inner(
     socket_path: &Path,
     target: Option<String>,
     startup_panes: Vec<StartupPaneChoice>,
+    split_direction: SplitDirection,
 ) -> Result<()> {
     ensure_daemon(socket_path).await?;
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
@@ -151,7 +154,9 @@ pub(crate) async fn run_tui_session_inner(
         writer.write(snapshot_request).await?;
     }
 
-    let mut state = TuiSessionState::default();
+    // The requested split direction is already in engine terms
+    // (spec `|` -> `Vertical`, spec `―` -> `Horizontal`); see `parse_start_layout`.
+    let mut state = TuiSessionState::new(split_direction);
     let mut startup_agent_ids = Vec::new();
     if let Some((attach_request, snapshot_request)) = &attach_and_snapshot {
         let _startup_agent_ids = wait_for_tui_bootstrap(
