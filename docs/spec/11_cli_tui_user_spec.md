@@ -235,7 +235,7 @@ agentmux meeting close thread_01HX...
 `meeting open` は `MessageThread`(ADR-0006)を作成し、議題 kickoff message を
 参加者全員へ inject する。`--thread` 付きの message send は参加者全員
 (送信者を除く)へ fan-out 配送される。1 参加者あたりの発言数は
-`--max-turns`(既定 5)で制限され、上限到達後の投稿は拒否される。
+`--max-turns`(既定 7)で制限され、上限到達後の投稿は拒否される。
 詳細は `06_message_bus_context_broker.md §3.6`。
 
 ### 3.9 agent broadcast

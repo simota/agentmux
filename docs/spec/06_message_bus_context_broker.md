@@ -103,7 +103,7 @@ struct MessageThread {
     participants: Vec<AgentSessionId>,
     opened_by: MessageSource,
     status: ThreadStatus,                 // Open | Closed
-    max_messages_per_participant: u32,    // 既定 5
+    max_messages_per_participant: u32,    // 既定 7
     created_at: DateTimeUtc,
     closed_at: Option<DateTimeUtc>,
 }

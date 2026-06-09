@@ -25,7 +25,7 @@ Accepted
   を追加する。`to: Thread(id)` は参加者全員(送信者を除く)へ fan-out する。
 - fan-out 宛先(`Role` / `Task` / `Team` / `Thread` / `Broadcast`)は配送時に
   送信者を必ず除外する(エコーループの仕様レベル禁止)。
-- thread は `max_messages_per_participant`(既定 5)の発言上限を持ち、上限到達後の
+- thread は `max_messages_per_participant`(既定 7)の発言上限を持ち、上限到達後の
   agent 投稿は「要約して人間に判断を仰ぐ」誘導付きで拒否する。
 - 参加者以外の agent の投稿と Closed thread への投稿は拒否する。
 - 入口は IPC `meeting.open` / `meeting.close` / `meeting.list`、CLI

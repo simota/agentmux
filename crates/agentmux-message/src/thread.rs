@@ -11,10 +11,10 @@ use crate::message::MessageSource;
 
 /// Default per-participant message limit for a thread.
 ///
-/// Mirrors the pairwise loop guard in the agent protocol (3 back-and-forth
+/// Mirrors the pairwise loop guard in the agent protocol (7 back-and-forth
 /// turns before requiring human confirmation), with headroom for an opening
 /// statement and a closing summary.
-pub const DEFAULT_MAX_MESSAGES_PER_PARTICIPANT: u32 = 5;
+pub const DEFAULT_MAX_MESSAGES_PER_PARTICIPANT: u32 = 7;
 
 /// Lifecycle of a thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

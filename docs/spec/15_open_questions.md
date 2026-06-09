@@ -202,7 +202,7 @@ Deferred:
 
 ## 14. Meeting thread の永続化と進行制御
 
-**v0.1 decision:** マルチパーティ会議(`MessageThread`、ADR-0006)は messages と同じく in-memory + event log(`thread.opened`/`thread.closed`)で管理し、SQLite には永続化しない。発言順序の調停(turn-taking)は実装せず、`max_messages_per_participant`(既定 5)の発言上限のみ daemon が強制する。
+**v0.1 decision:** マルチパーティ会議(`MessageThread`、ADR-0006)は messages と同じく in-memory + event log(`thread.opened`/`thread.closed`)で管理し、SQLite には永続化しない。発言順序の調停(turn-taking)は実装せず、`max_messages_per_participant`(既定 7)の発言上限のみ daemon が強制する。
 
 理由:
 
