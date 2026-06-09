@@ -19,6 +19,10 @@ impl TuiSessionState {
                 self.toggle_zoom();
                 CommandEffect::Continue
             }
+            TuiCommand::ToggleResultMarker => {
+                self.toggle_result_marker();
+                CommandEffect::Continue
+            }
             TuiCommand::SplitVertical => {
                 self.layout.set_split_direction(SplitDirection::Vertical);
                 self.open_provider_picker();

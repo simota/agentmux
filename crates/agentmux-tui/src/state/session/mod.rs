@@ -99,6 +99,10 @@ pub struct TuiSessionState {
     /// this each frame via [`TuiSessionState::set_prefix_active`] so the render
     /// layer can surface a prefix-mode indicator.
     prefix_active: bool,
+    /// When `true`, `AGENTMUX_RESULT:` marker blocks are blanked in agent panes.
+    /// Defaults to `true` (hidden); toggled by the user. This is display-only:
+    /// the daemon detects the marker from raw PTY bytes regardless of this flag.
+    hide_result_marker: bool,
 }
 
 impl Default for TuiSessionState {

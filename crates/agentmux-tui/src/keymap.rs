@@ -47,6 +47,7 @@ pub enum TuiCommand {
     InterruptAgent,
     CommandPalette,
     EnterCopyMode,
+    ToggleResultMarker,
     SessionListNext,
     SessionListPrevious,
     FocusSelectedSession,
@@ -390,6 +391,9 @@ fn prefix_command(key: KeyEvent) -> Option<TuiCommand> {
         KeyCode::Char('I') => Some(TuiCommand::InterruptAgent),
         KeyCode::Char(':') => Some(TuiCommand::CommandPalette),
         KeyCode::Char('[') => Some(TuiCommand::EnterCopyMode),
+        // `r`/`R` are already bound (ResizeMode / RequestStatus); use `v`
+        // ("visibility") for toggling AGENTMUX_RESULT marker display.
+        KeyCode::Char('v') => Some(TuiCommand::ToggleResultMarker),
         _ => None,
     }
 }
@@ -771,6 +775,16 @@ mod tests {
         let dispatch = dispatcher.dispatch(key(KeyCode::Char('['), KeyModifiers::NONE));
 
         assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::EnterCopyMode));
+    }
+
+    #[test]
+    fn prefixed_v_maps_to_toggle_result_marker_command() {
+        let mut dispatcher = KeymapDispatcher::default();
+        dispatcher.dispatch(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+
+        let dispatch = dispatcher.dispatch(key(KeyCode::Char('v'), KeyModifiers::NONE));
+
+        assert_eq!(dispatch, KeyDispatch::Command(TuiCommand::ToggleResultMarker));
     }
 
     #[test]

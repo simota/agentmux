@@ -36,6 +36,7 @@ const KEYBINDING_HELP_LINES: &[&str] = &[
     "Msg pane      Enter/Space/d details",
     "Ctrl-g Space  Rotate split direction",
     "Ctrl-g :      Command palette",
+    "Ctrl-g v      Toggle AGENTMUX_RESULT visibility",
 ];
 
 pub(crate) fn render_session_list(area: Rect, state: &TuiSessionState, buffer: &mut Buffer) {

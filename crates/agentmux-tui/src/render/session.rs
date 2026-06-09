@@ -71,7 +71,8 @@ impl TuiSessionRenderer {
                 focused,
                 pane.has_unseen_output(),
             ))
-            .focused(focused);
+            .focused(focused)
+            .hide_result_marker(state.hide_result_marker());
             let selection = state
                 .copy_selection()
                 .filter(|selection| selection.agent_id == pane.agent_id());

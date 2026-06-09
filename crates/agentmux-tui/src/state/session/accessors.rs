@@ -43,6 +43,7 @@ impl TuiSessionState {
             daemon_protocol_version: None,
             runtime_notice: None,
             prefix_active: false,
+            hide_result_marker: true,
         }
     }
 
@@ -344,5 +345,16 @@ impl TuiSessionState {
 
     pub fn toggle_zoom(&mut self) {
         self.layout.toggle_zoom();
+    }
+
+    /// Whether `AGENTMUX_RESULT:` marker blocks are hidden in agent panes.
+    /// Defaults to `true`. Display-only — orchestration is unaffected.
+    pub fn hide_result_marker(&self) -> bool {
+        self.hide_result_marker
+    }
+
+    /// Flip the `AGENTMUX_RESULT:` marker visibility for agent panes.
+    pub fn toggle_result_marker(&mut self) {
+        self.hide_result_marker = !self.hide_result_marker;
     }
 }

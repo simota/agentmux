@@ -310,6 +310,7 @@ Ctrl-g %        split vertical and choose coding agent
 Ctrl-g "        split horizontal and choose coding agent
 Ctrl-g x        close/stop current pane
 Ctrl-g r        resize mode
+Ctrl-g v        toggle AGENTMUX_RESULT marker visibility (default hidden)
 Ctrl-g Space    rotate layout
 ```
 

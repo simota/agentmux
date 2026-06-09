@@ -22,6 +22,30 @@ use super::*;
     }
 
     #[test]
+    fn result_marker_hidden_by_default_and_toggle_flips_it() {
+        let mut state = TuiSessionState::default();
+        assert!(state.hide_result_marker());
+
+        state.toggle_result_marker();
+        assert!(!state.hide_result_marker());
+
+        state.toggle_result_marker();
+        assert!(state.hide_result_marker());
+    }
+
+    #[test]
+    fn apply_toggle_result_marker_command_flips_flag() {
+        let mut state = TuiSessionState::default();
+        assert!(state.hide_result_marker());
+
+        assert_eq!(
+            state.apply_command(TuiCommand::ToggleResultMarker),
+            CommandEffect::Continue
+        );
+        assert!(!state.hide_result_marker());
+    }
+
+    #[test]
     fn apply_prefix_commands_updates_state_or_returns_session_effect() {
         let mut state = TuiSessionState::default();
         state.apply_event(&event(
