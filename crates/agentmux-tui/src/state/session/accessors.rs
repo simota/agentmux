@@ -47,6 +47,17 @@ impl TuiSessionState {
         self
     }
 
+    /// Replace the pane layout with a CLI-parsed startup tree.
+    ///
+    /// The tree's leaves must reference pane ids that already exist as registered
+    /// panes (spawned agents) or the conversation-list pane id; callers resolve
+    /// provider leaves to spawned agent ids before invoking this. Focus is reset
+    /// to the first leaf in depth-first order. Used once at TUI bootstrap so the
+    /// nested/sized structure from `agentmux start "<spec>"` takes effect.
+    pub fn apply_startup_layout(&mut self, root: LayoutNode) {
+        self.layout = PaneLayout::from_root(root);
+    }
+
     pub fn layout(&self) -> &PaneLayout {
         &self.layout
     }

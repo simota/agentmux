@@ -48,8 +48,7 @@ async fn main() -> Result<()> {
     match command {
         Commands::Start(args) => {
             let layout = parse_start_layout(args.providers.as_deref())?;
-            run_tui_session_with_startup_panes(&socket_path, layout.panes, layout.direction)
-                .await?;
+            run_tui_session_with_startup_panes(&socket_path, layout).await?;
         }
         Commands::Doctor(_) => {
             let report = doctor_report(

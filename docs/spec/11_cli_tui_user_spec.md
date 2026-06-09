@@ -48,8 +48,8 @@ daemon未起動なら起動し、指定されたpaneを開いてからTUIを表�
 |------|---------|------|-----------|
 | `\|` | U+007C | pane を**左右**に分割（縦の分割線） | `/` |
 | `―` | U+2015 | pane を**上下**に分割（横の分割線） | `-`（前後に空白が必要） |
-| `()` | — | グルーピング・入れ子（Phase 2） | — |
-| `name:N` | — | サイズ比率 `N`（Phase 2） | — |
+| `()` | — | グルーピング・入れ子 | — |
+| `name:N` | — | 同一分割内のサイズ比率 `N` | — |
 
 視覚的な記憶の手がかり: 縦棒 `|` を pane の間に置くと縦の仕切り線になり左右に分かれる。横棒 `―` を pane の間に置くと横の仕切り線になり上下に分かれる。
 
@@ -67,7 +67,11 @@ agentmux start agy/codex               # 同上（/ はクォート不要）
 agentmux start "agy - codex"           # 上下2分割
 agentmux start "agy | codex | messages" # 左右3分割
 agentmux start "agy,codex"             # 従来構文（| と等価）、引き続き動作
+agentmux start "(agy ― codex) | messages" # 左カラムを上下に積み、右に messages
+agentmux start "agy:60 | codex:40"     # 左右をサイズ比 60:40 で分割
 ```
+
+`a | b ― c` のように括弧なしで方向を混在させた場合は、優先度（`|` < `―`）に従い `a | (b ― c)` と解釈される。意図した分割にするには `()` で明示する。
 
 **後方互換**
 
@@ -84,12 +88,12 @@ agentmux start "agy,codex"             # 従来構文（| と等価）、引き�
 
 実装時はこの橋渡し関係を本 ADR-0007 と合わせて参照すること。
 
-**段階導入**
+**段階導入（いずれも実装済み）**
 
-- **Phase 1（現在）**: フラットな方向指定のみ（`agy | codex`、`agy ― codex`、`agy / codex`、`,`互換）。
-- **Phase 2（後続）**: `()` ネストと `:N` サイズ比率（`(agy ― codex) | messages`、`agy:60 | codex:40`）。
+- **Phase 1**: フラットな方向指定（`agy | codex`、`agy ― codex`、`agy / codex`、`,`互換）。
+- **Phase 2**: `()` ネストと `:N` サイズ比率（`(agy ― codex) | messages`、`agy:60 | codex:40`）。
 
-Phase 1 では `()` と `:N` は構文エラーとして拒否される。
+サイズ比率は同一分割内の相対値で、省略した pane には残りを均等配分する。実行中に spawn される pane は従来どおりレイアウト直下の末尾に追加され、focus 移動は葉の左→右・上→下順に巡回する。
 
 ### 3.1 project init
 

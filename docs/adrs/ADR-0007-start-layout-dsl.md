@@ -63,7 +63,7 @@ name     ::= IDENTIFIER
 
 ### 段階導入
 
-**Phase 1（初期実装）: フラットな方向指定のみ**
+**Phase 1（実装済み）: フラットな方向指定**
 
 - `agy | codex`（左右並び）
 - `agy ― codex`（上下並び）
@@ -71,12 +71,12 @@ name     ::= IDENTIFIER
 - `agy,codex`（後方互換、`|` と等価）
 - 3 つ以上のフラット連鎖: `agy | codex | messages`
 
-**Phase 2（後続実装）: ネストとサイズ指定**
+**Phase 2（実装済み）: ネストとサイズ指定**
 
 - `()` グルーピング: `(agy ― codex) | messages`
-- `:N` サイズ比率: `agy:60 | codex:40`
+- `:N` サイズ比率: `agy:60 | codex:40`（同一分割内の相対比。省略 pane へ残余を均等配分）
 
-Phase 1 では `()` と `:N` は構文エラーとして明確に拒否し、Phase 2 で追加する。
+両 Phase とも実装済み。`PaneLayout` は内部を再帰ツリー（`LayoutNode` = `Leaf` | `Split{direction, children}`）として保持し、`pane_rects` がサイズ比率を反映した `Constraint::Percentage` で再帰的に矩形を計算する。フラットなレイアウト（全 leaf が root 直下）では従来の均等割・focus 順序・snapshot 挙動を完全に保存する。`PaneSnapshot` は in-process の内部状態であり IPC の wire には乗らないため、protocol version の変更は不要。
 
 ## 代替案と却下理由
 

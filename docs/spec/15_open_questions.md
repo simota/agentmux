@@ -250,6 +250,10 @@ Deferred:
 
 - `LayoutNode` ツリーと動的分割の統合モデルは Phase 2 で設計する（`## 19. LayoutNode 型の置き場所` も参照）。
 
+実装状況（Phase 2 完了時点）:
+
+- ネストツリーは `PaneLayout.root: LayoutNode` として導入済み。動的分割（`Ctrl-g %`/`"`）と実行時 spawn は引き続きフラット運用（root 直下末尾に追加・`set_split_direction` は root に作用）とし、focus 巡回は葉の DFS 順で行う。DSL 由来の固定ネストと動的分割の双方向な往復編集（任意ノードへの挿入・分割の解除）は依然 deferred。
+
 ## 17. `-` の追加 ASCII 別名
 
 検討点:
@@ -305,6 +309,10 @@ Deferred:
 
 - Phase 2 の ネストツリー設計時に、`agentmux-tui` / `agentmux-ipc` / `agentmux-core` のどこに置くかを改めて決定する。
 
+実装状況（Phase 2 完了時点）:
+
+- `LayoutNode` / `LayoutChild` は `agentmux-tui` のローカル型として実装した。`PaneSnapshot` は in-process の内部状態にとどまり IPC の wire には乗らないため、`agentmux-core` への昇格も protocol version の変更も不要だった。daemon がレイアウトを永続化・送信する機能を追加する段階で `agentmux-core` 昇格を再検討する。
+
 ## 20. 最小幅クランプと端末幅不足時の折り返し
 
 検討点:
@@ -322,3 +330,7 @@ Deferred:
 Deferred:
 
 - Phase 2 のサイズ指定導入時に最小幅クランプ規則と正規化アルゴリズムを合わせて設計する。
+
+実装状況（Phase 2 完了時点）:
+
+- `:N` サイズ比率の正規化（比率を `Constraint::Percentage` に変換し合計 100、省略 pane へ残余を均等配分、余りは先頭から）は実装済み。一方で**最小幅クランプは未導入**であり、極端に狭い端末や偏った比率では 0 セルの pane が生じうる。最小幅クランプ／折りたたみ規則は引き続き未決のまま残す。

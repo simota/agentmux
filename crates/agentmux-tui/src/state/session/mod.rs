@@ -10,7 +10,7 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthChar;
 
 use crate::keymap::{FocusDirection, TuiCommand};
-use crate::layout::{PaneLayout, SplitDirection};
+use crate::layout::{LayoutNode, PaneLayout, SplitDirection};
 
 use super::choices::{
     CommandEffect, NewPaneChoice, ProviderOption, StateChange, PROVIDER_OPTIONS,

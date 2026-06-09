@@ -1,6 +1,6 @@
 //! Interactive TUI session runtime, stream-frame handling, pane sizing, and copy-mode helpers.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::path::Path;
 use std::time::Duration;
@@ -47,6 +47,9 @@ use crate::daemon::daemon_supports_event_subscribe;
 #[cfg(feature = "arena")]
 use crate::daemon::daemon_supports_arena_state;
 use crate::cli::StartupPaneChoice;
+use crate::parse::{StartupLayout, StartupLayoutNode};
+use agentmux_tui::layout::LayoutNode;
+use agentmux_tui::state::CONVERSATION_LIST_PANE_ID;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuiSignal {
@@ -79,23 +82,21 @@ pub(crate) async fn run_bare_tui_session(socket_path: &Path) -> Result<()> {
 }
 
 pub(crate) async fn run_tui_session(socket_path: &Path, target: Option<String>) -> Result<()> {
-    // Attach path has no startup panes; the default `Vertical` direction is unused.
-    run_tui_session_inner(socket_path, target, Vec::new(), SplitDirection::Vertical).await
+    // Attach path has no startup layout; panes arrive from the daemon snapshot.
+    run_tui_session_inner(socket_path, target, None).await
 }
 
 pub(crate) async fn run_tui_session_with_startup_panes(
     socket_path: &Path,
-    panes: Vec<StartupPaneChoice>,
-    direction: SplitDirection,
+    layout: StartupLayout,
 ) -> Result<()> {
-    run_tui_session_inner(socket_path, None, panes, direction).await
+    run_tui_session_inner(socket_path, None, Some(layout)).await
 }
 
 pub(crate) async fn run_tui_session_inner(
     socket_path: &Path,
     target: Option<String>,
-    startup_panes: Vec<StartupPaneChoice>,
-    split_direction: SplitDirection,
+    startup_layout: Option<StartupLayout>,
 ) -> Result<()> {
     ensure_daemon(socket_path).await?;
     let stream = UnixStream::connect(socket_path).await.map_err(|error| {
@@ -115,11 +116,24 @@ pub(crate) async fn run_tui_session_inner(
     let status_request = tui_daemon_status_request();
     let status_request_id = status_request.id.clone();
     writer.write(&status_request).await?;
+
+    // Depth-first leaf choices drive deterministic spawn ordering. `split_direction`
+    // is the root split's direction (already in engine terms: spec `|` -> `Vertical`,
+    // spec `―` -> `Horizontal`; see `parse_start_layout`).
+    let startup_panes: Vec<StartupPaneChoice> = startup_layout
+        .as_ref()
+        .map(|layout| layout.panes.clone())
+        .unwrap_or_default();
+    let split_direction = startup_layout
+        .as_ref()
+        .map(startup_root_direction)
+        .unwrap_or(SplitDirection::Vertical);
     let open_startup_messages = startup_panes
         .iter()
         .any(|pane| matches!(pane, StartupPaneChoice::Messages));
     let startup_spawn_requests = startup_panes
-        .into_iter()
+        .iter()
+        .copied()
         .filter_map(|pane| match pane {
             StartupPaneChoice::Agent(provider) => Some(provider),
             StartupPaneChoice::Messages => None,
@@ -154,12 +168,10 @@ pub(crate) async fn run_tui_session_inner(
         writer.write(snapshot_request).await?;
     }
 
-    // The requested split direction is already in engine terms
-    // (spec `|` -> `Vertical`, spec `―` -> `Horizontal`); see `parse_start_layout`.
     let mut state = TuiSessionState::new(split_direction);
     let mut startup_agent_ids = Vec::new();
     if let Some((attach_request, snapshot_request)) = &attach_and_snapshot {
-        let _startup_agent_ids = wait_for_tui_bootstrap(
+        let _bootstrap = wait_for_tui_bootstrap(
             &mut reader,
             &mut state,
             &status_request_id,
@@ -172,7 +184,7 @@ pub(crate) async fn run_tui_session_inner(
         )
         .await?;
     } else {
-        startup_agent_ids = wait_for_tui_bootstrap(
+        let bootstrap = wait_for_tui_bootstrap(
             &mut reader,
             &mut state,
             &status_request_id,
@@ -184,10 +196,22 @@ pub(crate) async fn run_tui_session_inner(
                 .map(|request| request.id.as_str()),
         )
         .await?;
-        if open_startup_messages {
+        startup_agent_ids = bootstrap.agent_ids;
+
+        // Apply the parsed startup tree once every leaf can be resolved to a
+        // concrete pane id. Provider leaves map (in spec/DFS order) to spawned
+        // agent ids via their `req_start_agent_spawn_{n}` request id; the
+        // conversation-list leaf maps to the local conversation-list pane id.
+        // Falling back to the daemon-driven flat order keeps behavior identical
+        // when resolution is impossible (e.g. a spawn failed to report an id).
+        if let Some(root) =
+            resolve_startup_layout(startup_layout.as_ref(), &bootstrap.spawned_by_request)
+        {
+            state.apply_startup_layout(root);
+        } else if open_startup_messages {
             state.open_conversation_list_pane();
         }
-        if startup_agent_ids.is_empty() && !open_startup_messages {
+        if state.layout().panes().is_empty() {
             state.open_provider_picker();
         }
     }
@@ -519,6 +543,15 @@ pub(crate) async fn run_tui_session_inner(
     })
 }
 
+/// Outcome of the TUI bootstrap handshake.
+pub(crate) struct TuiBootstrap {
+    /// Spawned agent ids in arrival order (used for attach/snapshot fan-out).
+    pub agent_ids: Vec<String>,
+    /// Map from each startup spawn request id to the spawned agent id, used to
+    /// resolve startup-layout leaves to concrete pane ids in spec order.
+    pub spawned_by_request: BTreeMap<String, String>,
+}
+
 pub(crate) async fn wait_for_tui_bootstrap<R>(
     reader: &mut JsonlReader<R>,
     state: &mut TuiSessionState,
@@ -527,7 +560,7 @@ pub(crate) async fn wait_for_tui_bootstrap<R>(
     snapshot_request_id: Option<&str>,
     startup_spawn_request_ids: &[String],
     startup_message_list_request_id: Option<&str>,
-) -> Result<Vec<String>>
+) -> Result<TuiBootstrap>
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
@@ -537,6 +570,7 @@ where
     let mut startup_messages_received = startup_message_list_request_id.is_none();
     let mut startup_spawn_received = BTreeSet::new();
     let mut startup_agent_ids = Vec::new();
+    let mut spawned_by_request = BTreeMap::new();
 
     while !(status_received
         && attach_received
@@ -562,15 +596,19 @@ where
                 startup_messages_received = true;
             }
             if startup_spawn_request_ids.contains(&response_id) {
-                startup_spawn_received.insert(response_id);
+                startup_spawn_received.insert(response_id.clone());
                 if let Some(agent_id) = spawned_agent_id {
+                    spawned_by_request.insert(response_id, agent_id.clone());
                     startup_agent_ids.push(agent_id);
                 }
             }
         }
     }
 
-    Ok(startup_agent_ids)
+    Ok(TuiBootstrap {
+        agent_ids: startup_agent_ids,
+        spawned_by_request,
+    })
 }
 
 pub(crate) fn apply_tui_stream_frame(
@@ -677,18 +715,65 @@ pub(crate) fn current_terminal_size() -> Result<(u16, u16)> {
     })
 }
 
+/// The engine split direction of the parsed startup layout's root.
+fn startup_root_direction(layout: &StartupLayout) -> SplitDirection {
+    match &layout.root {
+        StartupLayoutNode::Split { direction, .. } => *direction,
+        StartupLayoutNode::Leaf(_) => SplitDirection::Vertical,
+    }
+}
+
+/// Resolve a parsed startup layout into a concrete engine [`LayoutNode`] tree.
+///
+/// Returns `None` when there is no startup layout, when the layout has no panes
+/// (picker case), or when any provider leaf cannot be matched to a spawned agent
+/// id (so callers can fall back to the daemon-driven flat ordering).
+fn resolve_startup_layout(
+    layout: Option<&StartupLayout>,
+    spawned_by_request: &BTreeMap<String, String>,
+) -> Option<LayoutNode> {
+    let layout = layout?;
+    if layout.panes.is_empty() {
+        return None;
+    }
+
+    // Walk leaves in DFS order; provider leaves consume spawn request ids in the
+    // same order they were issued (`req_start_agent_spawn_0`, `_1`, ...).
+    let mut agent_index = 0usize;
+    let mut resolution_failed = false;
+    let root = layout.resolve_root(|choice| match choice {
+        StartupPaneChoice::Agent(_) => {
+            let request_id = format!("req_start_agent_spawn_{agent_index}");
+            agent_index += 1;
+            match spawned_by_request.get(&request_id) {
+                Some(agent_id) => agent_id.clone(),
+                None => {
+                    resolution_failed = true;
+                    request_id
+                }
+            }
+        }
+        StartupPaneChoice::Messages => CONVERSATION_LIST_PANE_ID.to_string(),
+    });
+
+    if resolution_failed {
+        return None;
+    }
+    Some(root)
+}
+
 pub(crate) fn pending_spawn_pane_size(
     state: &TuiSessionState,
     terminal_cols: u16,
     terminal_rows: u16,
 ) -> Option<TuiTerminalSize> {
-    let mut snapshot = state.layout().snapshot();
     let pending_pane = "__agentmux_pending_spawn__".to_string();
-    snapshot.panes.push(pending_pane.clone());
-    snapshot.focused = Some(pending_pane.clone());
+    // Append the pending leaf at the root level — the same slot dynamic
+    // `add_pane` would use — so its computed rect matches the real spawn.
+    let pending_layout = state.layout().with_pending_pane(pending_pane.clone());
 
     let area = Rect::new(0, 0, terminal_cols, terminal_rows);
-    PaneLayout::restore(snapshot)
+    pending_layout
         .pane_rects(area)
         .into_iter()
         .find_map(|(agent_id, rect)| {
