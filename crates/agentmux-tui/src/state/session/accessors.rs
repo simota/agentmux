@@ -97,7 +97,7 @@ impl TuiSessionState {
         &self.commands_input_buffer
     }
 
-    /// Current broadcast target (`"broadcast"` or `"role:<role>"`).
+    /// Current broadcast target (`"broadcast"`, `"role:<role>"`, or `"agent:<name>"`).
     pub fn commands_target(&self) -> &str {
         &self.commands_target
     }

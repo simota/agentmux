@@ -27,7 +27,8 @@ tmux の synchronize-panes のように、**「同じキーストロークを全
 
 **パネル UI**:
 
-- 上部: 送信履歴ログ（過去の送信テキスト・対象・`delivered N / skipped M` の結果）。
+- 上部: 実行中セッション一覧（`name (role)`）と送信対象候補（`broadcast` / `role:<role>` / 個別セッション `agent:<name>`）。現在の送信対象にマーカーを付けて示す。
+- 中部: 送信履歴ログ（過去の送信テキスト・対象・`delivered N / skipped M` の結果）。
 - 下部: 入力フィールドと現在の送信対象表示。
 
 **操作キー（Commands pane focused 時）**:
@@ -35,7 +36,7 @@ tmux の synchronize-panes のように、**「同じキーストロークを全
 | キー | 動作 |
 |---|---|
 | `Enter` | 入力内容を送信対象へ broadcast |
-| `Tab` | 送信対象を巡回（`broadcast` → 実行中エージェントの distinct な `role:<role>` → …） |
+| `Tab` | 送信対象を巡回（`broadcast` → 実行中エージェントの distinct な `role:<role>` → 個別セッション `agent:<name>`） |
 | `Esc` | 入力フィールドをクリア |
 | `Backspace` / 印字文字 | 入力フィールドを編集 |
 

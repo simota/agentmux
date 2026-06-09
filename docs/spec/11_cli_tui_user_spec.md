@@ -241,6 +241,7 @@ agentmux meeting close thread_01HX...
 ```bash
 agentmux agent broadcast "<text>"
 agentmux agent broadcast --to role:tester "<text>"
+agentmux agent broadcast --to agent:impl-codex "<text>"
 agentmux agent broadcast --no-enter "<text>"
 ```
 
@@ -272,7 +273,7 @@ agentmux agent broadcast --no-enter "<text>"
 | AgentTui | Claude/Codex TUI |
 | Shell | test runner, git commands |
 | MessageBus | message一覧 |
-| Commands | 入力欄付きの専用 pane。全エージェントまたは role 絞り込みで生入力を一括 broadcast する（tmux synchronize-panes 相当）。上部に送信履歴ログ、下部に入力フィールドと現在の送信対象を表示する。 |
+| Commands | 入力欄付きの専用 pane。実行中セッション一覧を表示し、送信対象を `broadcast`（全エージェント）/ `role:<role>` / 個別セッション `agent:<name>` から選んで生入力を一括注入する（tmux synchronize-panes 相当）。上部にセッション一覧と送信対象候補、中部に送信履歴ログ、下部に入力フィールドと現在の送信対象を表示する。 |
 | ContextBoard | context item一覧 |
 | ApprovalQueue | 承認待ち |
 | WorktreeDiff | diff表示 |
@@ -318,7 +319,7 @@ Ctrl-g Space    rotate layout
 
 ```text
 Enter           テキストを送信対象へ broadcast
-Tab             送信対象を巡回（broadcast → role:<role> → …）
+Tab             送信対象を巡回（broadcast → role:<role> → agent:<name>）
 Esc             入力フィールドをクリア
 Backspace / 印字文字   入力フィールドを編集
 ```

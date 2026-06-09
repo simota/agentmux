@@ -285,13 +285,15 @@ impl TuiSessionState {
         self.commands_input_buffer.clear();
     }
 
-    /// Cycle the broadcast target through `["broadcast", "role:<r>", ...]`.
+    /// Cycle the broadcast target through:
     ///
-    /// The role list is the distinct set of roles across live agent panes,
-    /// sorted for a stable cycle order. With no roles available the target stays
-    /// `"broadcast"`.
+    /// `"broadcast"` → each distinct live-agent role as `"role:<r>"` (sorted) →
+    /// each live agent as `"agent:<name>"` (in pane order) → back to `"broadcast"`.
+    ///
+    /// If the current target has been removed (e.g. the session exited), the next
+    /// Tab safely resolves to the first entry (`"broadcast"`).
     pub fn cycle_commands_target(&mut self) {
-        let targets = self.commands_target_cycle();
+        let targets = self.commands_target_options();
         let next = targets
             .iter()
             .position(|candidate| candidate == &self.commands_target)
@@ -303,21 +305,36 @@ impl TuiSessionState {
             .unwrap_or_else(|| "broadcast".to_string());
     }
 
-    /// Build the broadcast-target cycle: `"broadcast"` followed by each distinct
-    /// live-agent role as `"role:<r>"`, sorted.
-    fn commands_target_cycle(&self) -> Vec<String> {
-        let mut roles: Vec<String> = self
+    /// Build the complete ordered list of broadcast-target options:
+    ///
+    /// 1. `"broadcast"` (always first)
+    /// 2. `"role:<r>"` for each distinct role among live panes, sorted ascending
+    /// 3. `"agent:<name>"` for each live pane in layout order
+    ///
+    /// A pane is considered live when its `process_id` is `Some`.  Panes without
+    /// a role are excluded from the role group but always appear in the agent group.
+    pub fn commands_target_options(&self) -> Vec<String> {
+        let live_panes: Vec<&crate::state::AgentPaneState> = self
             .panes()
             .filter(|pane| pane.process_id().is_some())
+            .collect();
+
+        let mut roles: Vec<String> = live_panes
+            .iter()
             .filter_map(|pane| pane.role().map(ToOwned::to_owned))
             .collect();
         roles.sort();
         roles.dedup();
 
-        let mut cycle = Vec::with_capacity(roles.len() + 1);
-        cycle.push("broadcast".to_string());
-        cycle.extend(roles.into_iter().map(|role| format!("role:{role}")));
-        cycle
+        let mut options = Vec::with_capacity(1 + roles.len() + live_panes.len());
+        options.push("broadcast".to_string());
+        options.extend(roles.into_iter().map(|role| format!("role:{role}")));
+        options.extend(
+            live_panes
+                .iter()
+                .map(|pane| format!("agent:{}", pane.name())),
+        );
+        options
     }
 
     /// Record a sent broadcast (with its delivery outcome) in the history log.

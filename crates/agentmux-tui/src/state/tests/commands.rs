@@ -218,7 +218,9 @@ use super::*;
         state.cycle_commands_target();
         assert_eq!(state.commands_target(), "broadcast");
 
-        // Two implementers (same role) and one reviewer → distinct roles only.
+        // Two implementers (same role) and one reviewer.
+        // Cycle order: broadcast → role:implementer → role:reviewer →
+        //              agent:impl-1 → agent:impl-2 → agent:rev-1 → broadcast.
         state.apply_event(&event(
             IpcEventKind::AgentSpawned,
             json!({ "agent_id": "a1", "name": "impl-1", "role": "implementer", "process_id": 1 }),
@@ -232,11 +234,16 @@ use super::*;
             json!({ "agent_id": "r1", "name": "rev-1", "role": "reviewer", "process_id": 3 }),
         ));
 
-        // broadcast -> role:implementer -> role:reviewer -> broadcast (sorted).
         state.cycle_commands_target();
         assert_eq!(state.commands_target(), "role:implementer");
         state.cycle_commands_target();
         assert_eq!(state.commands_target(), "role:reviewer");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "agent:impl-1");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "agent:impl-2");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "agent:rev-1");
         state.cycle_commands_target();
         assert_eq!(state.commands_target(), "broadcast");
     }
@@ -505,5 +512,95 @@ use super::*;
         state.apply_command(TuiCommand::Focus(FocusDirection::Right));
         assert_eq!(state.layout().focused(), Some("agent_b"));
         assert!(!state.pane("agent_b").expect("pane b").has_unseen_output());
+    }
+
+    // ── Session-aware target cycling ───────────────────────────────────────
+
+    /// With two sessions (one with a role, one without), the cycle order is:
+    /// broadcast → role:<r> → agent:<name1> → agent:<name2> → broadcast.
+    #[test]
+    fn cycle_commands_target_includes_agent_targets() {
+        let mut state = TuiSessionState::default();
+
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "x1", "name": "coder", "role": "implementer", "process_id": 10 }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "x2", "name": "tester", "process_id": 11 }),
+        ));
+
+        // Expected order: broadcast → role:implementer → agent:coder → agent:tester → broadcast
+        assert_eq!(state.commands_target(), "broadcast");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "role:implementer");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "agent:coder");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "agent:tester");
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "broadcast");
+    }
+
+    /// With no sessions, cycling keeps the target at "broadcast".
+    #[test]
+    fn cycle_commands_target_stays_at_broadcast_with_no_sessions() {
+        let mut state = TuiSessionState::default();
+        assert_eq!(state.commands_target(), "broadcast");
+        for _ in 0..3 {
+            state.cycle_commands_target();
+            assert_eq!(state.commands_target(), "broadcast");
+        }
+    }
+
+    /// When the active target disappears (session exited), the next cycle
+    /// resolves safely to broadcast without panicking.
+    #[test]
+    fn cycle_commands_target_recovers_from_stale_agent_target() {
+        let mut state = TuiSessionState::default();
+
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "z1", "name": "ghost", "process_id": 99 }),
+        ));
+        state.cycle_commands_target(); // → agent:ghost
+        assert_eq!(state.commands_target(), "agent:ghost");
+
+        // Session exits.
+        state.apply_event(&event(
+            IpcEventKind::AgentExited,
+            json!({ "agent_id": "z1" }),
+        ));
+        // Target is now stale; options contain only ["broadcast"].
+        assert_eq!(state.commands_target(), "agent:ghost");
+
+        state.cycle_commands_target();
+        assert_eq!(state.commands_target(), "broadcast");
+    }
+
+    /// `commands_target_options` returns broadcast + sorted roles + agents in pane order.
+    #[test]
+    fn commands_target_options_returns_broadcast_then_roles_then_agents() {
+        let mut state = TuiSessionState::default();
+
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "p1", "name": "plan", "role": "planner", "process_id": 1 }),
+        ));
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "i1", "name": "impl", "role": "implementer", "process_id": 2 }),
+        ));
+
+        let options = state.commands_target_options();
+        assert_eq!(options[0], "broadcast");
+        // Roles are sorted: implementer < planner.
+        assert_eq!(options[1], "role:implementer");
+        assert_eq!(options[2], "role:planner");
+        // Agent entries follow in pane/spawn order.
+        assert!(options.contains(&"agent:plan".to_string()));
+        assert!(options.contains(&"agent:impl".to_string()));
+        assert_eq!(options.len(), 5); // broadcast + 2 roles + 2 agents
     }
 

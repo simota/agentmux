@@ -83,7 +83,7 @@ pub struct TuiSessionState {
     arena_selected: usize,
     /// Commands-panel input editor buffer (text the user is composing).
     commands_input_buffer: String,
-    /// Current broadcast target: `"broadcast"` or `"role:<role>"`.
+    /// Current broadcast target: `"broadcast"`, `"role:<role>"`, or `"agent:<name>"`.
     commands_target: String,
     /// Sent-broadcast history, oldest first.
     commands_history: Vec<CommandsLogEntry>,
