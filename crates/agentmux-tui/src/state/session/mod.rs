@@ -69,6 +69,10 @@ pub enum CommandsSubmit {
     Broadcast(String),
     /// Assign `role` to the single resolved live session `agent_id`.
     AssignRole { agent_id: String, role: String },
+    /// Send the raw key sequence `spec` (a `/keys` DSL string) to the single
+    /// resolved live session `agent_id`. The spec is forwarded verbatim; the
+    /// client validates and parses it when building the request.
+    SendKeys { agent_id: String, spec: String },
     /// The submission was rejected; show `message` as an error history line.
     Error(String),
 }

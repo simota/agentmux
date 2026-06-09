@@ -35,7 +35,7 @@ tmux の synchronize-panes のように、**「同じキーストロークを全
 
 | キー | 動作 |
 |---|---|
-| `Enter` | 入力を `/` コマンドとして実行（`/send "<text>"` で broadcast、`/role <newrole>` で role 割当。プレーン/未知コマンドはエラー） |
+| `Enter` | 入力を `/` コマンドとして実行（`/send "<text>"` で broadcast、`/role <newrole>` で role 割当、`/keys <spec>` で単一セッションへキーシーケンス送信。プレーン/未知コマンドはエラー） |
 | `Tab` | 送信対象を巡回（`broadcast` → 実行中エージェントの distinct な `role:<role>` → 個別セッション `agent:<name>`） |
 | `Esc` | 入力フィールドをクリア |
 | `Backspace` / 印字文字 | 入力フィールドを編集 |

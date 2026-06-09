@@ -269,3 +269,30 @@ use super::*;
         assert!(agent_set_role_request("  ".to_string(), "reviewer".to_string()).is_err());
         assert!(agent_set_role_request("agent_001".to_string(), "  ".to_string()).is_err());
     }
+
+    #[test]
+    fn agent_send_keys_request_targets_single_session_with_actions_json() {
+        let request = agent_send_keys_request("agent_001", "C-c|enter").unwrap();
+
+        assert_eq!(request.command, IpcCommand::AgentBroadcastInput);
+        assert_eq!(request.payload["target"], "agent:agent_001");
+        let actions = request.payload["actions"].as_array().unwrap();
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0], json!({ "press_ctrl": "c" }));
+        assert_eq!(actions[1], json!("press_enter"));
+    }
+
+    #[test]
+    fn agent_send_keys_request_emits_send_raw_byte_arrays() {
+        let request = agent_send_keys_request("agent_xyz", "raw:1b5b41").unwrap();
+        let actions = request.payload["actions"].as_array().unwrap();
+        assert_eq!(actions[0], json!({ "send_raw": [0x1b, 0x5b, 0x41] }));
+    }
+
+    #[test]
+    fn agent_send_keys_request_rejects_empty_and_malformed_input() {
+        assert!(agent_send_keys_request("  ", "C-c").is_err());
+        assert!(agent_send_keys_request("agent_001", "   ").is_err());
+        assert!(agent_send_keys_request("agent_001", "bogus").is_err());
+        assert!(agent_send_keys_request("agent_001", "raw:1b5").is_err());
+    }

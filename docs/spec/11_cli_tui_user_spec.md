@@ -15,7 +15,7 @@ agentmux attach [task|session]
 agentmux daemon start|stop|status
 agentmux project init|open|status|install-result-protocol
 agentmux task run|status|pause|resume|cancel|summary
-agentmux agent ls|spawn|stop|send|inject|focus|interrupt|broadcast|set-role
+agentmux agent ls|spawn|stop|send|inject|focus|interrupt|broadcast|set-role|keys
 agentmux message list|history|show|send|inject
 agentmux meeting open|close|list
 agentmux context add|list|show|search|attach|inject|export
@@ -260,6 +260,23 @@ agentmux agent set-role <agent_id> qa-lead
 
 指定セッションの role を実行時に変更する。既知ラベルは対応する role に、それ以外は任意のカスタム role として保存される。daemon は session metadata を更新し、`role:<role>` 解決に即時反映、`agent.role_changed` イベントを publish する（TUI の session list 表示が更新される）。Commands パネルからは `agent:<name>` を選択した状態で入力欄に `/role <newrole>` と打って Enter することで同じ操作ができる。
 
+### 3.11 agent keys
+
+```bash
+agentmux agent keys <agent_id> "C-c|enter"
+agentmux agent keys <agent_id> "text:y|enter"
+agentmux agent keys <agent_id> "esc|raw:1b5b41"
+```
+
+指定セッションへ任意のキーシーケンス（キーコード）を生のまま注入する。内部的には `agent.broadcast_input` を単一 target（`agent:<id>`）で再利用する。spec は `|` 区切りの step DSL:
+
+- `text:<s>` 文字入力 / `raw:<hex>` 生バイト列
+- `bs` `enter` `esc` `tab`
+- `C-<c>` / `ctrl:<c>` Ctrl 修飾、`M-<c>` / `alt:<c>` Alt 修飾
+- `up` `down` `left` `right` `home` `end`（端末エスケープシーケンス）
+
+Commands パネルからは、送信先が `agent:<name>`（**単一の live セッション**）のとき入力欄に `/keys <spec>` と打って Enter する。`broadcast` / `role:<...>`（複数対象）のときは履歴にエラーを出す（割り込み/制御キーの一斉送信を避け、「Ctrl-C は単一 pane のみ」の不変条件を保持する）。`enter` を含めない限り末尾 Enter は自動付与しない。
+
 ## 4. TUI画面構成
 
 標準layout:
@@ -332,6 +349,7 @@ Ctrl-g Space    rotate layout
 ```text
 /send "<text>"  入力テキストを送信対象へ broadcast（生入力の一括注入）
 /role <newrole> 送信対象 agent:<name> に role を割り当てる
+/keys <spec>    送信対象 agent:<name>(単一) にキーシーケンスを直接送信（§3.11）
 Tab             送信対象を巡回（broadcast → role:<role> → agent:<name>）
 Esc             入力フィールドをクリア
 Backspace / 印字文字   入力フィールドを編集

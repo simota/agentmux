@@ -35,6 +35,15 @@ pub enum CommandEffect {
         agent_id: String,
         role: String,
     },
+    /// Send the raw key sequence `spec` (a `/keys` DSL string) to the single
+    /// live session `agent_id`. Emitted when the operator submits `/keys <seq>`
+    /// with an `agent:<name>` target. The client loop parses the spec, performs
+    /// the `agent.broadcast_input` IPC round-trip against `agent:<agent_id>`,
+    /// and records the result via the Commands history.
+    SendKeys {
+        agent_id: String,
+        spec: String,
+    },
     #[cfg(feature = "activity-feed")]
     ToggleActivityFeedPane {
         visible: bool,

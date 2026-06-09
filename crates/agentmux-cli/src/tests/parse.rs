@@ -218,3 +218,79 @@ use super::*;
 
         std::fs::remove_dir_all(&root).unwrap();
     }
+
+    fn keys(spec: &str) -> Vec<KeyAction> {
+        parse_key_spec(spec).expect("expected a valid key spec")
+    }
+
+    fn keys_err(spec: &str) -> AgentmuxError {
+        parse_key_spec(spec).expect_err("expected a key spec error")
+    }
+
+    #[test]
+    fn parse_key_spec_maps_modifier_steps() {
+        assert_eq!(keys("C-c"), vec![KeyAction::PressCtrl('c')]);
+        assert_eq!(keys("ctrl:c"), vec![KeyAction::PressCtrl('c')]);
+        assert_eq!(keys("M-x"), vec![KeyAction::PressAlt('x')]);
+        assert_eq!(keys("alt:x"), vec![KeyAction::PressAlt('x')]);
+    }
+
+    #[test]
+    fn parse_key_spec_maps_named_keys() {
+        assert_eq!(keys("enter"), vec![KeyAction::PressEnter]);
+        assert_eq!(keys("esc"), vec![KeyAction::PressEsc]);
+        assert_eq!(keys("tab"), vec![KeyAction::PressTab]);
+        assert_eq!(keys("bs"), vec![KeyAction::PressBackspace]);
+    }
+
+    #[test]
+    fn parse_key_spec_maps_text_and_raw() {
+        assert_eq!(keys("text:hi"), vec![KeyAction::TypeText("hi".to_string())]);
+        assert_eq!(
+            keys("raw:1b5b41"),
+            vec![KeyAction::SendRaw(vec![0x1b, 0x5b, 0x41])]
+        );
+    }
+
+    #[test]
+    fn parse_key_spec_maps_arrow_and_navigation_keys() {
+        assert_eq!(keys("up"), vec![KeyAction::SendRaw(b"\x1b[A".to_vec())]);
+        assert_eq!(keys("down"), vec![KeyAction::SendRaw(b"\x1b[B".to_vec())]);
+        assert_eq!(keys("right"), vec![KeyAction::SendRaw(b"\x1b[C".to_vec())]);
+        assert_eq!(keys("left"), vec![KeyAction::SendRaw(b"\x1b[D".to_vec())]);
+        assert_eq!(keys("home"), vec![KeyAction::SendRaw(b"\x1b[H".to_vec())]);
+        assert_eq!(keys("end"), vec![KeyAction::SendRaw(b"\x1b[F".to_vec())]);
+    }
+
+    #[test]
+    fn parse_key_spec_parses_multiple_pipe_separated_steps() {
+        assert_eq!(
+            keys("C-c|enter"),
+            vec![KeyAction::PressCtrl('c'), KeyAction::PressEnter]
+        );
+        assert_eq!(
+            keys("text:hi | tab | up"),
+            vec![
+                KeyAction::TypeText("hi".to_string()),
+                KeyAction::PressTab,
+                KeyAction::SendRaw(b"\x1b[A".to_vec()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_key_spec_rejects_malformed_input() {
+        // Odd-length hex.
+        assert!(matches!(keys_err("raw:1b5"), AgentmuxError::UserError(_)));
+        // Non-hex characters.
+        assert!(matches!(keys_err("raw:zz"), AgentmuxError::UserError(_)));
+        // Unknown step.
+        assert!(matches!(keys_err("bogus"), AgentmuxError::UserError(_)));
+        // Empty spec.
+        assert!(matches!(keys_err(""), AgentmuxError::UserError(_)));
+        assert!(matches!(keys_err("   "), AgentmuxError::UserError(_)));
+        // Empty step between separators.
+        assert!(matches!(keys_err("enter||esc"), AgentmuxError::UserError(_)));
+        // Multi-char modifier.
+        assert!(matches!(keys_err("C-ab"), AgentmuxError::UserError(_)));
+    }

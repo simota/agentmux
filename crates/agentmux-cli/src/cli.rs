@@ -219,6 +219,16 @@ pub(crate) enum AgentAction {
     Focus { agent_id: String },
     /// Send an interrupt (Ctrl-C) to an agent.
     Interrupt { agent_id: String },
+    /// Send a raw key sequence to a single agent session.
+    ///
+    /// The spec is a pipe-separated DSL: text:<s>, raw:<hex>, bs, enter, esc,
+    /// tab, C-<c>/ctrl:<c>, M-<c>/alt:<c>, up/down/left/right/home/end.
+    /// Example: agentmux agent keys <agent_id> "C-c|enter".
+    Keys {
+        agent_id: String,
+        /// The pipe-separated key sequence to send to the agent PTY.
+        spec: String,
+    },
     /// Reassign the role of a running agent session.
     SetRole {
         agent_id: String,

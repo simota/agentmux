@@ -7,7 +7,10 @@ use agentmux_ipc::{ClientRequest, IpcCommand};
 use agentmux_tui::state::{AgentProviderChoice, TerminalSize as TuiTerminalSize};
 use serde_json::json;
 
-use crate::parse::{normalize_agent_target, normalize_message_kind, normalize_priority, unique_agent_name};
+use crate::parse::{
+    KeyAction, normalize_agent_target, normalize_message_kind, normalize_priority, parse_key_spec,
+    unique_agent_name,
+};
 
 pub(crate) fn daemon_status_request() -> ClientRequest {
     ClientRequest::new("req_daemon_status", IpcCommand::DaemonStatus, json!({}))
@@ -242,6 +245,40 @@ pub(crate) fn agent_broadcast_input_request(
         json!({
             "target": target,
             "actions": actions,
+        }),
+    ))
+}
+
+/// Build an `agent.broadcast_input` request that sends an arbitrary key
+/// sequence (parsed from a `/keys` DSL spec) to a single agent session.
+///
+/// Reuses the same `AgentBroadcastInput` IPC as `synchronize-panes`, but pins
+/// the target to exactly one session via `agent:<agent_id>` — `/keys` must
+/// never fan out to multiple panes (the "Ctrl-C goes to one pane only"
+/// invariant). The actions are the verbatim parse of `spec`, with no implicit
+/// trailing Enter (the caller spells out `enter` in the spec when wanted).
+///
+/// Errors when `agent_id` is empty, `spec` is empty, or the DSL is malformed.
+pub(crate) fn agent_send_keys_request(agent_id: &str, spec: &str) -> Result<ClientRequest> {
+    let agent_id = agent_id.trim();
+    if agent_id.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "keys target agent id must not be empty".to_string(),
+        ));
+    }
+    if spec.trim().is_empty() {
+        return Err(AgentmuxError::UserError(
+            "keys spec must not be empty".to_string(),
+        ));
+    }
+    let actions = parse_key_spec(spec)?;
+    let actions_json: Vec<_> = actions.iter().map(KeyAction::to_json).collect();
+    Ok(ClientRequest::new(
+        "req_agent_broadcast_input",
+        IpcCommand::AgentBroadcastInput,
+        json!({
+            "target": format!("agent:{agent_id}"),
+            "actions": actions_json,
         }),
     ))
 }

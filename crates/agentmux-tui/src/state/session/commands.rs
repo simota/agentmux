@@ -431,6 +431,12 @@ impl TuiSessionState {
     ///   must be a single live session (`agent:<name>` resolving to a live
     ///   pane); anything else (`broadcast`, `role:<…>`, or an unresolved
     ///   `agent:<name>`) -> [`CommandsSubmit::Error`]. Empty role -> Error.
+    /// - `/keys <seq>` sends a raw key sequence (pipe-separated DSL, e.g.
+    ///   `C-c|enter`) to the selected session. Like `/role`, the target must be
+    ///   a single live session (`agent:<name>`); `broadcast`, `role:<…>`, or an
+    ///   unresolved `agent:<name>` -> [`CommandsSubmit::Error`]. Empty spec ->
+    ///   Error. The DSL itself is validated client-side when the request is
+    ///   built, keeping this state crate independent of `InputAction`.
     /// - Plain (non-slash) text or an unknown `/command` -> [`CommandsSubmit::Error`];
     ///   text is never broadcast implicitly — use `/send`.
     /// - An empty buffer yields `None` (nothing to submit).
@@ -480,6 +486,28 @@ impl TuiSessionState {
                     None => Some(CommandsSubmit::Error(format!("no live session named {name}"))),
                 }
             }
+            "keys" => {
+                if rest.is_empty() {
+                    return Some(CommandsSubmit::Error(
+                        "/keys requires a key sequence, e.g. /keys C-c|enter".to_string(),
+                    ));
+                }
+                // Raw keys must target exactly one live session: fanning the
+                // sequence out to multiple panes would violate the "Ctrl-C goes
+                // to a single pane only" invariant.
+                let Some(name) = self.commands_target.strip_prefix("agent:") else {
+                    return Some(CommandsSubmit::Error(
+                        "/keys targets a single session; select agent:<name> first".to_string(),
+                    ));
+                };
+                match self.live_agent_id_by_name(name) {
+                    Some(agent_id) => Some(CommandsSubmit::SendKeys {
+                        agent_id,
+                        spec: rest.to_string(),
+                    }),
+                    None => Some(CommandsSubmit::Error(format!("no live session named {name}"))),
+                }
+            }
             other => Some(CommandsSubmit::Error(format!("unknown command: /{other}"))),
         }
     }
@@ -520,6 +548,22 @@ impl TuiSessionState {
         let target = self.commands_target.clone();
         self.push_commands_error_history(target, message);
         self.commands_pending_role = None;
+        self.commands_input_clear();
+    }
+
+    /// Record an in-flight key-sequence send so the daemon's
+    /// `agent.broadcast_input` response (`{delivered, skipped}`) is paired with
+    /// a readable `keys: <spec>` history line. Also clears the input buffer.
+    pub fn begin_commands_keys(&mut self, spec: impl AsRef<str>) {
+        let target = self.commands_target.clone();
+        self.commands_pending_broadcast = Some((target, format!("keys: {}", spec.as_ref())));
+        self.commands_input_clear();
+    }
+
+    /// Record an error line for a rejected `/keys` submission and clear the input.
+    pub fn fail_commands_keys(&mut self, message: impl Into<String>) {
+        let target = self.commands_target.clone();
+        self.push_commands_error_history(target, message);
         self.commands_input_clear();
     }
 

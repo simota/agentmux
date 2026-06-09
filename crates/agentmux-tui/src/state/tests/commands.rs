@@ -867,3 +867,133 @@ use super::*;
         assert_eq!(state.commands_input_buffer(), "");
     }
 
+    #[test]
+    fn parse_commands_input_keys_sends_to_resolved_live_agent() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+
+        type_input(&mut state, "/keys C-c|enter");
+        assert_eq!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::SendKeys {
+                agent_id: "agent_foo".to_string(),
+                spec: "C-c|enter".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn parse_commands_input_empty_keys_spec_is_error() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+
+        type_input(&mut state, "/keys ");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn parse_commands_input_keys_against_broadcast_target_is_error() {
+        let mut state = TuiSessionState::default();
+        assert_eq!(state.commands_target(), "broadcast");
+        type_input(&mut state, "/keys C-c");
+        match state.parse_commands_input() {
+            Some(CommandsSubmit::Error(message)) => {
+                assert!(message.contains("agent:<name>"), "message: {message}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_commands_input_keys_against_role_target_is_error() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "role:implementer");
+
+        type_input(&mut state, "/keys C-c");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn parse_commands_input_keys_against_unresolved_agent_is_error() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+        state.apply_event(&event(
+            IpcEventKind::AgentExited,
+            json!({ "agent_id": "agent_foo" }),
+        ));
+
+        type_input(&mut state, "/keys C-c");
+        assert!(matches!(
+            state.parse_commands_input(),
+            Some(CommandsSubmit::Error(_))
+        ));
+    }
+
+    #[test]
+    fn begin_commands_keys_records_keys_history_via_broadcast_response() {
+        let mut state = TuiSessionState::default();
+        state.apply_event(&event(
+            IpcEventKind::AgentSpawned,
+            json!({ "agent_id": "agent_foo", "name": "foo", "role": "implementer", "process_id": 7 }),
+        ));
+        select_target(&mut state, "agent:foo");
+
+        type_input(&mut state, "/keys C-c|enter");
+        state.begin_commands_keys("C-c|enter");
+        // begin_* clears the editor buffer (request handed to daemon).
+        assert_eq!(state.commands_input_buffer(), "");
+
+        // The daemon's agent.broadcast_input response drives the history entry.
+        let applied = state.apply_commands_broadcast_response(&json!({
+            "delivered": ["agent_foo"],
+            "skipped": []
+        }));
+        assert!(applied);
+
+        let history = state.commands_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].target, "agent:foo");
+        assert_eq!(history[0].text, "keys: C-c|enter");
+        assert_eq!(
+            history[0].kind,
+            CommandsLogKind::Broadcast {
+                delivered: 1,
+                skipped: 0
+            }
+        );
+    }
+
+    #[test]
+    fn fail_commands_keys_records_error_history_entry() {
+        let mut state = TuiSessionState::default();
+        type_input(&mut state, "/keys bogus");
+        state.fail_commands_keys("unknown key step 'bogus'");
+
+        let history = state.commands_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].kind, CommandsLogKind::Error);
+        assert_eq!(state.commands_input_buffer(), "");
+    }
+

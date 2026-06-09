@@ -144,7 +144,7 @@ pub(crate) fn commands_panel_lines(
 
     // ── Fixed bottom elements ─────────────────────────────────────────────
     let separator = "─".repeat(content_width.min(40));
-    let hint = "/send \"text\"  /role <r>  Tab: target  Esc: clear".to_string();
+    let hint = "/send \"text\"  /role <r>  /keys <seq>  Tab: target  Esc: clear".to_string();
     let input_line = truncate_cell(
         &format!("> {}\u{2588}", state.commands_input_buffer()),
         content_width,

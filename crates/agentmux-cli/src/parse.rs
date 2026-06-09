@@ -626,6 +626,151 @@ pub(crate) fn parse_provider_choice(raw: &str) -> Result<AgentProviderChoice> {
     }
 }
 
+/// A single input action parsed from a `/keys` spec, mirroring the variants of
+/// `agentmux_agent::InputAction` that a key sequence can express. Held as a
+/// dedicated client-side enum so the parser stays unit-testable and `agentmux-cli`
+/// does not need to depend on `agentmux-agent`; [`KeyAction::to_json`] emits the
+/// exact serde wire shape the daemon already accepts for `agent.broadcast_input`.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum KeyAction {
+    TypeText(String),
+    SendRaw(Vec<u8>),
+    PressEnter,
+    PressEsc,
+    PressTab,
+    PressBackspace,
+    PressCtrl(char),
+    PressAlt(char),
+}
+
+impl KeyAction {
+    /// Serialize to the `InputAction` serde encoding
+    /// (`#[serde(rename_all = "snake_case")]`, externally tagged):
+    /// `{"type_text":"…"}`, `{"send_raw":[u8…]}`, `{"press_ctrl":"c"}`,
+    /// `{"press_alt":"x"}`, and the bare strings `"press_enter"` / `"press_esc"`
+    /// / `"press_tab"` / `"press_backspace"` for the unit variants.
+    pub(crate) fn to_json(&self) -> serde_json::Value {
+        use serde_json::json;
+        match self {
+            Self::TypeText(text) => json!({ "type_text": text }),
+            Self::SendRaw(bytes) => json!({ "send_raw": bytes }),
+            Self::PressEnter => json!("press_enter"),
+            Self::PressEsc => json!("press_esc"),
+            Self::PressTab => json!("press_tab"),
+            Self::PressBackspace => json!("press_backspace"),
+            Self::PressCtrl(ch) => json!({ "press_ctrl": ch }),
+            Self::PressAlt(ch) => json!({ "press_alt": ch }),
+        }
+    }
+}
+
+/// Parse a pipe-separated key-sequence spec into a list of [`KeyAction`]s.
+///
+/// The grammar extends the `print_input_script` example DSL with modifier and
+/// arrow/navigation keys:
+/// - `text:<s>`              -> `TypeText(s)`
+/// - `raw:<hex>`             -> `SendRaw(bytes)` (hex must be even-length, valid)
+/// - `bs`                    -> `PressBackspace`
+/// - `enter`                 -> `PressEnter`
+/// - `esc`                   -> `PressEsc`
+/// - `tab`                   -> `PressTab`
+/// - `C-<c>` / `ctrl:<c>`    -> `PressCtrl(c)`
+/// - `M-<c>` / `alt:<c>`     -> `PressAlt(c)`
+/// - `up`/`down`/`left`/`right` -> `SendRaw` of the CSI arrow sequence
+/// - `home`/`end`            -> `SendRaw(ESC [ H)` / `SendRaw(ESC [ F)`
+///
+/// Unlike the example (which panics), an empty spec or any unknown/malformed
+/// step returns a [`AgentmuxError::UserError`] so callers can surface it.
+pub(crate) fn parse_key_spec(spec: &str) -> Result<Vec<KeyAction>> {
+    let mut actions = Vec::new();
+    for raw_step in spec.split('|') {
+        let step = raw_step.trim();
+        if step.is_empty() {
+            return Err(AgentmuxError::UserError(
+                "empty key step in spec (steps are separated by '|')".to_string(),
+            ));
+        }
+        actions.push(parse_key_step(step)?);
+    }
+    if actions.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "key spec must contain at least one step".to_string(),
+        ));
+    }
+    Ok(actions)
+}
+
+fn parse_key_step(step: &str) -> Result<KeyAction> {
+    if let Some(text) = step.strip_prefix("text:") {
+        return Ok(KeyAction::TypeText(text.to_string()));
+    }
+    if let Some(hex) = step.strip_prefix("raw:") {
+        return parse_hex_bytes(hex).map(KeyAction::SendRaw);
+    }
+    if let Some(rest) = step.strip_prefix("ctrl:") {
+        return single_char(rest, "ctrl:").map(KeyAction::PressCtrl);
+    }
+    if let Some(rest) = step.strip_prefix("alt:") {
+        return single_char(rest, "alt:").map(KeyAction::PressAlt);
+    }
+    if let Some(rest) = step.strip_prefix("C-") {
+        return single_char(rest, "C-").map(KeyAction::PressCtrl);
+    }
+    if let Some(rest) = step.strip_prefix("M-") {
+        return single_char(rest, "M-").map(KeyAction::PressAlt);
+    }
+    match step {
+        "bs" => Ok(KeyAction::PressBackspace),
+        "enter" => Ok(KeyAction::PressEnter),
+        "esc" => Ok(KeyAction::PressEsc),
+        "tab" => Ok(KeyAction::PressTab),
+        "up" => Ok(KeyAction::SendRaw(b"\x1b[A".to_vec())),
+        "down" => Ok(KeyAction::SendRaw(b"\x1b[B".to_vec())),
+        "right" => Ok(KeyAction::SendRaw(b"\x1b[C".to_vec())),
+        "left" => Ok(KeyAction::SendRaw(b"\x1b[D".to_vec())),
+        "home" => Ok(KeyAction::SendRaw(b"\x1b[H".to_vec())),
+        "end" => Ok(KeyAction::SendRaw(b"\x1b[F".to_vec())),
+        other => Err(AgentmuxError::UserError(format!(
+            "unknown key step '{other}' (expected text:/raw:/ctrl:/alt:/C-/M-, \
+             bs/enter/esc/tab, or up/down/left/right/home/end)"
+        ))),
+    }
+}
+
+/// Decode an even-length hexadecimal string into bytes, erroring on odd length
+/// or any non-hex character.
+fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>> {
+    if hex.is_empty() {
+        return Err(AgentmuxError::UserError(
+            "raw: requires hex bytes, e.g. raw:1b5b41".to_string(),
+        ));
+    }
+    if hex.len() % 2 != 0 {
+        return Err(AgentmuxError::UserError(format!(
+            "raw hex '{hex}' has an odd length; each byte needs two hex digits"
+        )));
+    }
+    (0..hex.len())
+        .step_by(2)
+        .map(|index| {
+            u8::from_str_radix(&hex[index..index + 2], 16).map_err(|_| {
+                AgentmuxError::UserError(format!("invalid hex byte in raw:'{hex}'"))
+            })
+        })
+        .collect()
+}
+
+/// Extract exactly one character for a `C-`/`M-`/`ctrl:`/`alt:` modifier step.
+fn single_char(rest: &str, prefix: &str) -> Result<char> {
+    let mut chars = rest.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => Ok(ch),
+        _ => Err(AgentmuxError::UserError(format!(
+            "'{prefix}' modifier expects exactly one character, got '{rest}'"
+        ))),
+    }
+}
+
 pub(crate) fn normalize_agent_target(raw: &str) -> String {
     let target = raw.trim();
     if target.starts_with("agent:") {

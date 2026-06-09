@@ -34,7 +34,8 @@ use tokio::task::JoinHandle;
 use crate::daemon::ensure_daemon;
 use crate::output::response_error;
 use crate::requests::{
-    agent_broadcast_input_request, agent_resize_request, agent_set_role_request,
+    agent_broadcast_input_request, agent_resize_request, agent_send_keys_request,
+    agent_set_role_request,
     agent_spawn_for_provider_request_with_id, agent_spawn_for_provider_request_with_size,
     agent_stop_request, attach_request, detach_request, message_list_request, snapshot_request,
     tui_daemon_status_request,
@@ -480,6 +481,15 @@ pub(crate) async fn run_tui_session_inner(
                                 Err(error) => state.fail_commands_role_assign(error.to_string()),
                             }
                         }
+                        Some(CommandsSubmit::SendKeys { agent_id, spec }) => {
+                            match agent_send_keys_request(&agent_id, &spec) {
+                                Ok(request) => {
+                                    state.begin_commands_keys(&spec);
+                                    writer.write(&request).await?;
+                                }
+                                Err(error) => state.fail_commands_keys(error.to_string()),
+                            }
+                        }
                         Some(CommandsSubmit::Error(message)) => {
                             state.fail_commands_role_assign(message);
                         }
@@ -562,6 +572,21 @@ pub(crate) async fn run_tui_session_inner(
                             }
                             Err(error) => {
                                 state.fail_commands_role_assign(error.to_string());
+                                draw_tui_frame(&mut terminal, &renderer, &state)?;
+                            }
+                        }
+                    }
+                    CommandEffect::SendKeys { agent_id, spec } => {
+                        // The Commands Send path emits the SendKeys submission
+                        // directly; this arm covers the (currently unused) command
+                        // path and keeps the match total.
+                        match agent_send_keys_request(&agent_id, &spec) {
+                            Ok(request) => {
+                                state.begin_commands_keys(&spec);
+                                writer.write(&request).await?;
+                            }
+                            Err(error) => {
+                                state.fail_commands_keys(error.to_string());
                                 draw_tui_frame(&mut terminal, &renderer, &state)?;
                             }
                         }
