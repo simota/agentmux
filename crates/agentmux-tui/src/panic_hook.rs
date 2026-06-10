@@ -5,7 +5,9 @@ use std::io::{self, Write};
 use std::panic;
 
 use crossterm::{
-    cursor, execute,
+    cursor,
+    event::{DisableBracketedPaste, DisableMouseCapture},
+    execute,
     terminal::{LeaveAlternateScreen, disable_raw_mode},
 };
 
@@ -74,7 +76,17 @@ where
     F: FnOnce() -> io::Result<()>,
 {
     let raw_mode_error = disable_raw_mode_fn().err();
-    let screen_error = execute!(writer, LeaveAlternateScreen, cursor::Show).err();
+    // Keep this sequence identical to `CrosstermTerminalIo::exit`: mouse
+    // capture must be disabled too, or a panic during copy mode leaves the
+    // host terminal emitting mouse-report escape sequences.
+    let screen_error = execute!(
+        writer,
+        DisableMouseCapture,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        cursor::Show
+    )
+    .err();
 
     TerminalRestoreError::from_parts(raw_mode_error, screen_error).map_or(Ok(()), Err)
 }
@@ -118,7 +130,14 @@ mod tests {
         let error = result.expect_err("raw mode failure should be reported");
         assert_eq!(error.raw_mode_error(), Some("raw mode unavailable"));
         assert!(error.screen_error().is_none());
-        assert_eq!(output, b"\x1b[?1049l\x1b[?25h");
+        // Mouse capture and bracketed paste are disabled alongside the
+        // screen/cursor restore — the same sequence as the regular exit path —
+        // so a panic during copy mode never leaves the host terminal in
+        // mouse-reporting or paste-reporting mode.
+        assert_eq!(
+            output,
+            b"\x1b[?1006l\x1b[?1015l\x1b[?1003l\x1b[?1002l\x1b[?1000l\x1b[?2004l\x1b[?1049l\x1b[?25h"
+        );
     }
 
     #[test]

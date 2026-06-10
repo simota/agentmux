@@ -287,10 +287,8 @@ async fn ipc_message_commands_create_list_show_and_inject() {
         inject_response.payload.as_ref().unwrap()["delivery_status"],
         "delivered"
     );
-    let first_event: DaemonEvent = reader.read().await.unwrap().unwrap();
-    let second_event: DaemonEvent = reader.read().await.unwrap().unwrap();
-    assert_eq!(first_event.kind, IpcEventKind::InputInjected);
-    assert_eq!(second_event.kind, IpcEventKind::MessageDelivered);
+    read_event_of_kind(&mut reader, IpcEventKind::InputInjected).await;
+    read_event_of_kind(&mut reader, IpcEventKind::MessageDelivered).await;
 
     std::thread::sleep(Duration::from_millis(1200));
     let delivered = std::fs::read_to_string(&output_path).expect("message reached PTY");
@@ -712,20 +710,22 @@ async fn ready_status_signal_delivers_next_idle_message_to_live_pty() {
 
     assert_eq!(delivered.id, message.id);
     assert_eq!(delivered.delivery_status, DeliveryStatus::Delivered);
-    let mut seen = Vec::new();
-    for _ in 0..4 {
-        seen.push(
-            events
-                .recv()
-                .await
-                .expect("delivery event is published")
-                .kind,
-        );
+    // PTY echo chunks can interleave with the delivery events, so scan until
+    // every expected kind has been observed instead of reading a fixed count.
+    let mut expected = vec![
+        IpcEventKind::AgentStatusSignal,
+        IpcEventKind::AgentStatusChanged,
+        IpcEventKind::InputInjected,
+        IpcEventKind::MessageDelivered,
+    ];
+    for _ in 0..32 {
+        if expected.is_empty() {
+            break;
+        }
+        let event = events.recv().await.expect("delivery event is published");
+        expected.retain(|kind| kind != &event.kind);
     }
-    assert!(seen.contains(&IpcEventKind::AgentStatusSignal));
-    assert!(seen.contains(&IpcEventKind::AgentStatusChanged));
-    assert!(seen.contains(&IpcEventKind::InputInjected));
-    assert!(seen.contains(&IpcEventKind::MessageDelivered));
+    assert!(expected.is_empty(), "missing delivery events: {expected:?}");
 
     let status = runtime.status_payload().await;
     assert_eq!(status["agents"][0]["status"], "awaiting_input");
@@ -1353,6 +1353,185 @@ async fn injection_defers_inside_window_and_proceeds_at_boundary() {
 
 /// Spawn a perl-capture PTY agent under `role` that writes everything it
 /// receives to `output_path`. Shared by the broadcast tests below.
+/// Regression for the stalled-delivery gap: a message parked in
+/// `WaitingForAgent` (deferred while the target was busy) used to wait for the
+/// *next* status signal of that agent — which may never arrive. A redelivery
+/// pass must pick it up using only the stored session status, and a second
+/// pass must not deliver it twice.
+#[tokio::test]
+async fn redelivery_pass_delivers_message_parked_in_waiting_for_agent() {
+    let root = std::env::temp_dir().join(format!("agentmux-redelivery-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let output_path = root.join("redelivery.txt");
+    let runtime = DaemonRuntime::new(16);
+    let agent = spawn_capture_agent(
+        &runtime,
+        "parked-codex",
+        AgentRole::Tester,
+        &root,
+        &output_path,
+    )
+    .await;
+
+    let message = runtime
+        .create_message(NewAgentMessage {
+            task_id: None,
+            thread_id: None,
+            from: MessageSource::System,
+            to: MessageTarget::Agent(agent.id.clone()),
+            kind: MessageKind::Handoff,
+            priority: Priority::Normal,
+            body: "redelivery-parked-body".to_string(),
+            context_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            delivery_mode: DeliveryMode::InjectWhenIdle,
+            requires_response: false,
+        })
+        .await
+        .expect("message is created");
+
+    // A busy status signal parks the message in WaitingForAgent.
+    let deferred = runtime
+        .apply_agent_status_signal(&agent.id, AgentStatus::RunningTurn, "turn in progress")
+        .await
+        .expect("busy signal is applied");
+    assert!(deferred.is_none(), "busy agent defers delivery");
+    assert_eq!(
+        runtime
+            .get_message(&message.id)
+            .await
+            .unwrap()
+            .delivery_status,
+        DeliveryStatus::WaitingForAgent
+    );
+
+    // The agent becomes idle, but no further status signal arrives — only the
+    // stored metadata reflects it. The redelivery pass must still deliver.
+    {
+        let mut state = runtime.state.write().await;
+        state.agents.get_mut(&agent.id).unwrap().metadata.status = Some(AgentStatus::AwaitingInput);
+    }
+    runtime.retry_waiting_message_delivery().await;
+
+    assert_eq!(
+        runtime
+            .get_message(&message.id)
+            .await
+            .unwrap()
+            .delivery_status,
+        DeliveryStatus::Delivered,
+        "redelivery pass delivers the parked message"
+    );
+    let output = wait_for_file_contains(&output_path, "redelivery-parked-body")
+        .await
+        .expect("parked message reached the PTY via the redelivery pass");
+
+    // A second pass must be a no-op: the message is already delivered to this
+    // recipient (`delivered_to` dedup), so the body appears exactly once.
+    runtime.retry_waiting_message_delivery().await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let final_output = std::fs::read_to_string(&output_path).unwrap_or(output);
+    assert_eq!(
+        final_output.matches("redelivery-parked-body").count(),
+        1,
+        "redelivery never injects the same message twice"
+    );
+
+    terminate_agent_process(&runtime, &agent.id.to_string()).await;
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
+/// Regression for the daemon-wide hang: a pane whose foreground process stops
+/// reading input fills the kernel PTY buffer and blocks `write_all`. The write
+/// must run without holding the daemon state lock and must time out as a
+/// delivery failure (message -> `Failed`) instead of wedging every IPC task
+/// behind the state `RwLock`'s fair queue.
+#[tokio::test]
+async fn pty_write_timeout_fails_delivery_without_wedging_daemon_state() {
+    let root = std::env::temp_dir().join(format!("agentmux-write-timeout-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let runtime = DaemonRuntime::new(16);
+
+    // `sleep` keeps the PTY slave open but never reads stdin, so a write
+    // larger than the kernel PTY buffer blocks forever.
+    let agent = runtime
+        .spawn_agent(
+            "stuck-pane".to_string(),
+            PtySpawnSpec {
+                command: "/bin/sleep".to_string(),
+                args: vec!["30".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                size: Default::default(),
+            },
+        )
+        .await
+        .expect("agent is spawned");
+    {
+        let mut state = runtime.state.write().await;
+        state.injection_timing.pty_write_timeout = Duration::from_millis(250);
+    }
+
+    let message = runtime
+        .create_message(NewAgentMessage {
+            task_id: None,
+            thread_id: None,
+            from: MessageSource::System,
+            to: MessageTarget::Agent(agent.id.clone()),
+            kind: MessageKind::Handoff,
+            priority: Priority::High,
+            body: "x".repeat(512 * 1024),
+            context_refs: Vec::new(),
+            artifact_refs: Vec::new(),
+            delivery_mode: DeliveryMode::InjectWhenIdle,
+            requires_response: false,
+        })
+        .await
+        .expect("message is created");
+
+    let delivery_runtime = runtime.clone();
+    let delivery_agent = agent.id.clone();
+    let delivery = tokio::spawn(async move {
+        delivery_runtime
+            .deliver_idle_messages_for_agent(&delivery_agent, AgentStatus::AwaitingInput)
+            .await
+    });
+
+    // While the oversized write is blocked on the full PTY buffer, the daemon
+    // state must stay responsive: no state guard is held across the write.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let status = tokio::time::timeout(Duration::from_secs(1), runtime.status_payload())
+        .await
+        .expect("daemon state stays responsive during a blocked PTY write");
+    assert_eq!(status["agent_count"], 1);
+
+    let result = tokio::time::timeout(Duration::from_secs(5), delivery)
+        .await
+        .expect("delivery times out instead of hanging")
+        .expect("delivery task does not panic");
+    let error = result.expect_err("blocked PTY write must fail delivery");
+    assert!(
+        matches!(error, AgentmuxError::PtyError(_)),
+        "timeout surfaces as a PTY error, got {error:?}"
+    );
+    assert_eq!(
+        runtime
+            .get_message(&message.id)
+            .await
+            .unwrap()
+            .delivery_status,
+        DeliveryStatus::Failed,
+        "timed-out injection marks the message Failed"
+    );
+
+    // Unblock the leaked blocking write (it still owns this pane's PTY mutex):
+    // killing the child closes the slave side, so the blocked `write_all`
+    // fails with EIO and the tokio blocking pool can drain at shutdown.
+    let pid = agent.process_id.expect("spawned agent has a pid");
+    let _ = Command::new("kill").arg("-9").arg(pid.to_string()).output();
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
 async fn spawn_capture_agent(
     runtime: &DaemonRuntime,
     name: &str,

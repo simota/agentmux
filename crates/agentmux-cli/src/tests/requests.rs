@@ -246,6 +246,13 @@ fn sigint_requests_tui_detach_for_terminal_restoring_shutdown_path() {
 }
 
 #[test]
+fn sigterm_requests_tui_detach_for_terminal_restoring_shutdown_path() {
+    // SIGTERM must flow through the same Detach path as SIGINT so the
+    // TerminalSession Drop restores raw mode / the alternate screen.
+    assert_eq!(tui_signal_effect(TuiSignal::Sigterm), CommandEffect::Detach);
+}
+
+#[test]
 fn quit_closes_tui_client_without_stopping_agent_sessions() {
     let request = tui_close_request(CommandEffect::Quit).expect("close request");
 

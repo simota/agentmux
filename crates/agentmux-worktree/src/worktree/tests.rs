@@ -492,6 +492,46 @@ fn rejects_empty_test_command_before_writing_artifact() {
     assert!(error.to_string().contains("test command must not be empty"));
 }
 
+/// Regression: a hung test command must be killed at the timeout instead of
+/// occupying its caller forever (the daemon runs these on blocking workers).
+#[test]
+fn shell_command_times_out_and_kills_the_child() {
+    let fixture = GitFixture::new();
+    let started = std::time::Instant::now();
+
+    let error = run_shell_command_with_timeout(
+        &fixture.repo,
+        "sleep 30",
+        std::time::Duration::from_millis(200),
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("timed out"),
+        "timeout error mentions the cause, got: {error}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(5),
+        "the hung command is killed promptly, not awaited to completion"
+    );
+}
+
+#[test]
+fn shell_command_within_timeout_captures_output_and_status() {
+    let fixture = GitFixture::new();
+
+    let output = run_shell_command_with_timeout(
+        &fixture.repo,
+        "printf out-marker; printf err-marker >&2; exit 3",
+        std::time::Duration::from_secs(10),
+    )
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "out-marker");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "err-marker");
+}
+
 struct GitFixture {
     root: PathBuf,
     repo: PathBuf,

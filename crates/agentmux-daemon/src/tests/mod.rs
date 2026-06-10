@@ -52,20 +52,44 @@ where
     (response.unwrap(), event.unwrap())
 }
 
+/// Read frames until a response frame arrives, skipping interleaved event
+/// frames. PTY writes hop through the blocking pool, so an attached client can
+/// receive e.g. a `pty.output_chunk` echo event before the request's response
+/// frame — that interleaving is nondeterministic and not part of the contract.
 async fn read_response<R>(reader: &mut JsonlReader<R>) -> DaemonResponse
 where
     R: tokio::io::AsyncBufRead + Unpin,
 {
-    let frame: serde_json::Value = tokio::time::timeout(Duration::from_secs(2), reader.read())
-        .await
-        .expect("response frame is not timed out")
-        .expect("response frame is readable")
-        .expect("response frame exists");
-    assert!(
-        frame.get("ok").is_some(),
-        "expected response frame, got {frame:?}"
-    );
-    serde_json::from_value(frame).expect("response frame is valid")
+    for _ in 0..32 {
+        let frame: serde_json::Value = tokio::time::timeout(Duration::from_secs(2), reader.read())
+            .await
+            .expect("response frame is not timed out")
+            .expect("response frame is readable")
+            .expect("response frame exists");
+        if frame.get("ok").is_some() {
+            return serde_json::from_value(frame).expect("response frame is valid");
+        }
+    }
+    panic!("no response frame within 32 frames");
+}
+
+/// Read event frames until one of `kind` arrives, skipping unrelated events
+/// (same nondeterministic interleaving as in [`read_response`]).
+async fn read_event_of_kind<R>(reader: &mut JsonlReader<R>, kind: IpcEventKind) -> DaemonEvent
+where
+    R: tokio::io::AsyncBufRead + Unpin,
+{
+    for _ in 0..32 {
+        let event: DaemonEvent = tokio::time::timeout(Duration::from_secs(2), reader.read())
+            .await
+            .expect("event frame is not timed out")
+            .expect("event frame is readable")
+            .expect("event frame exists");
+        if event.kind == kind {
+            return event;
+        }
+    }
+    panic!("no {kind:?} event within 32 frames");
 }
 
 fn test_git<const N: usize>(repo: &Path, args: [&str; N]) {

@@ -37,6 +37,42 @@ impl DaemonRuntime {
         self
     }
 
+    /// Build the production runtime for a project directory, wiring the
+    /// `.agentmux/` runtime pieces when the project has been initialized:
+    ///
+    /// - `.agentmux/events.jsonl` as the audit event log (spec invariant: all
+    ///   automated input/messages/results are recorded),
+    /// - the policy engine from `[policy]` + `[automation]`,
+    /// - injection timing from `[automation]` + `[context]`
+    ///   (`human_input_quiet_ms` etc.).
+    ///
+    /// Without a `.agentmux/` directory (pre-`project init`) the daemon runs
+    /// with a plain runtime: spec-default policy, default timing, no event
+    /// log. With `.agentmux/` but no `config.toml`, the event log is still
+    /// wired so audit entries are never silently dropped. An invalid
+    /// `config.toml` is a startup error, not a silent fallback.
+    pub async fn for_project(event_capacity: usize, project_root: &Path) -> Result<Self> {
+        let agentmux_dir = project_root.join(".agentmux");
+        if !agentmux_dir.is_dir() {
+            return Ok(Self::new(event_capacity));
+        }
+
+        let runtime = Self::new(event_capacity)
+            .with_event_log(EventLog::new(agentmux_dir.join("events.jsonl")));
+        let config_path = agentmux_dir.join("config.toml");
+        if !config_path.is_file() {
+            return Ok(runtime);
+        }
+
+        let config = AgentmuxConfig::load_from_path(&config_path)?;
+        let policy = policy_engine_from_config(&config.automation, &config.policy)?;
+        Ok(runtime
+            .with_policy_engine(policy)
+            .await
+            .with_injection_config(&config.automation, &config.context)
+            .await)
+    }
+
     pub async fn recover_state_from_event_log(&self) -> Result<usize> {
         let Some(event_log) = &self.event_log else {
             return Ok(0);

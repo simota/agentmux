@@ -754,6 +754,14 @@ fn parse_hex_bytes(hex: &str) -> Result<Vec<u8>> {
             "raw: requires hex bytes, e.g. raw:1b5b41".to_string(),
         ));
     }
+    // Reject non-ASCII input up front: multi-byte characters can pass the
+    // even-length check below but make `hex[index..index + 2]` slice across a
+    // char boundary and panic.
+    if !hex.is_ascii() {
+        return Err(AgentmuxError::UserError(format!(
+            "invalid hex byte in raw:'{hex}'"
+        )));
+    }
     if hex.len() % 2 != 0 {
         return Err(AgentmuxError::UserError(format!(
             "raw hex '{hex}' has an odd length; each byte needs two hex digits"
@@ -1238,5 +1246,20 @@ mod tests {
             vec![agent(AgentProviderChoice::Agy), StartupPaneChoice::Commands]
         );
         assert_eq!(dir(&layout), SplitDirection::Vertical);
+    }
+
+    #[test]
+    fn parse_hex_bytes_rejects_non_ascii_input_without_panicking() {
+        // Two full-width characters are 6 bytes, which passes the even-length
+        // check; slicing by byte index used to panic on the char boundary.
+        assert!(matches!(
+            parse_hex_bytes("ＡＢ"),
+            Err(AgentmuxError::UserError(_))
+        ));
+        // Mixed ASCII + multi-byte (4 bytes, even length) must also error.
+        assert!(matches!(
+            parse_hex_bytes("aあ"),
+            Err(AgentmuxError::UserError(_))
+        ));
     }
 }

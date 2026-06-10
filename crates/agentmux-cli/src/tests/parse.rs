@@ -283,6 +283,9 @@ fn parse_key_spec_rejects_malformed_input() {
     assert!(matches!(keys_err("raw:1b5"), AgentmuxError::UserError(_)));
     // Non-hex characters.
     assert!(matches!(keys_err("raw:zz"), AgentmuxError::UserError(_)));
+    // Non-ASCII hex input (even byte length but multi-byte chars) must not panic.
+    assert!(matches!(keys_err("raw:aあ"), AgentmuxError::UserError(_)));
+    assert!(matches!(keys_err("raw:ＡＢ"), AgentmuxError::UserError(_)));
     // Unknown step.
     assert!(matches!(keys_err("bogus"), AgentmuxError::UserError(_)));
     // Empty spec.

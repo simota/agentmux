@@ -9,7 +9,7 @@ use agentmux_core::{AgentmuxError, error::Result};
 use agentmux_ipc::ClientRequest;
 use agentmux_ipc::{ClientHello, DaemonStreamFrame, JsonlReader, JsonlWriter};
 use agentmux_tui::{
-    input::{InputForwardError, dispatch_to_daemon_request},
+    input::{InputForwardError, dispatch_to_daemon_request, focused_input_request},
     keymap::KeymapDispatcher,
     layout::{PaneLayout, Rect, SplitDirection},
     render::TuiSessionRenderer,
@@ -20,7 +20,7 @@ use agentmux_tui::{
     terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
 };
 use crossterm::{
-    event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
+    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     terminal as crossterm_terminal,
 };
 use serde_json::{Value, json};
@@ -35,7 +35,7 @@ use crate::daemon::daemon_supports_arena_state;
 #[cfg(feature = "activity-feed")]
 use crate::daemon::daemon_supports_event_subscribe;
 use crate::daemon::ensure_daemon;
-use crate::output::response_error;
+use crate::output::{read_daemon_response_frame, response_error, write_daemon_frame};
 use crate::parse::{StartupLayout, StartupLayoutNode};
 #[cfg(feature = "activity-feed")]
 use crate::requests::event_subscribe_request;
@@ -53,11 +53,16 @@ use agentmux_tui::state::{COMMANDS_PANE_ID, CONVERSATION_LIST_PANE_ID};
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TuiSignal {
     Sigint,
+    Sigterm,
 }
 
 pub(crate) fn tui_signal_effect(signal: TuiSignal) -> CommandEffect {
     match signal {
-        TuiSignal::Sigint => CommandEffect::Detach,
+        // SIGTERM's default disposition is immediate termination, which would
+        // skip `TerminalSession`'s Drop and leave the host terminal in raw
+        // mode / the alternate screen. Routing it through the same Detach path
+        // as SIGINT guarantees an orderly shutdown and terminal restore.
+        TuiSignal::Sigint | TuiSignal::Sigterm => CommandEffect::Detach,
     }
 }
 
@@ -70,12 +75,20 @@ pub(crate) fn tui_close_request(effect: CommandEffect) -> Option<ClientRequest> 
 
 pub(crate) fn spawn_tui_signal_forwarder(
     signal_tx: mpsc::UnboundedSender<TuiSignal>,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        if tokio::signal::ctrl_c().await.is_ok() {
-            let _ = signal_tx.send(TuiSignal::Sigint);
+) -> Result<JoinHandle<()>> {
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(|error| {
+            AgentmuxError::TerminalError(format!("failed to register SIGTERM handler: {error}"))
+        })?;
+    Ok(tokio::spawn(async move {
+        let signal = tokio::select! {
+            result = tokio::signal::ctrl_c() => result.ok().map(|()| TuiSignal::Sigint),
+            received = sigterm.recv() => received.map(|()| TuiSignal::Sigterm),
+        };
+        if let Some(signal) = signal {
+            let _ = signal_tx.send(signal);
         }
-    })
+    }))
 }
 
 pub(crate) async fn run_bare_tui_session(socket_path: &Path) -> Result<()> {
@@ -110,13 +123,11 @@ pub(crate) async fn run_tui_session_inner(
     let mut reader = JsonlReader::new(BufReader::new(reader));
     let mut writer = JsonlWriter::new(writer);
 
-    writer
-        .write(&ClientHello::new(env!("CARGO_PKG_VERSION")))
-        .await?;
+    write_daemon_frame(&mut writer, &ClientHello::new(env!("CARGO_PKG_VERSION"))).await?;
 
     let status_request = tui_daemon_status_request();
     let status_request_id = status_request.id.clone();
-    writer.write(&status_request).await?;
+    write_daemon_frame(&mut writer, &status_request).await?;
 
     // Depth-first leaf choices drive deterministic spawn ordering. `split_direction`
     // is the root split's direction (already in engine terms: spec `|` -> `Vertical`,
@@ -152,11 +163,11 @@ pub(crate) async fn run_tui_session_inner(
         })
         .collect::<Vec<_>>();
     for request in &startup_spawn_requests {
-        writer.write(request).await?;
+        write_daemon_frame(&mut writer, request).await?;
     }
     let startup_message_list_request = open_startup_messages.then(message_list_request);
     if let Some(request) = &startup_message_list_request {
-        writer.write(request).await?;
+        write_daemon_frame(&mut writer, request).await?;
     }
     let startup_spawn_request_ids = startup_spawn_requests
         .iter()
@@ -168,8 +179,8 @@ pub(crate) async fn run_tui_session_inner(
         (attach_request, snapshot_request)
     });
     if let Some((attach_request, snapshot_request)) = &attach_and_snapshot {
-        writer.write(attach_request).await?;
-        writer.write(snapshot_request).await?;
+        write_daemon_frame(&mut writer, attach_request).await?;
+        write_daemon_frame(&mut writer, snapshot_request).await?;
     }
 
     let mut state = TuiSessionState::new(split_direction);
@@ -259,16 +270,14 @@ pub(crate) async fn run_tui_session_inner(
     let mut copy_mode = false;
     let mut copy_drag_start: Option<CopyPoint> = None;
     let (signal_tx, mut signal_rx) = mpsc::unbounded_channel();
-    let signal_task = spawn_tui_signal_forwarder(signal_tx);
+    let signal_task = spawn_tui_signal_forwarder(signal_tx)?;
 
     sync_current_terminal_pane_sizes(&mut writer, &mut state, &mut resize_sequence).await?;
     if let Some(first_agent_id) = startup_agent_ids.first() {
-        writer
-            .write(&attach_request(first_agent_id.clone()))
-            .await?;
+        write_daemon_frame(&mut writer, &attach_request(first_agent_id.clone())).await?;
     }
     for agent_id in &startup_agent_ids {
-        writer.write(&snapshot_request(agent_id.clone())).await?;
+        write_daemon_frame(&mut writer, &snapshot_request(agent_id.clone())).await?;
     }
     draw_tui_frame(&mut terminal, &renderer, &state)?;
 
@@ -296,8 +305,8 @@ pub(crate) async fn run_tui_session_inner(
             if let Some(agent_id) = spawned_agent_id {
                 sync_current_terminal_pane_sizes(&mut writer, &mut state, &mut resize_sequence)
                     .await?;
-                writer.write(&attach_request(agent_id.clone())).await?;
-                writer.write(&snapshot_request(agent_id)).await?;
+                write_daemon_frame(&mut writer, &attach_request(agent_id.clone())).await?;
+                write_daemon_frame(&mut writer, &snapshot_request(agent_id)).await?;
             }
             pending_redraw = true;
         }
@@ -307,7 +316,7 @@ pub(crate) async fn run_tui_session_inner(
 
         if let Ok(signal) = signal_rx.try_recv() {
             if let Some(request) = tui_close_request(tui_signal_effect(signal)) {
-                writer.write(&request).await?;
+                write_daemon_frame(&mut writer, &request).await?;
                 break;
             }
         }
@@ -322,7 +331,7 @@ pub(crate) async fn run_tui_session_inner(
                     for request in
                         resize_panes_for_terminal(&mut state, cols, rows, &mut resize_sequence)
                     {
-                        writer.write(&request).await?;
+                        write_daemon_frame(&mut writer, &request).await?;
                     }
                     draw_tui_frame(&mut terminal, &renderer, &state)?;
                 } else if copy_mode && let Event::Mouse(mouse) = event {
@@ -371,6 +380,32 @@ pub(crate) async fn run_tui_session_inner(
                     let (cols, rows) = current_terminal_size()?;
                     if scroll_pane_at(&mut state, cols, rows, mouse.column, mouse.row, delta) {
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    }
+                } else if let Event::Paste(text) = event {
+                    let commands_pane_focused = state
+                        .layout()
+                        .focused()
+                        .is_some_and(|pane_id| state.is_commands_pane(pane_id));
+                    if commands_pane_focused {
+                        // Insert the paste at the caret in one shot; newlines
+                        // are flattened to spaces so a multi-line paste cannot
+                        // trigger Send mid-paste.
+                        state.commands_input_insert_str(&commands_paste_text(&text));
+                        draw_tui_frame(&mut terminal, &renderer, &state)?;
+                    } else if !text.is_empty() {
+                        // Forward the whole paste to the focused agent PTY as a
+                        // single raw write — never one request per character.
+                        input_sequence = input_sequence.saturating_add(1);
+                        let request_id = format!("req_input_{input_sequence}");
+                        match focused_input_request(&state, request_id, text.into_bytes()) {
+                            Ok(request) => write_daemon_frame(&mut writer, &request).await?,
+                            Err(InputForwardError::NoFocusedPane) => {}
+                            Err(error) => {
+                                return Err(AgentmuxError::UserError(format!(
+                                    "failed to forward paste to focused agent: {error:?}"
+                                )));
+                            }
+                        }
                     }
                 }
                 continue;
@@ -459,7 +494,7 @@ pub(crate) async fn run_tui_session_inner(
                         | agentmux_tui::keymap::KeyDispatch::Consumed
                 )
             {
-                match commands_input_key(key.code) {
+                match commands_input_key(key) {
                     Some(CommandsInputAction::Send) => match state.parse_commands_input() {
                         Some(CommandsSubmit::Broadcast(text)) => {
                             let target = state.commands_target().to_string();
@@ -467,7 +502,7 @@ pub(crate) async fn run_tui_session_inner(
                             {
                                 Ok(request) => {
                                     state.begin_commands_broadcast(target, text);
-                                    writer.write(&request).await?;
+                                    write_daemon_frame(&mut writer, &request).await?;
                                 }
                                 Err(error) => state.set_runtime_notice(error.to_string()),
                             }
@@ -476,7 +511,7 @@ pub(crate) async fn run_tui_session_inner(
                             match agent_set_role_request(agent_id, role.clone()) {
                                 Ok(request) => {
                                     state.begin_commands_role_assign(role);
-                                    writer.write(&request).await?;
+                                    write_daemon_frame(&mut writer, &request).await?;
                                 }
                                 Err(error) => state.fail_commands_role_assign(error.to_string()),
                             }
@@ -485,7 +520,7 @@ pub(crate) async fn run_tui_session_inner(
                             match agent_send_keys_request(&agent_id, &spec) {
                                 Ok(request) => {
                                     state.begin_commands_keys(&spec);
-                                    writer.write(&request).await?;
+                                    write_daemon_frame(&mut writer, &request).await?;
                                 }
                                 Err(error) => state.fail_commands_keys(error.to_string()),
                             }
@@ -498,6 +533,11 @@ pub(crate) async fn run_tui_session_inner(
                     Some(CommandsInputAction::CycleTarget) => state.cycle_commands_target(),
                     Some(CommandsInputAction::Clear) => state.commands_input_clear(),
                     Some(CommandsInputAction::Backspace) => state.commands_input_backspace(),
+                    Some(CommandsInputAction::Delete) => state.commands_input_delete(),
+                    Some(CommandsInputAction::MoveLeft) => state.commands_input_move_left(),
+                    Some(CommandsInputAction::MoveRight) => state.commands_input_move_right(),
+                    Some(CommandsInputAction::MoveHome) => state.commands_input_move_home(),
+                    Some(CommandsInputAction::MoveEnd) => state.commands_input_move_end(),
                     Some(CommandsInputAction::Insert(ch)) => state.commands_input_push(ch),
                     None => {}
                 }
@@ -523,14 +563,14 @@ pub(crate) async fn run_tui_session_inner(
                         let spawn_size = current_terminal_size()
                             .ok()
                             .and_then(|(cols, rows)| pending_spawn_pane_size(&state, cols, rows));
-                        writer
-                            .write(&agent_spawn_for_provider_request_with_size(
-                                provider, spawn_size,
-                            ))
-                            .await?;
+                        write_daemon_frame(
+                            &mut writer,
+                            &agent_spawn_for_provider_request_with_size(provider, spawn_size),
+                        )
+                        .await?;
                     }
                     CommandEffect::OpenConversationListPane => {
-                        writer.write(&message_list_request()).await?;
+                        write_daemon_frame(&mut writer, &message_list_request()).await?;
                         sync_current_terminal_pane_sizes(
                             &mut writer,
                             &mut state,
@@ -554,7 +594,7 @@ pub(crate) async fn run_tui_session_inner(
                         match agent_broadcast_input_request(target.clone(), text.clone(), true) {
                             Ok(request) => {
                                 state.begin_commands_broadcast(target, text);
-                                writer.write(&request).await?;
+                                write_daemon_frame(&mut writer, &request).await?;
                             }
                             Err(error) => {
                                 state.set_runtime_notice(error.to_string());
@@ -568,7 +608,7 @@ pub(crate) async fn run_tui_session_inner(
                         match agent_set_role_request(agent_id, role.clone()) {
                             Ok(request) => {
                                 state.begin_commands_role_assign(role);
-                                writer.write(&request).await?;
+                                write_daemon_frame(&mut writer, &request).await?;
                             }
                             Err(error) => {
                                 state.fail_commands_role_assign(error.to_string());
@@ -583,7 +623,7 @@ pub(crate) async fn run_tui_session_inner(
                         match agent_send_keys_request(&agent_id, &spec) {
                             Ok(request) => {
                                 state.begin_commands_keys(&spec);
-                                writer.write(&request).await?;
+                                write_daemon_frame(&mut writer, &request).await?;
                             }
                             Err(error) => {
                                 state.fail_commands_keys(error.to_string());
@@ -595,9 +635,11 @@ pub(crate) async fn run_tui_session_inner(
                     CommandEffect::ToggleActivityFeedPane { visible } => {
                         if visible {
                             if daemon_supports_event_subscribe(&state) {
-                                writer
-                                    .write(&event_subscribe_request(state.feed_filter()))
-                                    .await?;
+                                write_daemon_frame(
+                                    &mut writer,
+                                    &event_subscribe_request(state.feed_filter()),
+                                )
+                                .await?;
                             } else {
                                 state
                                     .set_runtime_notice("Activity Feed unsupported by this daemon");
@@ -619,17 +661,18 @@ pub(crate) async fn run_tui_session_inner(
                     #[cfg(feature = "arena")]
                     CommandEffect::ArenaAdopt(worktree_id) => {
                         if daemon_supports_arena_state(&state) {
-                            writer.write(&worktree_adopt_request(worktree_id)).await?;
+                            write_daemon_frame(&mut writer, &worktree_adopt_request(worktree_id))
+                                .await?;
                         } else {
                             state.set_runtime_notice("Arena unsupported by this daemon");
                             draw_tui_frame(&mut terminal, &renderer, &state)?;
                         }
                     }
                     CommandEffect::StopPane(agent_id) => {
-                        writer.write(&agent_stop_request(agent_id)).await?;
+                        write_daemon_frame(&mut writer, &agent_stop_request(agent_id)).await?;
                     }
                     CommandEffect::RefreshMessages => {
-                        writer.write(&message_list_request()).await?;
+                        write_daemon_frame(&mut writer, &message_list_request()).await?;
                         draw_tui_frame(&mut terminal, &renderer, &state)?;
                     }
                     CommandEffect::Unhandled(agentmux_tui::keymap::TuiCommand::EnterCopyMode) => {
@@ -646,11 +689,11 @@ pub(crate) async fn run_tui_session_inner(
                         }
                     }
                     CommandEffect::Detach => {
-                        writer.write(&detach_request()).await?;
+                        write_daemon_frame(&mut writer, &detach_request()).await?;
                         break;
                     }
                     CommandEffect::Quit => {
-                        writer.write(&detach_request()).await?;
+                        write_daemon_frame(&mut writer, &detach_request()).await?;
                         break;
                     }
                     CommandEffect::Unhandled(_) => {}
@@ -661,7 +704,7 @@ pub(crate) async fn run_tui_session_inner(
             input_sequence = input_sequence.saturating_add(1);
             let request_id = format!("req_input_{input_sequence}");
             match dispatch_to_daemon_request(&state, request_id, dispatch) {
-                Ok(Some(request)) => writer.write(&request).await?,
+                Ok(Some(request)) => write_daemon_frame(&mut writer, &request).await?,
                 Ok(None) | Err(InputForwardError::NoFocusedPane) => {}
                 Err(error) => {
                     return Err(AgentmuxError::UserError(format!(
@@ -714,9 +757,11 @@ where
         && startup_messages_received
         && startup_spawn_received.len() == startup_spawn_request_ids.len())
     {
-        let frame = reader.read::<DaemonStreamFrame>().await?.ok_or_else(|| {
-            AgentmuxError::IpcError("daemon closed before TUI attach completed".to_string())
-        })?;
+        let frame = read_daemon_response_frame::<_, DaemonStreamFrame>(reader)
+            .await?
+            .ok_or_else(|| {
+                AgentmuxError::IpcError("daemon closed before TUI attach completed".to_string())
+            })?;
         let spawned_agent_id = spawned_agent_id_from_frame(&frame);
         if let Some(response_id) = apply_tui_stream_frame(state, frame)? {
             if response_id == status_request_id {
@@ -855,7 +900,7 @@ where
 {
     let (cols, rows) = current_terminal_size()?;
     for request in resize_panes_for_terminal(state, cols, rows, resize_sequence) {
-        writer.write(&request).await?;
+        write_daemon_frame(writer, &request).await?;
     }
     Ok(())
 }
@@ -974,23 +1019,76 @@ pub(crate) enum CommandsInputAction {
     CycleTarget,
     Clear,
     Backspace,
+    Delete,
+    MoveLeft,
+    MoveRight,
+    MoveHome,
+    MoveEnd,
     Insert(char),
 }
 
-/// Map a key code to a Commands-panel input action.
+/// Map a key event to a Commands-panel input action.
 ///
-/// `Enter` submits, `Tab` cycles the broadcast target, `Esc` clears, `Backspace`
-/// and `Delete` both delete the previous character (the input field has no
-/// in-line cursor), and printable characters are inserted. Other keys are ignored.
-pub(crate) fn commands_input_key(code: KeyCode) -> Option<CommandsInputAction> {
-    match code {
+/// `Enter` submits, `Tab` cycles the broadcast target, `Esc` clears, and
+/// printable characters are inserted at the caret. The input field is a full
+/// in-line editor: `Left`/`Right`/`Home`/`End` move the caret, `Backspace`
+/// deletes the character before it, and `Delete` the character under it.
+/// Other keys are ignored.
+///
+/// Release notifications (terminals using the kitty keyboard protocol report
+/// them) are ignored so a key never acts twice, and — mirroring the overlay
+/// key handlers in `keymap.rs` — events carrying CONTROL or ALT never edit
+/// the buffer (e.g. `Ctrl+C` must not type a literal `c`).
+pub(crate) fn commands_input_key(key: KeyEvent) -> Option<CommandsInputAction> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+    if key
+        .modifiers
+        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    {
+        return None;
+    }
+    match key.code {
         KeyCode::Enter => Some(CommandsInputAction::Send),
         KeyCode::Tab => Some(CommandsInputAction::CycleTarget),
         KeyCode::Esc => Some(CommandsInputAction::Clear),
-        KeyCode::Backspace | KeyCode::Delete => Some(CommandsInputAction::Backspace),
+        KeyCode::Backspace => Some(CommandsInputAction::Backspace),
+        KeyCode::Delete => Some(CommandsInputAction::Delete),
+        KeyCode::Left => Some(CommandsInputAction::MoveLeft),
+        KeyCode::Right => Some(CommandsInputAction::MoveRight),
+        KeyCode::Home => Some(CommandsInputAction::MoveHome),
+        KeyCode::End => Some(CommandsInputAction::MoveEnd),
         KeyCode::Char(ch) => Some(CommandsInputAction::Insert(ch)),
         _ => None,
     }
+}
+
+/// Normalise pasted text for the Commands input field: every line break
+/// (`\r\n`, `\n`, or bare `\r`) becomes a single space so a multi-line paste
+/// cannot trigger Send mid-paste, and every other control character except
+/// `\t` is stripped — a paste captured from terminal output can carry raw
+/// escape sequences, and inserting them into the input buffer would re-emit
+/// them through the rendered frame and corrupt the display. All remaining
+/// characters are kept verbatim.
+pub(crate) fn commands_paste_text(text: &str) -> String {
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\r' => {
+                if chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
+                normalized.push(' ');
+            }
+            '\n' => normalized.push(' '),
+            '\t' => normalized.push('\t'),
+            ch if ch.is_control() => {}
+            other => normalized.push(other),
+        }
+    }
+    normalized
 }
 
 pub(crate) fn copy_mode_key_exits(code: KeyCode, modifiers: KeyModifiers) -> bool {

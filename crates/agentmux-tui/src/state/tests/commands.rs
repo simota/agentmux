@@ -229,9 +229,157 @@ fn commands_input_editing_pushes_backspaces_and_clears() {
 
     state.commands_input_clear();
     assert_eq!(state.commands_input_buffer(), "");
+    assert_eq!(state.commands_input_cursor(), 0);
     // Backspace on an empty buffer is a no-op.
     state.commands_input_backspace();
     assert_eq!(state.commands_input_buffer(), "");
+}
+
+/// The caret moves with Left/Right/Home/End and clamps at both buffer ends.
+#[test]
+fn commands_input_cursor_moves_and_clamps() {
+    let mut state = TuiSessionState::default();
+    for ch in "abc".chars() {
+        state.commands_input_push(ch);
+    }
+    assert_eq!(state.commands_input_cursor(), 3);
+
+    state.commands_input_move_right(); // already at the end: no-op
+    assert_eq!(state.commands_input_cursor(), 3);
+    state.commands_input_move_left();
+    state.commands_input_move_left();
+    assert_eq!(state.commands_input_cursor(), 1);
+    state.commands_input_move_home();
+    assert_eq!(state.commands_input_cursor(), 0);
+    state.commands_input_move_left(); // already at the start: no-op
+    assert_eq!(state.commands_input_cursor(), 0);
+    state.commands_input_move_right();
+    assert_eq!(state.commands_input_cursor(), 1);
+    state.commands_input_move_end();
+    assert_eq!(state.commands_input_cursor(), 3);
+}
+
+/// Insertion and deletion happen at the caret, staying char-boundary safe for
+/// multibyte text (Japanese and emoji).
+#[test]
+fn commands_input_edits_at_cursor_are_char_boundary_safe() {
+    let mut state = TuiSessionState::default();
+    for ch in "あい😀".chars() {
+        state.commands_input_push(ch);
+    }
+    assert_eq!(state.commands_input_buffer(), "あい😀");
+
+    // Insert in the middle: あ|い😀 → あxい😀
+    state.commands_input_move_home();
+    state.commands_input_move_right();
+    state.commands_input_push('x');
+    assert_eq!(state.commands_input_buffer(), "あxい😀");
+    assert_eq!(state.commands_input_cursor(), 2);
+
+    // Backspace removes the char before the caret (the inserted 'x').
+    state.commands_input_backspace();
+    assert_eq!(state.commands_input_buffer(), "あい😀");
+    assert_eq!(state.commands_input_cursor(), 1);
+
+    // Delete removes the char under the caret ('い').
+    state.commands_input_delete();
+    assert_eq!(state.commands_input_buffer(), "あ😀");
+    assert_eq!(state.commands_input_cursor(), 1);
+
+    // Delete at the end of the buffer is a no-op.
+    state.commands_input_move_end();
+    state.commands_input_delete();
+    assert_eq!(state.commands_input_buffer(), "あ😀");
+}
+
+/// A pasted string is inserted whole at the caret and the caret lands after it.
+#[test]
+fn commands_input_insert_str_inserts_at_cursor() {
+    let mut state = TuiSessionState::default();
+    for ch in "ad".chars() {
+        state.commands_input_push(ch);
+    }
+    state.commands_input_move_left();
+    state.commands_input_insert_str("bあc");
+    assert_eq!(state.commands_input_buffer(), "abあcd");
+    assert_eq!(state.commands_input_cursor(), 4);
+
+    // Empty paste is a no-op.
+    state.commands_input_insert_str("");
+    assert_eq!(state.commands_input_buffer(), "abあcd");
+    assert_eq!(state.commands_input_cursor(), 4);
+}
+
+/// Every caret operation on an empty buffer is a safe no-op: no panic and no
+/// caret drift away from index 0.
+#[test]
+fn commands_input_empty_buffer_ops_are_noops() {
+    let mut state = TuiSessionState::default();
+
+    state.commands_input_delete();
+    state.commands_input_move_left();
+    state.commands_input_move_right();
+    state.commands_input_move_end();
+    state.commands_input_move_home();
+
+    assert_eq!(state.commands_input_buffer(), "");
+    assert_eq!(state.commands_input_cursor(), 0);
+
+    // Insert after the no-op storm lands at index 0 as usual.
+    state.commands_input_push('a');
+    assert_eq!(state.commands_input_buffer(), "a");
+    assert_eq!(state.commands_input_cursor(), 1);
+}
+
+/// Editing is Unicode-scalar based: deleting after a ZWJ emoji sequence or a
+/// combining mark removes exactly one scalar per keypress, never splitting a
+/// char (no byte-boundary panic).
+#[test]
+fn commands_input_backspace_removes_one_scalar_from_zwj_and_combining_sequences() {
+    let mut state = TuiSessionState::default();
+    for ch in "👩\u{200D}🚀".chars() {
+        state.commands_input_push(ch); // astronaut: 3 scalars joined by ZWJ
+    }
+    assert_eq!(state.commands_input_cursor(), 3);
+
+    state.commands_input_backspace(); // removes 🚀
+    assert_eq!(state.commands_input_buffer(), "👩\u{200D}");
+    state.commands_input_backspace(); // removes the ZWJ
+    assert_eq!(state.commands_input_buffer(), "👩");
+    state.commands_input_backspace();
+    assert_eq!(state.commands_input_buffer(), "");
+
+    // Combining mark: backspace removes the mark first, then the base char.
+    state.commands_input_push('e');
+    state.commands_input_push('\u{301}'); // e + combining acute = é
+    state.commands_input_backspace();
+    assert_eq!(state.commands_input_buffer(), "e");
+
+    // Delete (forward) is scalar-based too: caret before the mark removes it.
+    state.commands_input_push('\u{301}');
+    state.commands_input_move_home();
+    state.commands_input_move_right(); // caret between 'e' and the mark
+    state.commands_input_delete();
+    assert_eq!(state.commands_input_buffer(), "e");
+    assert_eq!(state.commands_input_cursor(), 1);
+}
+
+/// A multi-kilobyte insert lands whole at the caret and the caret advances by
+/// the char count (not the byte count) of the inserted text.
+#[test]
+fn commands_input_insert_str_handles_multi_kilobyte_text() {
+    let mut state = TuiSessionState::default();
+    state.commands_input_push('<');
+    state.commands_input_push('>');
+    state.commands_input_move_left(); // caret between '<' and '>'
+
+    let huge = "あ0".repeat(1024); // 2048 chars, 4 KB of multibyte payload
+    state.commands_input_insert_str(&huge);
+
+    assert_eq!(state.commands_input_cursor(), 1 + 2048);
+    assert_eq!(state.commands_input_buffer().chars().count(), 2050);
+    assert!(state.commands_input_buffer().starts_with("<あ0"));
+    assert!(state.commands_input_buffer().ends_with("あ0>"));
 }
 
 #[test]

@@ -1,12 +1,97 @@
 //! Git command and shell process helpers.
 
 use std::ffi::OsStr;
+use std::io::Read;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use agentmux_core::{AgentmuxError, error::Result};
 
 use super::types::TestCommand;
+
+/// Upper bound on a single git invocation. Git can hang indefinitely (e.g. a
+/// credential prompt, a wedged filesystem); a stuck call must not pin its
+/// caller forever.
+pub(crate) const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Upper bound on a worktree test command (`worktree.test`). Test suites are
+/// slow but must still terminate; a hung test is killed and reported.
+pub(crate) const TEST_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Poll interval for the bounded child wait loop.
+const CHILD_WAIT_POLL: Duration = Duration::from_millis(25);
+
+/// Run `command` to completion with captured output, killing the child if it
+/// does not exit within `timeout`.
+///
+/// Equivalent to `Command::output()` (stdin null, stdout/stderr piped) but
+/// bounded: the wait is a `try_wait` poll loop with a deadline, and on timeout
+/// the child is killed (SIGKILL) and reaped before the error is returned.
+/// Output pipes are drained on dedicated threads so a chatty child can never
+/// deadlock against a full pipe buffer.
+pub(crate) fn run_command_with_timeout(
+    command: &mut Command,
+    timeout: Duration,
+    label: &str,
+) -> Result<Output> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| AgentmuxError::ProviderError(format!("failed to run {label}: {error}")))?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let stdout_thread = std::thread::spawn(move || read_pipe_to_end(stdout));
+    let stderr_thread = std::thread::spawn(move || read_pipe_to_end(stderr));
+
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() >= deadline => {
+                // SIGKILL, then reap so no zombie is left behind. The reader
+                // threads finish once the pipe write ends close with the child.
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(AgentmuxError::ProviderError(format!(
+                    "{label} timed out after {}s and was killed",
+                    timeout.as_secs()
+                )));
+            }
+            Ok(None) => std::thread::sleep(CHILD_WAIT_POLL),
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_thread.join();
+                let _ = stderr_thread.join();
+                return Err(AgentmuxError::ProviderError(format!(
+                    "failed to wait for {label}: {error}"
+                )));
+            }
+        }
+    };
+
+    let stdout = stdout_thread.join().unwrap_or_default();
+    let stderr = stderr_thread.join().unwrap_or_default();
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_pipe_to_end(pipe: Option<impl Read>) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    if let Some(mut pipe) = pipe {
+        let _ = pipe.read_to_end(&mut buffer);
+    }
+    buffer
+}
 
 pub(crate) fn utf8_stdout(output: Output, command: &str) -> Result<String> {
     String::from_utf8(output.stdout).map_err(|error| {
@@ -134,14 +219,9 @@ pub(crate) fn run_git_raw<'a>(
     repo_root: &Path,
     args: impl IntoIterator<Item = &'a OsStr>,
 ) -> Result<Output> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(args)
-        .output()
-        .map_err(|error| AgentmuxError::ProviderError(format!("failed to run git: {error}")))?;
-
-    Ok(output)
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_root).args(args);
+    run_command_with_timeout(&mut command, GIT_COMMAND_TIMEOUT, "git")
 }
 
 pub(crate) fn git_failure(prefix: &str, output: Output) -> AgentmuxError {
@@ -152,14 +232,17 @@ pub(crate) fn git_failure(prefix: &str, output: Output) -> AgentmuxError {
 }
 
 pub(crate) fn run_shell_command(worktree_path: &Path, command: &str) -> Result<Output> {
-    Command::new("/bin/sh")
-        .arg("-c")
-        .arg(command)
-        .current_dir(worktree_path)
-        .output()
-        .map_err(|error| {
-            AgentmuxError::ProviderError(format!("failed to run test command: {error}"))
-        })
+    run_shell_command_with_timeout(worktree_path, command, TEST_COMMAND_TIMEOUT)
+}
+
+pub(crate) fn run_shell_command_with_timeout(
+    worktree_path: &Path,
+    command: &str,
+    timeout: Duration,
+) -> Result<Output> {
+    let mut shell = Command::new("/bin/sh");
+    shell.arg("-c").arg(command).current_dir(worktree_path);
+    run_command_with_timeout(&mut shell, timeout, "test command")
 }
 
 pub(crate) fn test_log_contents(command: &TestCommand, output: &Output) -> String {

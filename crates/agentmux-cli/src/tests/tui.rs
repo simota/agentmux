@@ -426,33 +426,169 @@ fn arena_actions_are_gated_by_daemon_protocol_version() {
 
 #[test]
 fn commands_input_key_maps_editor_actions() {
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
     assert_eq!(
-        commands_input_key(KeyCode::Enter),
+        commands_input_key(plain(KeyCode::Enter)),
         Some(CommandsInputAction::Send)
     );
     assert_eq!(
-        commands_input_key(KeyCode::Tab),
+        commands_input_key(plain(KeyCode::Tab)),
         Some(CommandsInputAction::CycleTarget)
     );
     assert_eq!(
-        commands_input_key(KeyCode::Esc),
+        commands_input_key(plain(KeyCode::Esc)),
         Some(CommandsInputAction::Clear)
     );
     assert_eq!(
-        commands_input_key(KeyCode::Backspace),
+        commands_input_key(plain(KeyCode::Backspace)),
         Some(CommandsInputAction::Backspace)
     );
-    // Delete is treated like Backspace in the panel input field.
+    // Standard in-line editor semantics: Backspace deletes before the caret,
+    // Delete deletes under it, arrows/Home/End move it.
     assert_eq!(
-        commands_input_key(KeyCode::Delete),
-        Some(CommandsInputAction::Backspace)
+        commands_input_key(plain(KeyCode::Delete)),
+        Some(CommandsInputAction::Delete)
     );
     assert_eq!(
-        commands_input_key(KeyCode::Char('a')),
+        commands_input_key(plain(KeyCode::Left)),
+        Some(CommandsInputAction::MoveLeft)
+    );
+    assert_eq!(
+        commands_input_key(plain(KeyCode::Right)),
+        Some(CommandsInputAction::MoveRight)
+    );
+    assert_eq!(
+        commands_input_key(plain(KeyCode::Home)),
+        Some(CommandsInputAction::MoveHome)
+    );
+    assert_eq!(
+        commands_input_key(plain(KeyCode::End)),
+        Some(CommandsInputAction::MoveEnd)
+    );
+    assert_eq!(
+        commands_input_key(plain(KeyCode::Char('a'))),
         Some(CommandsInputAction::Insert('a'))
     );
-    assert_eq!(commands_input_key(KeyCode::Left), None);
+    // SHIFT stays allowed: uppercase input arrives as Char + SHIFT.
+    assert_eq!(
+        commands_input_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
+        Some(CommandsInputAction::Insert('A'))
+    );
+}
+
+/// CONTROL/ALT chords and Release notifications never edit the input buffer:
+/// `Ctrl+C` must not type a literal `c`, `Alt+x` must not type `x`, and a key
+/// release on kitty-protocol terminals must not act a second time.
+#[test]
+fn commands_input_key_ignores_modifier_chords_and_release_events() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+    assert_eq!(
+        commands_input_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        None
+    );
+    assert_eq!(
+        commands_input_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
+        None
+    );
+    assert_eq!(
+        commands_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+        None
+    );
+
+    let release = KeyEvent::new_with_kind(
+        KeyCode::Char('a'),
+        KeyModifiers::NONE,
+        KeyEventKind::Release,
+    );
+    assert_eq!(commands_input_key(release), None);
+    let repeat =
+        KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat);
+    assert_eq!(
+        commands_input_key(repeat),
+        Some(CommandsInputAction::Insert('a'))
+    );
+}
+
+/// Pasted text destined for the Commands input flattens every line-break
+/// flavour to a single space so Enter is never synthesised mid-paste.
+#[test]
+fn commands_paste_text_flattens_line_breaks_to_single_spaces() {
+    assert_eq!(commands_paste_text("a\r\nb\nc\rd"), "a b c d");
+    assert_eq!(commands_paste_text("one line"), "one line");
+    assert_eq!(
+        commands_paste_text("tabs\tand  spaces"),
+        "tabs\tand  spaces"
+    );
+    assert_eq!(commands_paste_text(""), "");
+}
+
+/// Line-break-only pastes collapse to exactly one space per logical break,
+/// regardless of the break flavour (`\n`, bare `\r`, or `\r\n`).
+#[test]
+fn commands_paste_text_newline_only_variants() {
+    assert_eq!(commands_paste_text("\n"), " ");
+    assert_eq!(commands_paste_text("\r"), " ");
+    assert_eq!(commands_paste_text("\r\n"), " ");
+    assert_eq!(commands_paste_text("\n\n"), "  ");
+    assert_eq!(commands_paste_text("\r\r"), "  ");
+    assert_eq!(commands_paste_text("\r\n\r\n"), "  ");
+    assert_eq!(commands_paste_text("\n\r"), "  ");
+}
+
+/// Control characters in a paste (e.g. ANSI escapes copied from terminal
+/// output) are stripped so they can never be re-rendered into the TUI frame
+/// and corrupt the display; tab is the only control character kept.
+#[test]
+fn commands_paste_text_strips_control_characters_except_tab() {
+    assert_eq!(
+        commands_paste_text("a\u{1b}[31mred\u{1b}[0m"),
+        "a[31mred[0m"
+    );
+    assert_eq!(
+        commands_paste_text("bell\u{7}back\u{8}del\u{7f}"),
+        "bellbackdel"
+    );
+    // C1 controls (e.g. CSI U+009B) are control characters too.
+    assert_eq!(commands_paste_text("c1\u{9b}31m"), "c131m");
+    assert_eq!(commands_paste_text("keep\ttab"), "keep\ttab");
+}
+
+/// A multi-kilobyte paste is flattened in one pass without losing or
+/// truncating any payload character.
+#[test]
+fn commands_paste_text_handles_multi_kilobyte_input() {
+    let text = "0123456789\r\n".repeat(500); // 6 KB
+    let flattened = commands_paste_text(&text);
+    assert_eq!(flattened.len(), "0123456789 ".len() * 500);
+    assert!(flattened.starts_with("0123456789 0123456789 "));
+    assert!(!flattened.contains('\n') && !flattened.contains('\r'));
+}
+
+/// A paste aimed at an agent pane travels as ONE raw input request carrying
+/// the whole text (newlines included) — never one request per character.
+#[test]
+fn paste_to_agent_pane_builds_single_raw_input_request() {
+    use agentmux_tui::input::focused_input_request;
+
+    let mut state = TuiSessionState::default();
+    state.apply_daemon_status(&json!({
+        "agents": [{ "id": "agent_01KBKX3F4SPGZ1A0JMQJEFAV7B", "name": "impl" }]
+    }));
+
+    let pasted = "line1\nline2\n";
+    let request = focused_input_request(&state, "req_input_7", pasted.as_bytes().to_vec())
+        .expect("paste forward request");
+
+    assert_eq!(request.command, IpcCommand::AgentSendInputScript);
+    let actions = request
+        .payload
+        .get("actions")
+        .and_then(Value::as_array)
+        .expect("input script actions");
+    assert_eq!(actions.len(), 1, "paste must be a single action");
+    assert_eq!(actions[0], json!({ "send_raw": pasted.as_bytes() }));
 }
 
 #[test]

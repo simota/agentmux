@@ -8,7 +8,10 @@ use std::time::Duration;
 
 use crossterm::{
     cursor,
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event},
+    event::{
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -71,6 +74,7 @@ impl<W: Write> TerminalIo for CrosstermTerminalIo<W> {
         if let Err(error) = execute!(
             self.terminal.backend_mut(),
             EnterAlternateScreen,
+            EnableBracketedPaste,
             cursor::Hide
         ) {
             let _ = disable_raw_mode();
@@ -79,6 +83,7 @@ impl<W: Write> TerminalIo for CrosstermTerminalIo<W> {
         if let Err(error) = self.terminal.clear() {
             let _ = execute!(
                 self.terminal.backend_mut(),
+                DisableBracketedPaste,
                 LeaveAlternateScreen,
                 cursor::Show
             );
@@ -93,6 +98,7 @@ impl<W: Write> TerminalIo for CrosstermTerminalIo<W> {
         let screen_error = execute!(
             self.terminal.backend_mut(),
             DisableMouseCapture,
+            DisableBracketedPaste,
             LeaveAlternateScreen,
             cursor::Show
         )

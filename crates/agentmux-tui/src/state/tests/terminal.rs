@@ -166,6 +166,39 @@ fn full_snapshot_restores_existing_pane_grid() {
 }
 
 #[test]
+fn snapshot_with_huge_declared_dimensions_is_clamped() {
+    let mut state =
+        TuiSessionState::default().with_terminal_size(TerminalSize { rows: 1, cols: 4 });
+    state.apply_daemon_status(&json!({
+        "agents": [
+            {"id": "agent_001", "name": "impl", "process_id": 7}
+        ]
+    }));
+
+    // 65535x65535 would allocate a ~100 GB grid if applied verbatim; the
+    // snapshot payload is untrusted IPC input and must be clamped instead.
+    let change = state.apply_snapshot(&json!({
+        "agent_id": "agent_001",
+        "name": "impl",
+        "process_id": 7,
+        "rows": 65535,
+        "cols": 65535,
+        "lines": ["hello"]
+    }));
+
+    assert_eq!(change, StateChange::UpdatedPane("agent_001".to_string()));
+    let pane = state.pane("agent_001").expect("pane");
+    assert_eq!(pane.grid().rows(), 1000);
+    assert_eq!(pane.grid().cols(), 1000);
+    assert_eq!(
+        pane.grid()
+            .line_text(0)
+            .map(|line| line.trim_end().to_string()),
+        Some("hello".to_string())
+    );
+}
+
+#[test]
 fn snapshot_restore_clips_lines_by_display_width() {
     let mut state =
         TuiSessionState::default().with_terminal_size(TerminalSize { rows: 1, cols: 3 });

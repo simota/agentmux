@@ -28,5 +28,11 @@ agentmux-terminal = { workspace = true }
 agentmux-tui  = { workspace = true }
 clap          = { workspace = true }
 crossterm     = { workspace = true }
+serde         = { workspace = true }
 serde_json    = { workspace = true }
 tokio         = { workspace = true }
+
+[dev-dependencies]
+# `start_paused` tests need tokio's paused clock so daemon-timeout regression
+# tests complete instantly instead of sleeping for the real timeout.
+tokio         = { workspace = true, features = ["test-util"] }

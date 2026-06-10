@@ -1,15 +1,66 @@
 //! Daemon request transport and human-readable response/output formatting.
 
 use std::path::Path;
+use std::time::Duration;
 
 use agentmux_core::{AgentmuxError, error::Result};
 use agentmux_ipc::{ClientHello, ClientRequest, DaemonResponse, JsonlReader, JsonlWriter};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use tokio::io::BufReader;
+use tokio::io::{AsyncBufRead, AsyncWrite, BufReader};
 use tokio::net::UnixStream;
 
 use crate::daemon::ensure_daemon;
 use crate::requests::message_inject_request;
+
+/// How long a single frame write to the daemon socket may take. A wedged daemon
+/// (e.g. stopped with SIGSTOP) stops draining the socket; once the kernel
+/// buffer fills, an un-timed write blocks forever and the TUI loop — including
+/// its SIGINT handling, which runs on the same loop — never regains control.
+pub(crate) const DAEMON_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long to wait for a daemon response frame during the TUI bootstrap
+/// handshake and one-shot CLI requests before declaring the daemon
+/// unresponsive. Bounded so a wedged daemon yields an actionable error instead
+/// of an indefinite hang before the terminal UI is even entered.
+pub(crate) const DAEMON_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Write one frame to the daemon, failing with an explicit "daemon not
+/// responding" error instead of blocking forever when the socket is wedged.
+pub(crate) async fn write_daemon_frame<W, T>(writer: &mut JsonlWriter<W>, value: &T) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    tokio::time::timeout(DAEMON_WRITE_TIMEOUT, writer.write(value))
+        .await
+        .map_err(|_| {
+            AgentmuxError::IpcError(format!(
+                "daemon not responding: write timed out after {}s",
+                DAEMON_WRITE_TIMEOUT.as_secs()
+            ))
+        })?
+}
+
+/// Read one response frame from the daemon, failing with an explicit "daemon
+/// not responding" error when no frame arrives within the response timeout.
+pub(crate) async fn read_daemon_response_frame<R, T>(
+    reader: &mut JsonlReader<R>,
+) -> Result<Option<T>>
+where
+    R: AsyncBufRead + Unpin,
+    T: DeserializeOwned,
+{
+    tokio::time::timeout(DAEMON_RESPONSE_TIMEOUT, reader.read::<T>())
+        .await
+        .map_err(|_| {
+            AgentmuxError::IpcError(format!(
+                "daemon not responding: no response within {}s",
+                DAEMON_RESPONSE_TIMEOUT.as_secs()
+            ))
+        })?
+}
 
 pub(crate) async fn send_daemon_request(
     socket_path: &Path,
@@ -27,12 +78,10 @@ pub(crate) async fn send_daemon_request(
     let mut reader = JsonlReader::new(BufReader::new(reader));
     let mut writer = JsonlWriter::new(writer);
 
-    writer
-        .write(&ClientHello::new(env!("CARGO_PKG_VERSION")))
-        .await?;
-    writer.write(&request).await?;
+    write_daemon_frame(&mut writer, &ClientHello::new(env!("CARGO_PKG_VERSION"))).await?;
+    write_daemon_frame(&mut writer, &request).await?;
 
-    while let Some(frame) = reader.read::<Value>().await? {
+    while let Some(frame) = read_daemon_response_frame::<_, Value>(&mut reader).await? {
         if frame.get("id").and_then(Value::as_str) == Some(request_id.as_str()) {
             return serde_json::from_value(frame).map_err(|error| {
                 AgentmuxError::IpcError(format!("invalid daemon response: {error}"))
@@ -322,4 +371,47 @@ pub(crate) fn truncate_for_table(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     truncated.push('…');
     truncated
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn write_daemon_frame_times_out_when_the_socket_is_wedged() {
+        // A tiny in-memory duplex whose peer never reads models a SIGSTOPped
+        // daemon: the kernel-side buffer fills and the write stays pending.
+        let (client, server) = tokio::io::duplex(16);
+        let mut writer = JsonlWriter::new(client);
+        let payload = json!({ "body": "x".repeat(1024) });
+
+        let error = write_daemon_frame(&mut writer, &payload)
+            .await
+            .expect_err("a write into a full socket must time out, not block forever");
+
+        assert!(matches!(error, AgentmuxError::IpcError(_)));
+        assert!(
+            error.to_string().contains("daemon not responding"),
+            "unexpected error: {error}"
+        );
+        drop(server);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_daemon_response_frame_times_out_when_no_response_arrives() {
+        // Keep the peer alive but silent so the read is pending (no EOF).
+        let (client, server) = tokio::io::duplex(64);
+        let mut reader = JsonlReader::new(BufReader::new(client));
+
+        let error = read_daemon_response_frame::<_, Value>(&mut reader)
+            .await
+            .expect_err("a response wait with no incoming frame must time out");
+
+        assert!(matches!(error, AgentmuxError::IpcError(_)));
+        assert!(
+            error.to_string().contains("daemon not responding"),
+            "unexpected error: {error}"
+        );
+        drop(server);
+    }
 }

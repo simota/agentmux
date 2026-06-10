@@ -24,6 +24,8 @@ pub(crate) use agentmux_core::{ArtifactKind, ProjectId, TaskId, WorktreeStatus};
 #[cfg(test)]
 pub(crate) use branch::parse_worktree_list;
 #[cfg(test)]
+pub(crate) use git::run_shell_command_with_timeout;
+#[cfg(test)]
 pub(crate) use std::path::{Path, PathBuf};
 #[cfg(test)]
 pub(crate) use std::process::Command;

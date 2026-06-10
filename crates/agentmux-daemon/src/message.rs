@@ -353,11 +353,17 @@ impl DaemonRuntime {
         self.write_bytes_to_agent_pty(agent_id, &pending).await
     }
 
-    /// Write a byte buffer to an agent's PTY under a short-lived lock.
+    /// Write a byte buffer to an agent's PTY without holding any daemon state
+    /// lock across the write.
     ///
-    /// The `state.read()` guard and the PTY `std::sync::Mutex` guard are both
-    /// confined to a non-async scope and dropped before this function returns,
-    /// so no guard can leak across an `.await` in the caller.
+    /// The PTY handle (`Arc`) is cloned out of a short-lived `state.read()`
+    /// guard, then the potentially blocking `write_all` runs on the blocking
+    /// pool bounded by `pty_write_timeout`. A pane whose foreground process
+    /// stops reading input can fill the kernel PTY buffer and block the write
+    /// indefinitely; if the state guard were held across that write, the fair
+    /// queue of the state `RwLock` would wedge every other daemon task behind
+    /// the stuck pane. A timeout is reported as a write failure so message
+    /// delivery paths mark the message `Failed` instead of hanging.
     pub(crate) async fn write_bytes_to_agent_pty(
         &self,
         agent_id: &AgentSessionId,
@@ -366,21 +372,45 @@ impl DaemonRuntime {
         if bytes.is_empty() {
             return Ok(());
         }
-        let state = self.state.read().await;
-        let Some(agent) = state.agents.get(agent_id) else {
-            return Err(AgentmuxError::UserError(format!(
-                "unknown agent session '{agent_id}'"
-            )));
+        let (pty, write_timeout) = {
+            let state = self.state.read().await;
+            let Some(agent) = state.agents.get(agent_id) else {
+                return Err(AgentmuxError::UserError(format!(
+                    "unknown agent session '{agent_id}'"
+                )));
+            };
+            let Some(pty) = agent.pty.clone() else {
+                return Err(AgentmuxError::UserError(format!(
+                    "agent session '{agent_id}' has no live PTY"
+                )));
+            };
+            (pty, state.injection_timing.pty_write_timeout)
         };
-        let Some(pty) = &agent.pty else {
-            return Err(AgentmuxError::UserError(format!(
-                "agent session '{agent_id}' has no live PTY"
-            )));
-        };
-        let mut pty = pty.lock().map_err(|_| {
-            AgentmuxError::Internal(format!("PTY lock for agent '{agent_id}' is poisoned"))
-        })?;
-        pty.write_bytes(bytes)
+
+        let bytes = bytes.to_vec();
+        let lock_owner = agent_id.clone();
+        let write = tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut pty = pty.lock().map_err(|_| {
+                AgentmuxError::Internal(format!("PTY lock for agent '{lock_owner}' is poisoned"))
+            })?;
+            pty.write_bytes(&bytes)
+        });
+
+        match tokio::time::timeout(write_timeout, write).await {
+            Ok(joined) => joined.map_err(|error| {
+                AgentmuxError::Internal(format!(
+                    "PTY write task for agent '{agent_id}' failed: {error}"
+                ))
+            })?,
+            // The blocking task keeps running (spawn_blocking cannot be
+            // aborted), but it owns no daemon state lock — only this pane's
+            // PTY mutex — so the daemon stays responsive and the delivery is
+            // reported as failed.
+            Err(_) => Err(AgentmuxError::PtyError(format!(
+                "write to agent '{agent_id}' PTY timed out after {}ms; the pane is not reading input",
+                write_timeout.as_millis()
+            ))),
+        }
     }
 
     pub(crate) async fn write_prepared_message_injection(
@@ -480,6 +510,72 @@ impl DaemonRuntime {
                     json!({
                         "agent_id": target_id.to_string(),
                         "signal": "idle_delivery_failed_after_result",
+                        "error": error.to_string(),
+                    }),
+                ));
+            }
+        }
+    }
+
+    /// Spawn the periodic redelivery loop for messages parked in
+    /// `WaitingForAgent`.
+    ///
+    /// A message lands in `WaitingForAgent` when an idle delivery is deferred
+    /// (target busy, or a human typed into the pane during the settle delay).
+    /// Without a poller, nothing retries it until the *next* status signal for
+    /// that agent — which may never arrive — and delivery silently stalls.
+    /// The loop re-runs the existing idle-delivery machinery on a fixed tick;
+    /// double delivery is impossible because `prepare_next_inject_when_idle`
+    /// atomically transitions the message to `Injecting` under the state write
+    /// lock, and an `Injecting` message is not eligible for selection.
+    ///
+    /// The returned handle is aborted by the serve loop on shutdown.
+    pub fn spawn_waiting_message_redelivery_loop(&self) -> tokio::task::JoinHandle<()> {
+        let runtime = self.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(WAITING_MESSAGE_REDELIVERY_INTERVAL);
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tick.tick().await;
+                runtime.retry_waiting_message_delivery().await;
+            }
+        })
+    }
+
+    /// One redelivery pass: re-attempt idle delivery for every live-PTY agent.
+    ///
+    /// Eligibility (delivery mode, agent status, quiet window, per-recipient
+    /// dedup) is fully delegated to `deliver_idle_messages_for_agent`; agents
+    /// without a PTY are skipped because nothing can be injected into them.
+    pub(crate) async fn retry_waiting_message_delivery(&self) {
+        let targets: Vec<(AgentSessionId, AgentStatus)> = {
+            let state = self.state.read().await;
+            state
+                .agents
+                .iter()
+                .filter(|(_, agent)| agent.pty.is_some())
+                .map(|(id, agent)| {
+                    (
+                        id.clone(),
+                        agent
+                            .metadata
+                            .status
+                            .clone()
+                            .unwrap_or(AgentStatus::InteractiveReady),
+                    )
+                })
+                .collect()
+        };
+        for (agent_id, status) in targets {
+            if let Err(error) = self
+                .deliver_idle_messages_for_agent(&agent_id, status)
+                .await
+            {
+                self.publish(DaemonEvent::new(
+                    IpcEventKind::Error,
+                    json!({
+                        "agent_id": agent_id.to_string(),
+                        "signal": "idle_delivery_retry_failed",
                         "error": error.to_string(),
                     }),
                 ));
@@ -592,6 +688,9 @@ impl DaemonRuntime {
         Ok(BroadcastInputOutcome { delivered, skipped })
     }
 }
+
+/// Tick interval for the `WaitingForAgent` redelivery poller.
+pub(crate) const WAITING_MESSAGE_REDELIVERY_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// Result of a broadcast-input write: which target PTYs received the actions
 /// and which were skipped because a human was typing into that pane.

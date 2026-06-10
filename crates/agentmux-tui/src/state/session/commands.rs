@@ -274,19 +274,79 @@ impl TuiSessionState {
         self.clear_copy_selection();
     }
 
-    /// Append a printable character to the Commands input buffer.
+    /// Byte offset of the caret inside the Commands input buffer, derived from
+    /// the char-index cursor so edits always land on a char boundary.
+    fn commands_input_byte_offset(&self) -> usize {
+        self.commands_input_buffer
+            .char_indices()
+            .nth(self.commands_input_cursor)
+            .map(|(offset, _)| offset)
+            .unwrap_or(self.commands_input_buffer.len())
+    }
+
+    /// Insert a printable character at the caret and advance the caret past it.
     pub fn commands_input_push(&mut self, ch: char) {
-        self.commands_input_buffer.push(ch);
+        let offset = self.commands_input_byte_offset();
+        self.commands_input_buffer.insert(offset, ch);
+        self.commands_input_cursor += 1;
     }
 
-    /// Remove the last character from the Commands input buffer (no-op if empty).
+    /// Insert a whole string (e.g. a paste) at the caret and advance the caret
+    /// past it. The text is inserted verbatim; callers normalise newlines first
+    /// when the source may contain them.
+    pub fn commands_input_insert_str(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        let offset = self.commands_input_byte_offset();
+        self.commands_input_buffer.insert_str(offset, text);
+        self.commands_input_cursor += text.chars().count();
+    }
+
+    /// Remove the character before the caret (no-op at the start of the buffer).
     pub fn commands_input_backspace(&mut self) {
-        self.commands_input_buffer.pop();
+        if self.commands_input_cursor == 0 {
+            return;
+        }
+        self.commands_input_cursor -= 1;
+        let offset = self.commands_input_byte_offset();
+        self.commands_input_buffer.remove(offset);
     }
 
-    /// Clear the Commands input buffer.
+    /// Remove the character under the caret (no-op at the end of the buffer).
+    pub fn commands_input_delete(&mut self) {
+        let offset = self.commands_input_byte_offset();
+        if offset < self.commands_input_buffer.len() {
+            self.commands_input_buffer.remove(offset);
+        }
+    }
+
+    /// Move the caret one character left (no-op at the start of the buffer).
+    pub fn commands_input_move_left(&mut self) {
+        self.commands_input_cursor = self.commands_input_cursor.saturating_sub(1);
+    }
+
+    /// Move the caret one character right (no-op at the end of the buffer).
+    pub fn commands_input_move_right(&mut self) {
+        if self.commands_input_cursor < self.commands_input_buffer.chars().count() {
+            self.commands_input_cursor += 1;
+        }
+    }
+
+    /// Move the caret to the start of the buffer.
+    pub fn commands_input_move_home(&mut self) {
+        self.commands_input_cursor = 0;
+    }
+
+    /// Move the caret to the end of the buffer.
+    pub fn commands_input_move_end(&mut self) {
+        self.commands_input_cursor = self.commands_input_buffer.chars().count();
+    }
+
+    /// Clear the Commands input buffer and reset the caret.
     pub fn commands_input_clear(&mut self) {
         self.commands_input_buffer.clear();
+        self.commands_input_cursor = 0;
     }
 
     /// Cycle the broadcast target through:

@@ -2,6 +2,12 @@
 
 use super::*;
 
+/// Upper bound for snapshot-declared terminal dimensions. The snapshot payload
+/// arrives over IPC and is not trusted: a corrupt or hostile `rows`/`cols` of
+/// 65535x65535 would make `TerminalParser::new` allocate a multi-gigabyte grid
+/// and abort the process, so both axes are clamped to a practical maximum.
+const MAX_SNAPSHOT_DIMENSION: u16 = 1000;
+
 impl TuiSessionState {
     /// Seed panes from a `daemon.status` response payload.
     ///
@@ -103,12 +109,14 @@ impl TuiSessionState {
             .and_then(|value| value.as_u64())
             .and_then(|value| u16::try_from(value).ok())
             .filter(|value| *value > 0)
+            .map(|value| value.min(MAX_SNAPSHOT_DIMENSION))
             .unwrap_or(self.default_terminal_size.rows);
         let cols = payload
             .get("cols")
             .and_then(|value| value.as_u64())
             .and_then(|value| u16::try_from(value).ok())
             .filter(|value| *value > 0)
+            .map(|value| value.min(MAX_SNAPSHOT_DIMENSION))
             .unwrap_or(self.default_terminal_size.cols);
         let name = string_field(payload, "name").unwrap_or_else(|| agent_id.clone());
         let role = string_field(payload, "role");

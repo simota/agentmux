@@ -7,15 +7,21 @@ use ratatui::{
     style::{Color, Style},
     widgets::{Block, Borders, Clear, Paragraph, Widget},
 };
-use unicode_width::UnicodeWidthStr;
+use unicode_width::UnicodeWidthChar;
 
 use crate::state::{CommandsLogKind, TuiSessionState};
 
 use super::util::truncate_cell;
 
+/// Cursor block rendered inside the Commands input field.
+const CURSOR_BLOCK: char = '\u{2588}';
+
+/// Display width of the `"> "` input prefix.
+const INPUT_PREFIX_WIDTH: usize = 2;
+
 /// Render the commands panel. When `focused`, returns the hardware cursor
-/// [`Position`] at the end of the input field so the real terminal cursor sits
-/// in the input area (keeping typing and IME preedit anchored there); returns
+/// [`Position`] at the input-field caret so the real terminal cursor sits in
+/// the input area (keeping typing and IME preedit anchored there); returns
 /// `None` when unfocused or the pane is too small to host the input row.
 pub(crate) fn render_commands_panel(
     area: Rect,
@@ -49,21 +55,18 @@ pub(crate) fn render_commands_panel(
         .style(Style::default().fg(Color::White).bg(Color::Black));
     paragraph.render(area, buffer);
 
-    // Focused: place the real cursor at the end of the input field. The input
-    // line is pinned to the last interior row by `commands_panel_lines`, and is
-    // rendered as `> {buffer}█`, so the cursor sits after the `> ` prefix plus
-    // the display width of the current input. This keeps typing and IME preedit
-    // anchored to the input area rather than wherever ratatui last left it.
+    // Focused: place the real cursor on the input-field caret. The input line
+    // is pinned to the last interior row by `commands_panel_lines` and rendered
+    // by `commands_input_field_line`; the hardware cursor X is derived from the
+    // same window computation so the visible `█` and the terminal cursor (and
+    // IME preedit anchor) can never drift apart.
     if !focused || area.height < 4 || area.width < 4 {
         return None;
     }
-    let prefix_width = 2u16; // "> "
-    let buffer_width =
-        u16::try_from(UnicodeWidthStr::width(state.commands_input_buffer())).unwrap_or(u16::MAX);
+    let (_, cursor_offset) = commands_input_field_line(state, content_width);
     let max_x = area.x + area.width.saturating_sub(2); // last column before the right border
     let cursor_x = (area.x + 1)
-        .saturating_add(prefix_width)
-        .saturating_add(buffer_width)
+        .saturating_add(u16::try_from(cursor_offset).unwrap_or(u16::MAX))
         .min(max_x);
     let cursor_y = area.y + area.height.saturating_sub(2); // last interior row (input field)
     Some(Position {
@@ -144,10 +147,7 @@ pub(crate) fn commands_panel_lines(
     // ── Fixed bottom elements ─────────────────────────────────────────────
     let separator = "─".repeat(content_width.min(40));
     let hint = "/send \"text\"  /role <r>  /keys <seq>  Tab: target  Esc: clear".to_string();
-    let input_line = truncate_cell(
-        &format!("> {}\u{2588}", state.commands_input_buffer()),
-        content_width,
-    );
+    let (input_line, _) = commands_input_field_line(state, content_width);
 
     // Fixed rows: separator + hint + input = 3
     let fixed_rows = 3;
@@ -197,8 +197,11 @@ pub(crate) fn commands_panel_lines(
         // Remove the oldest non-empty lines first (just before the separator area).
         if lines.len() > targets_rows + 1 {
             lines.remove(targets_rows + 1);
-        } else {
-            lines.pop();
+        } else if lines.pop().is_none() {
+            // interior_rows < 2 (pane height of exactly 3): even an empty body
+            // cannot satisfy the clamp, so stop instead of spinning forever —
+            // the paragraph clips the overflowing hint/input rows.
+            break;
         }
     }
     while lines.len() + 2 < interior_rows {
@@ -219,6 +222,86 @@ fn truncate_marker_line(marker: &str, body: &str, max_chars: usize) -> String {
     let body_budget = max_chars.saturating_sub(marker_chars);
     let truncated_body = truncate_cell(body, body_budget);
     format!("{marker}{truncated_body}")
+}
+
+/// Render the Commands input row (`"> "` prefix plus a sliding window over the
+/// input buffer with the `█` caret) and the caret's display-cell offset from
+/// the start of the row.
+///
+/// Unlike history/targets rows this must NOT go through `truncate_cell`: its
+/// whitespace normalisation would collapse consecutive spaces and turn U+3000
+/// the user actually typed into a single ASCII space. The window is computed
+/// with unicode display widths and always keeps the caret visible — anchored
+/// left while the content fits, scrolling with the caret once it passes the
+/// right edge. `render_commands_panel` derives the hardware cursor X from the
+/// same computation so the rendered caret and the terminal cursor stay in sync.
+pub(crate) fn commands_input_field_line(
+    state: &TuiSessionState,
+    content_width: usize,
+) -> (String, usize) {
+    let budget = content_width.saturating_sub(INPUT_PREFIX_WIDTH);
+    let (window, cursor_offset) = input_window(
+        state.commands_input_buffer(),
+        state.commands_input_cursor(),
+        budget,
+    );
+    (format!("> {window}"), INPUT_PREFIX_WIDTH + cursor_offset)
+}
+
+/// Compute the visible window of the input buffer (caret block inserted at the
+/// `cursor` char index) limited to `budget` display cells, plus the caret's
+/// cell offset within that window.
+///
+/// Whitespace is preserved verbatim. When the content overflows, the window
+/// starts at cell 0 until the caret reaches the right edge and then follows
+/// the caret, so the caret block is always visible. A wide character that
+/// straddles the window's left edge is skipped whole (char-boundary safe).
+fn input_window(buffer: &str, cursor: usize, budget: usize) -> (String, usize) {
+    if budget == 0 {
+        return (String::new(), 0);
+    }
+
+    // Display items: the buffer's chars with the caret block (1 cell wide)
+    // inserted at the cursor's char index (end of buffer when past the text).
+    let mut items: Vec<(char, usize)> = Vec::with_capacity(buffer.chars().count() + 1);
+    let mut block_index = None;
+    for (index, ch) in buffer.chars().enumerate() {
+        if index == cursor {
+            block_index = Some(items.len());
+            items.push((CURSOR_BLOCK, 1));
+        }
+        items.push((ch, UnicodeWidthChar::width(ch).unwrap_or(0)));
+    }
+    let block_index = block_index.unwrap_or_else(|| {
+        items.push((CURSOR_BLOCK, 1));
+        items.len() - 1
+    });
+
+    let cursor_cell: usize = items[..block_index].iter().map(|(_, width)| width).sum();
+    // First window cell: 0 while everything left of the caret fits; otherwise
+    // scroll just enough that the caret block sits at the right edge.
+    let start_cell = (cursor_cell + 1).saturating_sub(budget);
+
+    let mut window = String::new();
+    let mut first_visible_cell = None;
+    let mut cell = 0usize;
+    let mut used = 0usize;
+    for (ch, width) in items {
+        let begins = cell;
+        cell += width;
+        if begins < start_cell {
+            continue;
+        }
+        if used + width > budget {
+            break;
+        }
+        first_visible_cell.get_or_insert(begins);
+        window.push(ch);
+        used += width;
+    }
+
+    let cursor_offset = cursor_cell - first_visible_cell.unwrap_or(cursor_cell);
+    (window, cursor_offset)
 }
 
 #[cfg(test)]
@@ -259,6 +342,219 @@ mod tests {
                 .any(|line| line.contains("delivered 2, skipped 1"))
         );
         assert_eq!(lines.last().unwrap().as_str(), "> go\u{2588}");
+    }
+
+    /// The input row must not be whitespace-normalised: consecutive spaces and
+    /// U+3000 (ideographic space) are preserved exactly as typed.
+    #[test]
+    fn input_line_preserves_consecutive_and_ideographic_spaces() {
+        let mut state = TuiSessionState::default();
+        for ch in ['a', ' ', ' ', 'b', '\u{3000}', 'c'] {
+            state.commands_input_push(ch);
+        }
+
+        let lines = commands_panel_lines(&state, 40, 8);
+        assert_eq!(
+            lines.last().unwrap().as_str(),
+            "> a  b\u{3000}c\u{2588}",
+            "input row must keep raw whitespace"
+        );
+    }
+
+    /// When the input is wider than the field, the window scrolls so the caret
+    /// (at the end of the buffer) stays visible, and the hardware cursor X is
+    /// derived from the same window.
+    #[test]
+    fn input_line_overflow_keeps_caret_visible() {
+        let mut state = TuiSessionState::default();
+        for ch in "abcdefghijklmnopqrstuvwxy".chars() {
+            state.commands_input_push(ch); // 25 chars
+        }
+
+        let content_width = 16; // budget after "> " prefix: 14 cells
+        let (line, cursor_offset) = commands_input_field_line(&state, content_width);
+        // 13 tail chars + the caret block fill the 14-cell budget.
+        assert_eq!(line, "> mnopqrstuvwxy\u{2588}");
+        assert_eq!(cursor_offset, 15); // prefix (2) + 13 tail chars
+    }
+
+    /// With the caret in the middle of the buffer, the `█` block is rendered at
+    /// the caret position and the hardware cursor X matches it exactly.
+    #[test]
+    fn input_line_renders_caret_mid_buffer_and_cursor_matches() {
+        let mut state = TuiSessionState::default();
+        for ch in "abcd".chars() {
+            state.commands_input_push(ch);
+        }
+        state.commands_input_move_left();
+        state.commands_input_move_left(); // caret between 'b' and 'c'
+
+        let lines = commands_panel_lines(&state, 40, 8);
+        assert_eq!(lines.last().unwrap().as_str(), "> ab\u{2588}cd");
+
+        let area = Rect::new(0, 0, 40, 8);
+        let mut buffer = Buffer::empty(area);
+        let cursor = render_commands_panel(area, &state, true, &mut buffer);
+        // interior x (1) + "> " (2) + "ab" (2 cells)
+        assert_eq!(
+            cursor,
+            Some(Position {
+                x: 1 + 2 + 2,
+                y: 8 - 2
+            })
+        );
+    }
+
+    /// When the caret scrolls back from an overflowing tail, the window follows
+    /// it left so the caret block stays visible.
+    #[test]
+    fn input_line_overflow_window_follows_caret_left() {
+        let mut state = TuiSessionState::default();
+        for ch in "abcdefghijklmnopqrstuvwxy".chars() {
+            state.commands_input_push(ch); // 25 chars
+        }
+        state.commands_input_move_home();
+
+        let (line, cursor_offset) = commands_input_field_line(&state, 16);
+        // Caret at the start: the head of the buffer is visible again.
+        assert_eq!(line, "> \u{2588}abcdefghijklm");
+        assert_eq!(cursor_offset, 2);
+    }
+
+    /// Wide characters never straddle the window's left edge: the straddling
+    /// char is dropped whole and the caret offset shrinks accordingly.
+    #[test]
+    fn input_line_overflow_skips_straddling_wide_char() {
+        let mut state = TuiSessionState::default();
+        for ch in "あいうえおかきくけ".chars() {
+            state.commands_input_push(ch); // 9 wide chars = 18 cells
+        }
+
+        let content_width = 12; // budget: 10 cells; caret cell = 18
+        let (line, cursor_offset) = commands_input_field_line(&state, content_width);
+        // start_cell = 9 falls inside 'お' (cells 8..10), so the window starts
+        // at 'か' (cell 10): 4 wide chars (8 cells) + caret block.
+        assert_eq!(line, "> かきくけ\u{2588}");
+        assert_eq!(cursor_offset, 2 + 8);
+    }
+
+    /// Tiny widths never panic: with no budget after the prefix the row
+    /// degrades to the bare `"> "` and a 1-cell budget still shows the caret.
+    #[test]
+    fn input_line_tiny_widths_degrade_without_panic() {
+        let mut state = TuiSessionState::default();
+        for ch in "あい".chars() {
+            state.commands_input_push(ch); // 2 wide chars = 4 cells, caret at 4
+        }
+
+        // content_width 0..=2 leaves no budget after the prefix.
+        for content_width in 0..=2 {
+            let (line, cursor_offset) = commands_input_field_line(&state, content_width);
+            assert_eq!(line, "> ", "width {content_width}: prefix only");
+            assert_eq!(cursor_offset, 2, "width {content_width}");
+        }
+        // Budget 1: only the caret block fits.
+        assert_eq!(
+            commands_input_field_line(&state, 3),
+            ("> \u{2588}".to_string(), 2)
+        );
+        // Budget 2: 'い' would straddle the left edge → caret block only.
+        assert_eq!(
+            commands_input_field_line(&state, 4),
+            ("> \u{2588}".to_string(), 2)
+        );
+        // Budget 3: 'い' (2 cells) + caret block fit exactly.
+        assert_eq!(
+            commands_input_field_line(&state, 5),
+            ("> い\u{2588}".to_string(), 4)
+        );
+    }
+
+    /// Exact-fit boundary: content plus caret block exactly filling the budget
+    /// does not scroll; one more char tips the window by exactly one cell.
+    #[test]
+    fn input_line_exact_fit_boundary() {
+        let mut state = TuiSessionState::default();
+        for ch in "abcdefghijklm".chars() {
+            state.commands_input_push(ch); // 13 chars + caret = 14 cells
+        }
+
+        let (line, cursor_offset) = commands_input_field_line(&state, 16); // budget 14
+        assert_eq!(line, "> abcdefghijklm\u{2588}");
+        assert_eq!(cursor_offset, 15);
+
+        state.commands_input_push('n'); // 15 cells: scroll by exactly one
+        let (line, cursor_offset) = commands_input_field_line(&state, 16);
+        assert_eq!(line, "> bcdefghijklmn\u{2588}");
+        assert_eq!(cursor_offset, 15);
+    }
+
+    /// Window boundaries on a half/full-width mix: the scroll start can land
+    /// on either kind of char and the caret offset shrinks by the cells
+    /// actually skipped.
+    #[test]
+    fn input_line_mixed_width_window_boundary() {
+        let mut state = TuiSessionState::default();
+        for ch in "aあbいc".chars() {
+            state.commands_input_push(ch); // 7 cells, caret at cell 7
+        }
+
+        // budget 4: start_cell 4 lands exactly on 'い'.
+        let (line, cursor_offset) = commands_input_field_line(&state, 6);
+        assert_eq!(line, "> いc\u{2588}");
+        assert_eq!(cursor_offset, 2 + 3);
+
+        // budget 5: start_cell 3 lands exactly on 'b'.
+        let (line, cursor_offset) = commands_input_field_line(&state, 7);
+        assert_eq!(line, "> bいc\u{2588}");
+        assert_eq!(cursor_offset, 2 + 4);
+    }
+
+    /// Zero-width combining marks occupy no cells: they stay attached to their
+    /// base char in the window and never advance the caret offset.
+    #[test]
+    fn input_line_combining_mark_takes_no_cells() {
+        let mut state = TuiSessionState::default();
+        for ch in "e\u{301}x".chars() {
+            state.commands_input_push(ch); // e + combining acute + x
+        }
+
+        let (line, cursor_offset) = commands_input_field_line(&state, 40);
+        assert_eq!(line, "> e\u{301}x\u{2588}");
+        assert_eq!(cursor_offset, 2 + 2); // 'e' (1) + mark (0) + 'x' (1)
+    }
+
+    /// Regression: a pane height of exactly 3 (one interior row) used to spin
+    /// forever in the bottom-clamp loop — `pop()` on the already-empty body
+    /// never made `lines.len() + 2 > 1` false. The function must terminate and
+    /// still keep the input row as the last line.
+    #[test]
+    fn one_interior_row_terminates_and_keeps_input_line_last() {
+        let mut state = TuiSessionState::default();
+        state.commands_input_push('x');
+
+        let lines = commands_panel_lines(&state, 16, 3);
+        assert_eq!(lines.last().unwrap().as_str(), "> x\u{2588}");
+    }
+
+    /// Degenerate focused areas render without panicking and report no cursor
+    /// position (the pane cannot host the input row).
+    #[test]
+    fn render_commands_panel_degenerate_areas_are_safe() {
+        let mut state = TuiSessionState::default();
+        for ch in "abc".chars() {
+            state.commands_input_push(ch);
+        }
+
+        for (width, height) in [(1u16, 1u16), (3, 3), (2, 8), (40, 1), (3, 8), (40, 3)] {
+            let area = Rect::new(0, 0, width, height);
+            let mut buffer = Buffer::empty(area);
+            assert_eq!(
+                render_commands_panel(area, &state, true, &mut buffer),
+                None,
+                "area {width}x{height} must not host a cursor"
+            );
+        }
     }
 
     #[test]

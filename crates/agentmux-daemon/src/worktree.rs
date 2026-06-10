@@ -28,20 +28,26 @@ impl DaemonRuntime {
         worktree_id: &WorktreeId,
     ) -> Result<serde_json::Value> {
         let worktree = self.worktree_by_id(worktree_id).await?;
-        let captured = agentmux_worktree::WorktreeManager::new(
-            worktree.project_id.clone(),
-            worktree.path.clone(),
-            worktree.path.join(".agentmux/worktrees"),
-        )?
-        .capture_diff_artifact(
-            CaptureDiff {
-                task_id: worktree.task_id.clone(),
-                agent_name: worktree.branch_name.clone(),
-                worktree_path: worktree.path.clone(),
-                base_branch: worktree.base_branch.clone(),
-            },
-            worktree.path.join(".agentmux/artifacts"),
-        )?;
+        let captured = {
+            let worktree = worktree.clone();
+            run_blocking("worktree.diff", move || {
+                agentmux_worktree::WorktreeManager::new(
+                    worktree.project_id.clone(),
+                    worktree.path.clone(),
+                    worktree.path.join(".agentmux/worktrees"),
+                )?
+                .capture_diff_artifact(
+                    CaptureDiff {
+                        task_id: worktree.task_id.clone(),
+                        agent_name: worktree.branch_name.clone(),
+                        worktree_path: worktree.path.clone(),
+                        base_branch: worktree.base_branch.clone(),
+                    },
+                    worktree.path.join(".agentmux/artifacts"),
+                )
+            })
+            .await?
+        };
 
         self.publish(DaemonEvent::new(
             IpcEventKind::WorktreeDiffCaptured,
@@ -73,18 +79,27 @@ impl DaemonRuntime {
         let mut worktree = self.worktree_by_id(worktree_id).await?;
         self.set_worktree_status(worktree_id, WorktreeStatus::Testing)
             .await?;
-        let result = agentmux_worktree::WorktreeManager::new(
-            worktree.project_id.clone(),
-            worktree.path.clone(),
-            worktree.path.join(".agentmux/worktrees"),
-        )?
-        .run_test_command_artifact(
-            worktree.task_id.clone(),
-            &worktree.branch_name,
-            &worktree.path,
-            command,
-            worktree.path.join(".agentmux/artifacts"),
-        );
+        // Test commands run for minutes and are synchronous `std::process`
+        // calls: run them on the blocking pool so an async worker is never
+        // pinned (agentmux-worktree enforces the kill-on-timeout bound).
+        let result = {
+            let worktree = worktree.clone();
+            run_blocking("worktree.test", move || {
+                agentmux_worktree::WorktreeManager::new(
+                    worktree.project_id.clone(),
+                    worktree.path.clone(),
+                    worktree.path.join(".agentmux/worktrees"),
+                )?
+                .run_test_command_artifact(
+                    worktree.task_id.clone(),
+                    &worktree.branch_name,
+                    &worktree.path,
+                    command,
+                    worktree.path.join(".agentmux/artifacts"),
+                )
+            })
+            .await
+        };
 
         match result {
             Ok(test_run) => {
@@ -144,7 +159,15 @@ impl DaemonRuntime {
             repo_root.clone(),
             repo_root.join(".agentmux/worktrees"),
         )?;
-        match manager.merge_to_integration_branch(&worktree, "agentmux/integration")? {
+        let merge_outcome = {
+            let manager = manager.clone();
+            let worktree = worktree.clone();
+            run_blocking("worktree.promote", move || {
+                manager.merge_to_integration_branch(&worktree, "agentmux/integration")
+            })
+            .await?
+        };
+        match merge_outcome {
             MergeOutcome::Conflict => {
                 self.set_worktree_status(worktree_id, WorktreeStatus::Conflicted)
                     .await?;
@@ -296,6 +319,22 @@ impl DaemonRuntime {
             }
         });
     }
+}
+
+/// Run a synchronous, process-spawning closure on the blocking pool.
+///
+/// Worktree git/test operations are blocking `std::process` calls; executing
+/// them inline on a Tokio async worker pins that worker for the full command
+/// duration (and on a current-thread runtime, the whole daemon). A panicking
+/// or cancelled blocking task is mapped to an internal error.
+pub(crate) async fn run_blocking<T, F>(label: &'static str, task: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T> + Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .map_err(|error| AgentmuxError::Internal(format!("{label} task failed: {error}")))?
 }
 
 pub(crate) fn worktree_payload(worktree: &Worktree) -> serde_json::Value {

@@ -774,3 +774,73 @@ async fn ipc_worktree_test_allows_non_denied_command() {
 
     server.abort();
 }
+
+/// Regression: `worktree.test` runs a synchronous `std::process` command. On
+/// the (current-thread) runtime it used to pin the only async worker for the
+/// whole command duration; it must now run on the blocking pool so concurrent
+/// daemon work keeps progressing.
+#[tokio::test]
+async fn worktree_test_command_does_not_block_the_async_worker() {
+    let root = std::env::temp_dir().join(format!("agentmux-worktree-block-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&root).expect("temporary worktree root is created");
+    test_git(&root, ["init", "-b", "main"]);
+    std::fs::write(root.join("README.md"), "hello\n").unwrap();
+    test_git(&root, ["add", "README.md"]);
+    test_git(
+        &root,
+        [
+            "-c",
+            "user.name=Agentmux Test",
+            "-c",
+            "user.email=agentmux@example.invalid",
+            "commit",
+            "-m",
+            "initial",
+        ],
+    );
+    let runtime = DaemonRuntime::new(16);
+    let worktree = Worktree {
+        id: WorktreeId::new(),
+        project_id: ProjectId::new(),
+        task_id: agentmux_core::TaskId::new(),
+        owner_agent_id: None,
+        path: root.clone(),
+        branch_name: "main".to_string(),
+        base_branch: "main".to_string(),
+        status: WorktreeStatus::Ready,
+        created_at: DateTimeUtc::UNIX_EPOCH,
+    };
+    let worktree_id = worktree.id.clone();
+    runtime.register_worktree(worktree).await;
+
+    let test_runtime = runtime.clone();
+    let test_worktree_id = worktree_id.clone();
+    let test_task = tokio::spawn(async move {
+        test_runtime
+            .run_worktree_test(
+                &test_worktree_id,
+                TestCommand {
+                    name: "slow".to_string(),
+                    command: "sleep 1; printf slow-ok".to_string(),
+                },
+            )
+            .await
+    });
+
+    // While the slow test command runs, an unrelated runtime call must
+    // complete promptly: the async worker is not pinned by the child process.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let status = tokio::time::timeout(Duration::from_millis(500), runtime.status_payload())
+        .await
+        .expect("daemon stays responsive while a worktree test command runs");
+    assert_eq!(status["agent_count"], 0);
+
+    let payload = tokio::time::timeout(Duration::from_secs(10), test_task)
+        .await
+        .expect("worktree test completes")
+        .expect("worktree test task does not panic")
+        .expect("worktree test succeeds");
+    assert_eq!(payload["test"]["status"], "passed");
+
+    std::fs::remove_dir_all(root).expect("temporary worktree root is removed");
+}

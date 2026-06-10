@@ -37,6 +37,7 @@ impl TuiSessionState {
             #[cfg(feature = "arena")]
             arena_selected: 0,
             commands_input_buffer: String::new(),
+            commands_input_cursor: 0,
             commands_target: "broadcast".to_string(),
             commands_history: Vec::new(),
             commands_pending_broadcast: None,
@@ -97,6 +98,12 @@ impl TuiSessionState {
     /// Text the user is currently composing in the Commands panel.
     pub fn commands_input_buffer(&self) -> &str {
         &self.commands_input_buffer
+    }
+
+    /// Caret position in the Commands input buffer as a char index
+    /// (`0..=char count`).
+    pub fn commands_input_cursor(&self) -> usize {
+        self.commands_input_cursor
     }
 
     /// Current broadcast target (`"broadcast"`, `"role:<role>"`, or `"agent:<name>"`).

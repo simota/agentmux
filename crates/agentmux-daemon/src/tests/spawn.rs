@@ -481,6 +481,342 @@ async fn send_input_script_appends_audit_events_to_event_log() {
 }
 
 #[tokio::test]
+async fn for_project_without_agentmux_dir_uses_plain_runtime() {
+    let root = std::env::temp_dir().join(format!("agentmux-noinit-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+
+    let runtime = DaemonRuntime::for_project(16, &root)
+        .await
+        .expect("plain runtime builds for an uninitialized project");
+
+    assert!(
+        runtime.event_log.is_none(),
+        "no event log before project init"
+    );
+    let state = runtime.state.read().await;
+    assert_eq!(
+        state.policy.automation_level,
+        AutomationLevel::AutoPrompt,
+        "spec-default policy is kept"
+    );
+
+    drop(state);
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
+/// Regression for the unwired production main: with an initialized project,
+/// the runtime must wire the audit event log, the configured policy engine,
+/// and the `[automation]`/`[context]` injection timing — none of which were
+/// connected by `DaemonRuntime::new(1024)` alone.
+#[tokio::test]
+async fn for_project_wires_event_log_policy_and_injection_config() {
+    let root = std::env::temp_dir().join(format!("agentmux-init-{}", ulid::Ulid::new()));
+    let agentmux_dir = root.join(".agentmux");
+    std::fs::create_dir_all(&agentmux_dir).expect("temporary .agentmux dir is created");
+    let example_config = include_str!("../../../../docs/config/agentmux.config.example.toml");
+    std::fs::write(agentmux_dir.join("config.toml"), example_config)
+        .expect("project config is written");
+
+    let runtime = DaemonRuntime::for_project(16, &root)
+        .await
+        .expect("configured runtime builds");
+
+    assert!(
+        runtime.event_log.is_some(),
+        "audit event log is wired to .agentmux/events.jsonl"
+    );
+    assert_eq!(
+        runtime.event_log.as_ref().unwrap().path(),
+        agentmux_dir.join("events.jsonl")
+    );
+
+    let config = AgentmuxConfig::parse_str(example_config).expect("example config parses");
+    let state = runtime.state.read().await;
+    assert_eq!(
+        state.injection_timing,
+        InjectionTiming::from_config(&config.automation, &config.context),
+        "injection timing (incl. human_input_quiet_ms) comes from config"
+    );
+    assert_eq!(
+        state.policy.policy.allow_network,
+        PolicyDecision::Deny,
+        "policy engine reflects the configured [policy] section"
+    );
+    assert_eq!(
+        state.policy.policy.allow_git_push,
+        PolicyDecision::Deny,
+        "git push stays deny per spec defaults in the example config"
+    );
+
+    drop(state);
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
+#[tokio::test]
+async fn for_project_rejects_invalid_config_instead_of_silently_falling_back() {
+    let root = std::env::temp_dir().join(format!("agentmux-badcfg-{}", ulid::Ulid::new()));
+    let agentmux_dir = root.join(".agentmux");
+    std::fs::create_dir_all(&agentmux_dir).expect("temporary .agentmux dir is created");
+    std::fs::write(agentmux_dir.join("config.toml"), "not a valid config")
+        .expect("broken config is written");
+
+    let result = DaemonRuntime::for_project(16, &root).await;
+    let Err(error) = result else {
+        panic!("invalid config must abort startup");
+    };
+    assert!(
+        error.to_string().contains("config"),
+        "error points at the config, got: {error}"
+    );
+
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
+/// Poll `ps` until the process is fully reaped (a zombie still has a `ps`
+/// entry, so this proves the child was actually `wait()`ed, not just killed).
+fn assert_process_reaped(pid: u32) {
+    for _ in 0..200 {
+        let alive = Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .expect("ps runs")
+            .status
+            .success();
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("process {pid} still exists (zombie or live) after the reap window");
+}
+
+/// Regression for the zombie/ghost-session gap: when an agent process exits on
+/// its own (PTY EOF), the daemon must reap the child, mark the session
+/// `Exited`, emit `agent.exited`, and drop it from message-bus routing so it
+/// stops being an injection target.
+#[tokio::test]
+async fn agent_eof_reaps_child_marks_exited_and_stops_routing() {
+    let root = std::env::temp_dir().join(format!("agentmux-eof-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let runtime = DaemonRuntime::new(16);
+    let mut events = runtime.subscribe();
+
+    let agent = runtime
+        .spawn_agent_with_role(
+            "short-lived".to_string(),
+            AgentRole::Tester,
+            PtySpawnSpec {
+                command: "/bin/sh".to_string(),
+                args: vec!["-c".to_string(), "exit 0".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                size: Default::default(),
+            },
+        )
+        .await
+        .expect("agent is spawned");
+    let pid = agent.process_id.expect("spawned agent has a pid");
+
+    // The process exits immediately; the forwarder must observe EOF and emit
+    // agent.exited with the eof reason.
+    let exited = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let event = events.recv().await.expect("event stream stays open");
+            if event.kind == IpcEventKind::AgentExited {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("agent.exited is emitted after PTY EOF");
+    assert_eq!(exited.payload["agent_id"], agent.id.to_string());
+    assert_eq!(exited.payload["reason"], "eof");
+
+    // The child is fully reaped — no zombie left on the daemon process.
+    assert_process_reaped(pid);
+
+    {
+        let state = runtime.state.read().await;
+        let live = state.agents.get(&agent.id).expect("session metadata stays");
+        assert_eq!(
+            live.metadata.status,
+            Some(AgentStatus::Exited),
+            "session is marked Exited"
+        );
+        assert!(live.pty.is_none(), "PTY handle is released");
+        assert!(
+            state
+                .messages
+                .resolve_target(&MessageTarget::Agent(agent.id.clone()))
+                .is_err(),
+            "exited session is no longer an injection target"
+        );
+    }
+    let status = runtime.status_payload().await;
+    assert_eq!(status["agents"][0]["status"], "exited");
+    assert_eq!(status["agents"][0]["input_ready"], false);
+
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
+/// Regression for the stop ordering gap: `agent.stop` must confirm the child
+/// is terminated and reaped *before* dropping the session from state, so a
+/// failed terminate can never orphan a live process with no handle left.
+#[tokio::test]
+async fn stop_agent_reaps_child_before_removing_session() {
+    let root = std::env::temp_dir().join(format!("agentmux-stop-reap-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let runtime = DaemonRuntime::new(16);
+    let agent = runtime
+        .spawn_agent(
+            "long-runner".to_string(),
+            PtySpawnSpec {
+                command: "/bin/sleep".to_string(),
+                args: vec!["30".to_string()],
+                cwd: root.clone(),
+                env: BTreeMap::from([("TERM".to_string(), "xterm-256color".to_string())]),
+                size: Default::default(),
+            },
+        )
+        .await
+        .expect("agent is spawned");
+    let pid = agent.process_id.expect("spawned agent has a pid");
+
+    let stopped = tokio::time::timeout(Duration::from_secs(5), runtime.stop_agent(&agent.id))
+        .await
+        .expect("stop does not hang")
+        .expect("stop succeeds");
+    assert_eq!(stopped.id, agent.id);
+
+    // By the time stop_agent returns, the child has been killed AND reaped.
+    assert_process_reaped(pid);
+    let state = runtime.state.read().await;
+    assert!(
+        !state.agents.contains_key(&agent.id),
+        "session is removed only after the child is reaped"
+    );
+
+    drop(state);
+    std::fs::remove_dir_all(root).expect("temporary root is removed");
+}
+
+#[tokio::test]
+async fn serve_until_shutdown_clean_lifecycle_starts_and_stops() {
+    // Short directory name: a Unix socket path must fit in sun_path (~104
+    // bytes on macOS), and temp_dir is already long there.
+    let root = std::env::temp_dir().join(format!("amx-sc-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let socket_path = root.join("agentmux.sock");
+    let event_log_path = root.join(".agentmux").join("events.jsonl");
+    let runtime = DaemonRuntime::new(16).with_event_log(EventLog::new(&event_log_path));
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let serve_task = tokio::spawn(serve_until_shutdown(
+        DaemonConfig::new(&socket_path),
+        runtime,
+        async move {
+            let _ = shutdown_rx.await;
+        },
+    ));
+    for _ in 0..100 {
+        if socket_path.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(socket_path.exists(), "daemon socket is bound");
+    shutdown_tx.send(()).expect("shutdown is signalled");
+
+    tokio::time::timeout(Duration::from_secs(2), serve_task)
+        .await
+        .expect("serve loop stops on shutdown signal")
+        .expect("serve task does not panic")
+        .expect("serve loop exits cleanly");
+    assert!(!socket_path.exists(), "socket is removed on shutdown");
+
+    let content = std::fs::read_to_string(&event_log_path).expect("event log is written");
+    let kinds: Vec<String> = content
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["type"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, vec!["daemon.started", "daemon.stopped"]);
+
+    std::fs::remove_dir_all(root).expect("temporary daemon directory is removed");
+}
+
+/// Regression: when the serve loop exits with an error (here: a corrupt
+/// `daemon.stopped` recovery entry), the shutdown tail must still run so the
+/// socket file is removed and a fresh `daemon.stopped` event is recorded —
+/// otherwise the next start hits a stale socket and recovery loses state.
+#[tokio::test]
+async fn serve_until_shutdown_error_path_still_runs_shutdown_tail() {
+    // Short directory name: see serve_until_shutdown_clean_lifecycle_starts_and_stops.
+    let root = std::env::temp_dir().join(format!("amx-se-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).expect("temporary root is created");
+    let socket_path = root.join("agentmux.sock");
+    let event_log_path = root.join(".agentmux").join("events.jsonl");
+    let event_log = EventLog::new(&event_log_path);
+    // A daemon.stopped entry without payload.state.agents makes
+    // recover_state_from_event_log fail inside the serve loop.
+    event_log
+        .append(
+            &EventLogEntry::new("daemon.stopped", DateTimeUtc::now_utc(), json!({}))
+                .expect("entry builds"),
+        )
+        .expect("corrupt recovery entry is written");
+    let runtime = DaemonRuntime::new(16).with_event_log(event_log);
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        serve_until_shutdown(
+            DaemonConfig::new(&socket_path),
+            runtime,
+            std::future::pending(),
+        ),
+    )
+    .await
+    .expect("failed serve loop returns instead of hanging");
+
+    assert!(result.is_err(), "recovery failure surfaces as an error");
+    assert!(
+        !socket_path.exists(),
+        "socket is removed even on the error path"
+    );
+    let content = std::fs::read_to_string(&event_log_path).expect("event log is written");
+    let last = content.lines().last().expect("log has entries");
+    let entry: serde_json::Value = serde_json::from_str(last).expect("valid JSONL event");
+    assert_eq!(
+        entry["type"], "daemon.stopped",
+        "a daemon.stopped event is recorded even on the error path"
+    );
+
+    std::fs::remove_dir_all(root).expect("temporary daemon directory is removed");
+}
+
+#[test]
+fn accept_error_backoff_doubles_and_caps() {
+    let mut backoff = ACCEPT_ERROR_BACKOFF_MIN;
+    assert_eq!(backoff, Duration::from_millis(100));
+    backoff = next_accept_backoff(backoff);
+    assert_eq!(backoff, Duration::from_millis(200));
+    for _ in 0..10 {
+        backoff = next_accept_backoff(backoff);
+    }
+    assert_eq!(
+        backoff, ACCEPT_ERROR_BACKOFF_MAX,
+        "backoff is capped so retries keep happening at a bounded rate"
+    );
+}
+
+#[tokio::test]
 async fn finish_shutdown_removes_socket_and_flushes_state_event() {
     let root = std::env::temp_dir().join(format!("agentmux-daemon-{}", ulid::Ulid::new()));
     std::fs::create_dir_all(&root).expect("temporary root is created");

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use agentmux_core::AgentmuxError;
 use agentmux_core::error::Result;
 use agentmux_daemon::{DaemonConfig, DaemonRuntime, serve};
 
@@ -14,8 +15,25 @@ async fn main() -> Result<()> {
     println!("agentmux-daemon v{} starting", env!("CARGO_PKG_VERSION"));
     println!("Socket path: {}", socket_path.display());
 
+    // Wire `.agentmux/` (event log, policy engine, injection timing) from the
+    // working directory's project config; pre-init directories get a plain
+    // runtime. An invalid config.toml aborts startup instead of silently
+    // running with spec defaults.
+    let project_root = std::env::current_dir().map_err(|error| {
+        AgentmuxError::Internal(format!("failed to resolve working directory: {error}"))
+    })?;
+    let runtime = DaemonRuntime::for_project(1024, &project_root).await?;
+    println!(
+        "Project config: {}",
+        if project_root.join(".agentmux").is_dir() {
+            "wired from .agentmux/"
+        } else {
+            "not initialized (plain runtime)"
+        }
+    );
+
     let pid_path = write_pidfile(&socket_path);
-    let result = serve(DaemonConfig::new(socket_path), DaemonRuntime::new(1024)).await;
+    let result = serve(DaemonConfig::new(socket_path), runtime).await;
     remove_pidfile(&pid_path);
 
     result

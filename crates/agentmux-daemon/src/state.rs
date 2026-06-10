@@ -3,7 +3,10 @@ use crate::*;
 pub(crate) struct LiveAgentSession {
     pub(crate) metadata: RegisteredAgentSession,
     pub(crate) worktree_id: Option<WorktreeId>,
-    pub(crate) pty: Option<Mutex<PtyHandle>>,
+    /// Live PTY handle. `Arc` so PTY writes can clone the handle out of a
+    /// short-lived `state.read()` guard and perform the (potentially blocking)
+    /// write on the blocking pool without holding any daemon state lock.
+    pub(crate) pty: Option<Arc<Mutex<PtyHandle>>>,
     pub(crate) terminal: Arc<Mutex<TerminalParser>>,
     /// Per-pane human/PTY activity timestamps. `last_human_input_at` is updated
     /// only by genuine human key-forwarding (`AgentSendInputScript` ->
@@ -42,6 +45,11 @@ pub(crate) struct InjectionTiming {
     /// auto-inject into a pane where a human is currently typing"
     /// (`automation.human_input_quiet_ms`).
     pub(crate) human_input_quiet: Duration,
+    /// Upper bound on a single PTY write. A pane whose foreground process
+    /// stops reading input can fill the kernel PTY buffer and block
+    /// `write_all` forever; the timeout turns that into a delivery failure
+    /// instead of a wedged write task.
+    pub(crate) pty_write_timeout: Duration,
 }
 
 impl InjectionTiming {
@@ -53,6 +61,9 @@ impl InjectionTiming {
             result_detection_tail_bytes: automation.result_detection_tail_bytes,
             max_inline_chars: context.max_inline_chars,
             human_input_quiet: Duration::from_millis(automation.human_input_quiet_ms),
+            // Deliberately constant (not config-driven): the write timeout is a
+            // hang guard, not a tuning knob.
+            pty_write_timeout: Duration::from_millis(DEFAULT_PTY_WRITE_TIMEOUT_MS),
         }
     }
 
@@ -76,6 +87,7 @@ impl Default for InjectionTiming {
             result_detection_tail_bytes: DEFAULT_RESULT_DETECTION_TAIL_BYTES,
             max_inline_chars: DEFAULT_MAX_INLINE_CHARS,
             human_input_quiet: Duration::from_millis(DEFAULT_HUMAN_INPUT_QUIET_MS),
+            pty_write_timeout: Duration::from_millis(DEFAULT_PTY_WRITE_TIMEOUT_MS),
         }
     }
 }
@@ -86,6 +98,9 @@ pub(crate) const DEFAULT_HUMAN_INPUT_QUIET_MS: u64 = 2500;
 
 /// Fallback inline-context budget when no `[context]` config is wired in.
 pub(crate) const DEFAULT_MAX_INLINE_CHARS: usize = 2048;
+
+/// Bound on a single PTY write (see `InjectionTiming::pty_write_timeout`).
+pub(crate) const DEFAULT_PTY_WRITE_TIMEOUT_MS: u64 = 5000;
 
 pub(crate) struct DaemonState {
     pub(crate) clients: BTreeMap<ClientSessionId, Option<AgentSessionId>>,

@@ -51,8 +51,13 @@ pub(crate) fn render_message_list_panel(
 
 #[cfg(feature = "activity-feed")]
 pub(crate) fn feed_time(ts: &str) -> String {
-    if ts.len() >= 19 && ts.as_bytes().get(10) == Some(&b'T') {
-        return ts[11..19].to_string();
+    // `ts` comes from an unvalidated daemon frame: byte-index slicing would
+    // panic on a char boundary if multi-byte characters appear, so fall back
+    // to the full string whenever the HH:MM:SS range is not cleanly sliceable.
+    if ts.as_bytes().get(10) == Some(&b'T')
+        && let Some(time) = ts.get(11..19)
+    {
+        return time.to_string();
     }
     ts.to_string()
 }

@@ -280,6 +280,21 @@ fn render_session_draws_conversation_list_pane() {
 
 #[cfg(feature = "activity-feed")]
 #[test]
+fn feed_time_extracts_clock_and_falls_back_on_malformed_timestamps() {
+    use super::messages::feed_time;
+
+    // Well-formed RFC3339-like timestamp: keep only HH:MM:SS.
+    assert_eq!(feed_time("2026-06-10T12:34:56Z"), "12:34:56");
+    // The ts arrives from an unvalidated daemon frame: multi-byte characters
+    // around the slice range used to panic on a char boundary and must fall
+    // back to the full string instead.
+    assert_eq!(feed_time("2026-06-10Tあいうえお"), "2026-06-10Tあいうえお");
+    assert_eq!(feed_time("not a timestamp"), "not a timestamp");
+    assert_eq!(feed_time(""), "");
+}
+
+#[cfg(feature = "activity-feed")]
+#[test]
 fn render_activity_feed_with_empty_state_does_not_panic() {
     let state = TuiSessionState::default();
     let area = Rect::new(0, 0, 50, 10);

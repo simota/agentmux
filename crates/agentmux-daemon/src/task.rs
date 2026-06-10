@@ -53,7 +53,9 @@ impl DaemonRuntime {
             ("tester", AgentRole::Tester),
             ("reviewer", AgentRole::Reviewer),
         ] {
-            let output = run_shell_stub_agent(name)?;
+            // Synchronous process spawn: keep it off the async worker.
+            let output =
+                run_blocking("shell stub agent", move || run_shell_stub_agent(name)).await?;
             let result = parse_shell_stub_result(name, &output.stdout)?;
             shell_processes.push(json!({
                 "agent": name,
@@ -140,13 +142,18 @@ impl DaemonRuntime {
 
         for provider in providers {
             let agent_name = format!("impl-{}", slug_label(&provider));
-            let worktree = manager.create_worktree(CreateWorktree {
-                task_id: task_id.clone(),
-                task_slug: task_slug.clone(),
-                agent_name: agent_name.clone(),
-                owner_agent_id: None,
-                base_branch: base_branch.clone(),
-            })?;
+            // `git worktree add` is a blocking git call: run it off-worker.
+            let worktree = {
+                let manager = manager.clone();
+                let input = CreateWorktree {
+                    task_id: task_id.clone(),
+                    task_slug: task_slug.clone(),
+                    agent_name: agent_name.clone(),
+                    owner_agent_id: None,
+                    base_branch: base_branch.clone(),
+                };
+                run_blocking("worktree.create", move || manager.create_worktree(input)).await?
+            };
             self.register_worktree_with_repo_root(worktree.clone(), project_path.clone())
                 .await;
 

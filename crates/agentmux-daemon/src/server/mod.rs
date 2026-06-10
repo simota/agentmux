@@ -8,9 +8,11 @@ mod payload;
 pub use client::handle_client;
 pub use lifecycle::{serve, serve_until_shutdown};
 
-// `finish_shutdown` is exercised by the crate's test module via `crate::*`.
+// These are exercised by the crate's test module via `crate::*`.
 #[cfg(test)]
-pub(crate) use lifecycle::finish_shutdown;
+pub(crate) use lifecycle::{
+    ACCEPT_ERROR_BACKOFF_MAX, ACCEPT_ERROR_BACKOFF_MIN, finish_shutdown, next_accept_backoff,
+};
 
 // Preserve internal cross-module visibility: lib.rs does `pub(crate) use
 // server::*;`, so every `pub(crate)` item moved into a submodule must remain

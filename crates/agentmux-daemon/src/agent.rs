@@ -87,7 +87,7 @@ impl DaemonRuntime {
             LiveAgentSession {
                 metadata: agent.clone(),
                 worktree_id: worktree_id.clone(),
-                pty: Some(Mutex::new(pty)),
+                pty: Some(Arc::new(Mutex::new(pty))),
                 terminal,
                 input_activity: InputActivity::new(),
             },
@@ -191,7 +191,10 @@ impl DaemonRuntime {
                             }
                         }
                     }
-                    PtyReadEvent::Eof => break,
+                    PtyReadEvent::Eof => {
+                        runtime.handle_agent_pty_closed(&agent_id, "eof").await;
+                        break;
+                    }
                     PtyReadEvent::Error(error) => {
                         let _ = events.send(DaemonEvent::new(
                             IpcEventKind::AgentStatusSignal,
@@ -201,11 +204,79 @@ impl DaemonRuntime {
                                 "error": error,
                             }),
                         ));
+                        runtime
+                            .handle_agent_pty_closed(&agent_id, "pty_read_error")
+                            .await;
                         break;
                     }
                 }
             }
         });
+    }
+
+    /// Handle the natural end of an agent's PTY stream (EOF or read error):
+    /// reap the child process (no zombie), mark the session `Exited`, drop it
+    /// from message-bus routing so it stops being an injection target, and
+    /// emit `agent.exited`.
+    ///
+    /// The session metadata stays in `state.agents` so `daemon.status` keeps
+    /// showing the pane with its final `exited` status until an explicit
+    /// `agent.stop` removes it. If the PTY handle was already taken (an
+    /// `agent.stop` is in flight and owns process shutdown), this is a no-op.
+    pub(crate) async fn handle_agent_pty_closed(&self, agent_id: &AgentSessionId, reason: &str) {
+        let (pty, name) = {
+            let mut state = self.state.write().await;
+            let Some(agent) = state.agents.get_mut(agent_id) else {
+                return;
+            };
+            let Some(pty) = agent.pty.take() else {
+                // `stop_agent` already took the handle and owns the shutdown.
+                return;
+            };
+            agent.metadata.status = Some(AgentStatus::Exited);
+            let name = agent.metadata.name.clone();
+            state.messages.deregister_agent(agent_id);
+            (pty, name)
+        };
+
+        // Reap off-worker: `try_wait`/`wait` are blocking child-process calls.
+        let exit = tokio::task::spawn_blocking(move || terminate_and_reap_pty(&pty))
+            .await
+            .unwrap_or_else(|error| {
+                Err(AgentmuxError::Internal(format!(
+                    "PTY reap task failed: {error}"
+                )))
+            });
+        let exit_payload = match &exit {
+            Ok(Some(status)) => json!(status.exit_code),
+            Ok(None) | Err(_) => serde_json::Value::Null,
+        };
+
+        self.publish(DaemonEvent::new(
+            IpcEventKind::AgentStatusChanged,
+            json!({
+                "agent_id": agent_id.to_string(),
+                "status": AgentStatus::Exited,
+            }),
+        ));
+        let payload = json!({
+            "agent_id": agent_id.to_string(),
+            "name": name,
+            "reason": reason,
+            "exit_code": exit_payload,
+        });
+        let _ = self.append_daemon_lifecycle_event("agent.exited", payload.clone());
+        self.publish(DaemonEvent::new(IpcEventKind::AgentExited, payload));
+        if let Err(error) = exit {
+            self.publish(DaemonEvent::new(
+                IpcEventKind::Error,
+                json!({
+                    "agent_id": agent_id.to_string(),
+                    "signal": "agent_reap_failed",
+                    "error": error.to_string(),
+                }),
+            ));
+        }
     }
 
     pub async fn attach_client(
@@ -270,23 +341,52 @@ impl DaemonRuntime {
     }
 
     pub async fn stop_agent(&self, agent_id: &AgentSessionId) -> Result<RegisteredAgentSession> {
+        // Phase 1: take the PTY handle while keeping the session registered.
+        // Removing the session before the child is confirmed dead would orphan
+        // the process when terminate fails (no handle left to retry with).
+        let pty = {
+            let mut state = self.state.write().await;
+            let Some(agent) = state.agents.get_mut(agent_id) else {
+                return Err(AgentmuxError::UserError(format!(
+                    "unknown agent session '{agent_id}'"
+                )));
+            };
+            agent.pty.take()
+        };
+
+        if let Some(pty) = pty {
+            let reap_handle = pty.clone();
+            let reaped = tokio::task::spawn_blocking(move || terminate_and_reap_pty(&reap_handle))
+                .await
+                .unwrap_or_else(|error| {
+                    Err(AgentmuxError::Internal(format!(
+                        "PTY reap task failed: {error}"
+                    )))
+                });
+            if let Err(error) = reaped {
+                // Put the handle back so the session is still stoppable; the
+                // process was not confirmed dead, so the session must not be
+                // silently dropped from state.
+                let mut state = self.state.write().await;
+                if let Some(agent) = state.agents.get_mut(agent_id) {
+                    agent.pty = Some(pty);
+                }
+                return Err(error);
+            }
+        }
+
+        // Phase 2: the child is reaped (or there was no process) — now drop
+        // the session from state and from the message bus, otherwise
+        // `resolve_target` keeps routing to the stopped agent and its inbox
+        // leaks (#8).
         let mut state = self.state.write().await;
         let Some(agent) = state.agents.remove(agent_id) else {
             return Err(AgentmuxError::UserError(format!(
                 "unknown agent session '{agent_id}'"
             )));
         };
-        // Drop the session from the message bus too, otherwise `resolve_target`
-        // keeps routing to the stopped agent and its inbox leaks (#8).
         state.messages.deregister_agent(agent_id);
         drop(state);
-
-        if let Some(pty) = &agent.pty {
-            let mut pty = pty.lock().map_err(|_| {
-                AgentmuxError::Internal(format!("PTY lock for agent '{agent_id}' is poisoned"))
-            })?;
-            pty.terminate()?;
-        }
 
         self.publish(DaemonEvent::new(
             IpcEventKind::AgentExited,
@@ -299,21 +399,10 @@ impl DaemonRuntime {
     }
 
     pub async fn interrupt_agent(&self, agent_id: &AgentSessionId) -> Result<()> {
-        let state = self.state.read().await;
-        let Some(agent) = state.agents.get(agent_id) else {
-            return Err(AgentmuxError::UserError(format!(
-                "unknown agent session '{agent_id}'"
-            )));
-        };
-        let Some(pty) = &agent.pty else {
-            return Err(AgentmuxError::UserError(format!(
-                "agent session '{agent_id}' has no live PTY"
-            )));
-        };
-        let mut pty = pty.lock().map_err(|_| {
-            AgentmuxError::Internal(format!("PTY lock for agent '{agent_id}' is poisoned"))
-        })?;
-        pty.write_bytes(CTRL_C)
+        // Reuse the lock-free write path: the interrupt byte goes through the
+        // same bounded blocking write as message injection, so a pane that
+        // stopped reading input cannot wedge the daemon behind a state guard.
+        self.write_bytes_to_agent_pty(agent_id, CTRL_C).await
     }
 
     pub async fn resize_agent(
@@ -429,4 +518,41 @@ impl DaemonRuntime {
             "lines": lines,
         }))
     }
+}
+
+/// Window within which a signalled/EOF'd PTY child must be reaped before the
+/// reap is reported as failed (poll loop of 10ms steps).
+const PTY_REAP_POLL_STEPS: u32 = 200;
+const PTY_REAP_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Ensure a PTY child is dead and reaped, returning its exit status when one
+/// is available.
+///
+/// Blocking — call from `spawn_blocking`. An already-exited child (the EOF
+/// path) is reaped via `try_wait` without signalling. A still-running child is
+/// terminated (`PtyHandle::terminate` = SIGHUP to the process group, close of
+/// the master handles, SIGKILL to the child) and then reaped within a bounded
+/// window, so neither a zombie nor a live orphan process is left behind.
+pub(crate) fn terminate_and_reap_pty(pty: &Arc<Mutex<PtyHandle>>) -> Result<Option<PtyExitStatus>> {
+    let mut pty = pty.lock().map_err(|_| {
+        AgentmuxError::Internal("PTY lock is poisoned during terminate/reap".to_string())
+    })?;
+    if let Ok(Some(status)) = pty.try_wait() {
+        return Ok(Some(status));
+    }
+
+    let terminate_result = pty.terminate();
+    for _ in 0..PTY_REAP_POLL_STEPS {
+        match pty.try_wait() {
+            Ok(Some(status)) => return Ok(Some(status)),
+            Ok(None) => std::thread::sleep(PTY_REAP_POLL_INTERVAL),
+            Err(error) => return Err(error),
+        }
+    }
+    // The child survived SIGKILL's reap window: surface the terminate error if
+    // there was one, otherwise report the stuck reap itself.
+    terminate_result?;
+    Err(AgentmuxError::PtyError(
+        "PTY child did not exit within the reap window after kill".to_string(),
+    ))
 }

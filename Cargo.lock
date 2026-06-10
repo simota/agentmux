@@ -30,6 +30,7 @@ dependencies = [
  "agentmux-tui",
  "clap",
  "crossterm",
+ "serde",
  "serde_json",
  "tokio",
 ]

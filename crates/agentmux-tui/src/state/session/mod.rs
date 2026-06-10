@@ -109,6 +109,9 @@ pub struct TuiSessionState {
     arena_selected: usize,
     /// Commands-panel input editor buffer (text the user is composing).
     commands_input_buffer: String,
+    /// Caret position within `commands_input_buffer` as a char index
+    /// (`0..=char count`); edits and movement operate at this position.
+    commands_input_cursor: usize,
     /// Current broadcast target: `"broadcast"`, `"role:<role>"`, or `"agent:<name>"`.
     commands_target: String,
     /// Sent-broadcast history, oldest first.

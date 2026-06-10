@@ -349,41 +349,76 @@ fn glob_match(pattern: &str, path: &str) -> bool {
     glob_match_segments(&pattern_segments, &path_segments)
 }
 
+/// Iterative segment-sequence matcher where a whole-segment `**` matches zero
+/// or more path segments.
+///
+/// Uses the standard two-pointer wildcard algorithm with a single backtrack
+/// point (the most recent `**`): backtracking only to the latest wildcard is
+/// sufficient for correctness and keeps the worst case at O(pattern × path).
+/// The IPC layer accepts paths up to 1 MiB — hundreds of thousands of
+/// segments — so a per-segment recursive matcher would overflow the stack and
+/// a try-every-skip recursion would take exponential time.
 fn glob_match_segments(pattern: &[&str], path: &[&str]) -> bool {
-    match pattern.split_first() {
-        None => path.is_empty(),
-        Some((&"**", rest)) => {
-            // `**` matches zero or more leading path segments.
-            (0..=path.len()).any(|skip| glob_match_segments(rest, &path[skip..]))
+    let mut p = 0; // next pattern segment
+    let mut s = 0; // next path segment
+    let mut star: Option<usize> = None; // pattern index of the latest `**`
+    let mut star_s = 0; // path index where that `**` started matching
+
+    while s < path.len() {
+        if p < pattern.len() && pattern[p] == "**" {
+            // `**` initially matches zero segments; remember it for backtracking.
+            star = Some(p);
+            star_s = s;
+            p += 1;
+        } else if p < pattern.len() && segment_match(pattern[p], path[s]) {
+            p += 1;
+            s += 1;
+        } else if let Some(star_p) = star {
+            // Extend the latest `**` by one more path segment and retry.
+            p = star_p + 1;
+            star_s += 1;
+            s = star_s;
+        } else {
+            return false;
         }
-        Some((seg, rest)) => match path.split_first() {
-            Some((&candidate, path_rest)) if segment_match(seg, candidate) => {
-                glob_match_segments(rest, path_rest)
-            }
-            _ => false,
-        },
     }
+
+    // Only trailing `**` segments may remain unconsumed (they match zero).
+    pattern[p..].iter().all(|segment| *segment == "**")
 }
 
 /// Match a single path segment against a pattern segment where `*` matches any
 /// run of characters within that segment.
+///
+/// Same iterative single-backtrack scheme as [`glob_match_segments`]: a
+/// pattern with many `*`s must not trigger exponential backtracking, and a
+/// long segment must not recurse per character.
 fn segment_match(pattern: &str, segment: &str) -> bool {
-    let pattern_chars: Vec<char> = pattern.chars().collect();
-    let segment_chars: Vec<char> = segment.chars().collect();
-    segment_match_inner(&pattern_chars, &segment_chars)
-}
+    let pattern: Vec<char> = pattern.chars().collect();
+    let segment: Vec<char> = segment.chars().collect();
+    let mut p = 0; // next pattern char
+    let mut s = 0; // next segment char
+    let mut star: Option<usize> = None; // pattern index of the latest `*`
+    let mut star_s = 0; // segment index where that `*` started matching
 
-fn segment_match_inner(pattern: &[char], segment: &[char]) -> bool {
-    match pattern.split_first() {
-        None => segment.is_empty(),
-        Some(('*', rest)) => {
-            (0..=segment.len()).any(|skip| segment_match_inner(rest, &segment[skip..]))
+    while s < segment.len() {
+        if p < pattern.len() && pattern[p] == '*' {
+            star = Some(p);
+            star_s = s;
+            p += 1;
+        } else if p < pattern.len() && pattern[p] == segment[s] {
+            p += 1;
+            s += 1;
+        } else if let Some(star_p) = star {
+            p = star_p + 1;
+            star_s += 1;
+            s = star_s;
+        } else {
+            return false;
         }
-        Some((&p, rest)) => match segment.split_first() {
-            Some((&s, seg_rest)) if p == s => segment_match_inner(rest, seg_rest),
-            _ => false,
-        },
     }
+
+    pattern[p..].iter().all(|ch| *ch == '*')
 }
 
 fn command_matches_prefix(command: &str, prefix: &str) -> bool {
@@ -768,6 +803,53 @@ mod tests {
         assert!(!engine.is_protected_path("README.md"));
         assert!(!engine.is_protected_path(".gitignore")); // `.git` segment, not `.git/**`
         assert!(!engine.is_protected_path(".agentmux/config.toml"));
+    }
+
+    #[test]
+    fn glob_matcher_interleaves_double_stars_and_literals() {
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt)
+            .with_protected_paths(["**/secrets/**/key", "a/**/b/**"]);
+
+        assert!(engine.is_protected_path("secrets/key"));
+        assert!(engine.is_protected_path("x/y/secrets/p/q/key"));
+        assert!(!engine.is_protected_path("x/secrets/p/key/extra"));
+        assert!(engine.is_protected_path("a/b"));
+        assert!(engine.is_protected_path("a/x/y/b/z"));
+        assert!(!engine.is_protected_path("a/x/y/z"));
+    }
+
+    #[test]
+    fn glob_matcher_handles_hundreds_of_thousands_of_segments_without_overflow() {
+        // IPC frames may be up to 1 MiB, so a path can carry hundreds of
+        // thousands of segments. Run on a small 1 MiB stack to prove the
+        // matcher is iterative: the old per-segment recursion aborted here.
+        let handle = std::thread::Builder::new()
+            .stack_size(1024 * 1024)
+            .spawn(|| {
+                let path = format!("{}leaf", "a/".repeat(200_000));
+                let matching = PolicyEngine::new(AutomationLevel::AutoPrompt)
+                    .with_protected_paths(["**/leaf"]);
+                assert!(matching.is_protected_path(&path));
+                let non_matching = PolicyEngine::new(AutomationLevel::AutoPrompt)
+                    .with_protected_paths(["**/secret/**"]);
+                assert!(!non_matching.is_protected_path(&path));
+            })
+            .expect("spawn matcher thread");
+        handle
+            .join()
+            .expect("glob matching must not overflow a 1 MiB stack");
+    }
+
+    #[test]
+    fn segment_glob_with_many_stars_does_not_backtrack_exponentially() {
+        // A classic exponential-blowup case for naive `*` recursion: many
+        // wildcards against a long near-matching segment. The iterative
+        // single-backtrack matcher must finish (in O(pattern x segment)).
+        let engine = PolicyEngine::new(AutomationLevel::AutoPrompt)
+            .with_protected_paths(["*a*a*a*a*a*a*a*a*a*a*a*a*a*a*b"]);
+        let segment = "a".repeat(5_000);
+        assert!(!engine.is_protected_path(&segment));
+        assert!(engine.is_protected_path(&format!("{segment}b")));
     }
 
     #[test]

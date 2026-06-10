@@ -1,0 +1,346 @@
+diff --git a/crates/agentmux-cli/src/tests/tui.rs b/crates/agentmux-cli/src/tests/tui.rs
+index ca25726..b239e47 100644
+--- a/crates/agentmux-cli/src/tests/tui.rs
++++ b/crates/agentmux-cli/src/tests/tui.rs
+@@ -426,33 +426,169 @@ fn arena_actions_are_gated_by_daemon_protocol_version() {
+
+ #[test]
+ fn commands_input_key_maps_editor_actions() {
+-    use crossterm::event::KeyCode;
++    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
++    let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+     assert_eq!(
+-        commands_input_key(KeyCode::Enter),
++        commands_input_key(plain(KeyCode::Enter)),
+         Some(CommandsInputAction::Send)
+     );
+     assert_eq!(
+-        commands_input_key(KeyCode::Tab),
++        commands_input_key(plain(KeyCode::Tab)),
+         Some(CommandsInputAction::CycleTarget)
+     );
+     assert_eq!(
+-        commands_input_key(KeyCode::Esc),
++        commands_input_key(plain(KeyCode::Esc)),
+         Some(CommandsInputAction::Clear)
+     );
+     assert_eq!(
+-        commands_input_key(KeyCode::Backspace),
++        commands_input_key(plain(KeyCode::Backspace)),
+         Some(CommandsInputAction::Backspace)
+     );
+-    // Delete is treated like Backspace in the panel input field.
++    // Standard in-line editor semantics: Backspace deletes before the caret,
++    // Delete deletes under it, arrows/Home/End move it.
+     assert_eq!(
+-        commands_input_key(KeyCode::Delete),
+-        Some(CommandsInputAction::Backspace)
++        commands_input_key(plain(KeyCode::Delete)),
++        Some(CommandsInputAction::Delete)
++    );
++    assert_eq!(
++        commands_input_key(plain(KeyCode::Left)),
++        Some(CommandsInputAction::MoveLeft)
++    );
++    assert_eq!(
++        commands_input_key(plain(KeyCode::Right)),
++        Some(CommandsInputAction::MoveRight)
++    );
++    assert_eq!(
++        commands_input_key(plain(KeyCode::Home)),
++        Some(CommandsInputAction::MoveHome)
+     );
+     assert_eq!(
+-        commands_input_key(KeyCode::Char('a')),
++        commands_input_key(plain(KeyCode::End)),
++        Some(CommandsInputAction::MoveEnd)
++    );
++    assert_eq!(
++        commands_input_key(plain(KeyCode::Char('a'))),
+         Some(CommandsInputAction::Insert('a'))
+     );
+-    assert_eq!(commands_input_key(KeyCode::Left), None);
++    // SHIFT stays allowed: uppercase input arrives as Char + SHIFT.
++    assert_eq!(
++        commands_input_key(KeyEvent::new(KeyCode::Char('A'), KeyModifiers::SHIFT)),
++        Some(CommandsInputAction::Insert('A'))
++    );
++}
++
++/// CONTROL/ALT chords and Release notifications never edit the input buffer:
++/// `Ctrl+C` must not type a literal `c`, `Alt+x` must not type `x`, and a key
++/// release on kitty-protocol terminals must not act a second time.
++#[test]
++fn commands_input_key_ignores_modifier_chords_and_release_events() {
++    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
++
++    assert_eq!(
++        commands_input_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
++        None
++    );
++    assert_eq!(
++        commands_input_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT)),
++        None
++    );
++    assert_eq!(
++        commands_input_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
++        None
++    );
++
++    let release = KeyEvent::new_with_kind(
++        KeyCode::Char('a'),
++        KeyModifiers::NONE,
++        KeyEventKind::Release,
++    );
++    assert_eq!(commands_input_key(release), None);
++    let repeat =
++        KeyEvent::new_with_kind(KeyCode::Char('a'), KeyModifiers::NONE, KeyEventKind::Repeat);
++    assert_eq!(
++        commands_input_key(repeat),
++        Some(CommandsInputAction::Insert('a'))
++    );
++}
++
++/// Pasted text destined for the Commands input flattens every line-break
++/// flavour to a single space so Enter is never synthesised mid-paste.
++#[test]
++fn commands_paste_text_flattens_line_breaks_to_single_spaces() {
++    assert_eq!(commands_paste_text("a\r\nb\nc\rd"), "a b c d");
++    assert_eq!(commands_paste_text("one line"), "one line");
++    assert_eq!(
++        commands_paste_text("tabs\tand  spaces"),
++        "tabs\tand  spaces"
++    );
++    assert_eq!(commands_paste_text(""), "");
++}
++
++/// Line-break-only pastes collapse to exactly one space per logical break,
++/// regardless of the break flavour (`\n`, bare `\r`, or `\r\n`).
++#[test]
++fn commands_paste_text_newline_only_variants() {
++    assert_eq!(commands_paste_text("\n"), " ");
++    assert_eq!(commands_paste_text("\r"), " ");
++    assert_eq!(commands_paste_text("\r\n"), " ");
++    assert_eq!(commands_paste_text("\n\n"), "  ");
++    assert_eq!(commands_paste_text("\r\r"), "  ");
++    assert_eq!(commands_paste_text("\r\n\r\n"), "  ");
++    assert_eq!(commands_paste_text("\n\r"), "  ");
++}
++
++/// Control characters in a paste (e.g. ANSI escapes copied from terminal
++/// output) are stripped so they can never be re-rendered into the TUI frame
++/// and corrupt the display; tab is the only control character kept.
++#[test]
++fn commands_paste_text_strips_control_characters_except_tab() {
++    assert_eq!(
++        commands_paste_text("a\u{1b}[31mred\u{1b}[0m"),
++        "a[31mred[0m"
++    );
++    assert_eq!(
++        commands_paste_text("bell\u{7}back\u{8}del\u{7f}"),
++        "bellbackdel"
++    );
++    // C1 controls (e.g. CSI U+009B) are control characters too.
++    assert_eq!(commands_paste_text("c1\u{9b}31m"), "c131m");
++    assert_eq!(commands_paste_text("keep\ttab"), "keep\ttab");
++}
++
++/// A multi-kilobyte paste is flattened in one pass without losing or
++/// truncating any payload character.
++#[test]
++fn commands_paste_text_handles_multi_kilobyte_input() {
++    let text = "0123456789\r\n".repeat(500); // 6 KB
++    let flattened = commands_paste_text(&text);
++    assert_eq!(flattened.len(), "0123456789 ".len() * 500);
++    assert!(flattened.starts_with("0123456789 0123456789 "));
++    assert!(!flattened.contains('\n') && !flattened.contains('\r'));
++}
++
++/// A paste aimed at an agent pane travels as ONE raw input request carrying
++/// the whole text (newlines included) — never one request per character.
++#[test]
++fn paste_to_agent_pane_builds_single_raw_input_request() {
++    use agentmux_tui::input::focused_input_request;
++
++    let mut state = TuiSessionState::default();
++    state.apply_daemon_status(&json!({
++        "agents": [{ "id": "agent_01KBKX3F4SPGZ1A0JMQJEFAV7B", "name": "impl" }]
++    }));
++
++    let pasted = "line1\nline2\n";
++    let request = focused_input_request(&state, "req_input_7", pasted.as_bytes().to_vec())
++        .expect("paste forward request");
++
++    assert_eq!(request.command, IpcCommand::AgentSendInputScript);
++    let actions = request
++        .payload
++        .get("actions")
++        .and_then(Value::as_array)
++        .expect("input script actions");
++    assert_eq!(actions.len(), 1, "paste must be a single action");
++    assert_eq!(actions[0], json!({ "send_raw": pasted.as_bytes() }));
+ }
+
+ #[test]
+diff --git a/crates/agentmux-cli/src/tui.rs b/crates/agentmux-cli/src/tui.rs
+index 975e7d2..41c91fa 100644
+--- a/crates/agentmux-cli/src/tui.rs
++++ b/crates/agentmux-cli/src/tui.rs
+@@ -9,7 +9,7 @@ use agentmux_core::{AgentmuxError, error::Result};
+ use agentmux_ipc::ClientRequest;
+ use agentmux_ipc::{ClientHello, DaemonStreamFrame, JsonlReader, JsonlWriter};
+ use agentmux_tui::{
+-    input::{InputForwardError, dispatch_to_daemon_request},
++    input::{InputForwardError, dispatch_to_daemon_request, focused_input_request},
+     keymap::KeymapDispatcher,
+     layout::{PaneLayout, Rect, SplitDirection},
+     render::TuiSessionRenderer,
+@@ -20,7 +20,7 @@ use agentmux_tui::{
+     terminal::{CrosstermTerminalIo, TerminalIo, TerminalSession},
+ };
+ use crossterm::{
+-    event::{Event, KeyCode, KeyModifiers, MouseButton, MouseEventKind},
++    event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
+     terminal as crossterm_terminal,
+ };
+ use serde_json::{Value, json};
+@@ -372,6 +372,32 @@ pub(crate) async fn run_tui_session_inner(
+                     if scroll_pane_at(&mut state, cols, rows, mouse.column, mouse.row, delta) {
+                         draw_tui_frame(&mut terminal, &renderer, &state)?;
+                     }
++                } else if let Event::Paste(text) = event {
++                    let commands_pane_focused = state
++                        .layout()
++                        .focused()
++                        .is_some_and(|pane_id| state.is_commands_pane(pane_id));
++                    if commands_pane_focused {
++                        // Insert the paste at the caret in one shot; newlines
++                        // are flattened to spaces so a multi-line paste cannot
++                        // trigger Send mid-paste.
++                        state.commands_input_insert_str(&commands_paste_text(&text));
++                        draw_tui_frame(&mut terminal, &renderer, &state)?;
++                    } else if !text.is_empty() {
++                        // Forward the whole paste to the focused agent PTY as a
++                        // single raw write — never one request per character.
++                        input_sequence = input_sequence.saturating_add(1);
++                        let request_id = format!("req_input_{input_sequence}");
++                        match focused_input_request(&state, request_id, text.into_bytes()) {
++                            Ok(request) => writer.write(&request).await?,
++                            Err(InputForwardError::NoFocusedPane) => {}
++                            Err(error) => {
++                                return Err(AgentmuxError::UserError(format!(
++                                    "failed to forward paste to focused agent: {error:?}"
++                                )));
++                            }
++                        }
++                    }
+                 }
+                 continue;
+             };
+@@ -459,7 +485,7 @@ pub(crate) async fn run_tui_session_inner(
+                         | agentmux_tui::keymap::KeyDispatch::Consumed
+                 )
+             {
+-                match commands_input_key(key.code) {
++                match commands_input_key(key) {
+                     Some(CommandsInputAction::Send) => match state.parse_commands_input() {
+                         Some(CommandsSubmit::Broadcast(text)) => {
+                             let target = state.commands_target().to_string();
+@@ -498,6 +524,11 @@ pub(crate) async fn run_tui_session_inner(
+                     Some(CommandsInputAction::CycleTarget) => state.cycle_commands_target(),
+                     Some(CommandsInputAction::Clear) => state.commands_input_clear(),
+                     Some(CommandsInputAction::Backspace) => state.commands_input_backspace(),
++                    Some(CommandsInputAction::Delete) => state.commands_input_delete(),
++                    Some(CommandsInputAction::MoveLeft) => state.commands_input_move_left(),
++                    Some(CommandsInputAction::MoveRight) => state.commands_input_move_right(),
++                    Some(CommandsInputAction::MoveHome) => state.commands_input_move_home(),
++                    Some(CommandsInputAction::MoveEnd) => state.commands_input_move_end(),
+                     Some(CommandsInputAction::Insert(ch)) => state.commands_input_push(ch),
+                     None => {}
+                 }
+@@ -974,25 +1005,78 @@ pub(crate) enum CommandsInputAction {
+     CycleTarget,
+     Clear,
+     Backspace,
++    Delete,
++    MoveLeft,
++    MoveRight,
++    MoveHome,
++    MoveEnd,
+     Insert(char),
+ }
+
+-/// Map a key code to a Commands-panel input action.
++/// Map a key event to a Commands-panel input action.
+ ///
+-/// `Enter` submits, `Tab` cycles the broadcast target, `Esc` clears, `Backspace`
+-/// and `Delete` both delete the previous character (the input field has no
+-/// in-line cursor), and printable characters are inserted. Other keys are ignored.
+-pub(crate) fn commands_input_key(code: KeyCode) -> Option<CommandsInputAction> {
+-    match code {
++/// `Enter` submits, `Tab` cycles the broadcast target, `Esc` clears, and
++/// printable characters are inserted at the caret. The input field is a full
++/// in-line editor: `Left`/`Right`/`Home`/`End` move the caret, `Backspace`
++/// deletes the character before it, and `Delete` the character under it.
++/// Other keys are ignored.
++///
++/// Release notifications (terminals using the kitty keyboard protocol report
++/// them) are ignored so a key never acts twice, and — mirroring the overlay
++/// key handlers in `keymap.rs` — events carrying CONTROL or ALT never edit
++/// the buffer (e.g. `Ctrl+C` must not type a literal `c`).
++pub(crate) fn commands_input_key(key: KeyEvent) -> Option<CommandsInputAction> {
++    if key.kind == KeyEventKind::Release {
++        return None;
++    }
++    if key
++        .modifiers
++        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
++    {
++        return None;
++    }
++    match key.code {
+         KeyCode::Enter => Some(CommandsInputAction::Send),
+         KeyCode::Tab => Some(CommandsInputAction::CycleTarget),
+         KeyCode::Esc => Some(CommandsInputAction::Clear),
+-        KeyCode::Backspace | KeyCode::Delete => Some(CommandsInputAction::Backspace),
++        KeyCode::Backspace => Some(CommandsInputAction::Backspace),
++        KeyCode::Delete => Some(CommandsInputAction::Delete),
++        KeyCode::Left => Some(CommandsInputAction::MoveLeft),
++        KeyCode::Right => Some(CommandsInputAction::MoveRight),
++        KeyCode::Home => Some(CommandsInputAction::MoveHome),
++        KeyCode::End => Some(CommandsInputAction::MoveEnd),
+         KeyCode::Char(ch) => Some(CommandsInputAction::Insert(ch)),
+         _ => None,
+     }
+ }
+
++/// Normalise pasted text for the Commands input field: every line break
++/// (`\r\n`, `\n`, or bare `\r`) becomes a single space so a multi-line paste
++/// cannot trigger Send mid-paste, and every other control character except
++/// `\t` is stripped — a paste captured from terminal output can carry raw
++/// escape sequences, and inserting them into the input buffer would re-emit
++/// them through the rendered frame and corrupt the display. All remaining
++/// characters are kept verbatim.
++pub(crate) fn commands_paste_text(text: &str) -> String {
++    let mut normalized = String::with_capacity(text.len());
++    let mut chars = text.chars().peekable();
++    while let Some(ch) = chars.next() {
++        match ch {
++            '\r' => {
++                if chars.peek() == Some(&'\n') {
++                    chars.next();
++                }
++                normalized.push(' ');
++            }
++            '\n' => normalized.push(' '),
++            '\t' => normalized.push('\t'),
++            ch if ch.is_control() => {}
++            other => normalized.push(other),
++        }
++    }
++    normalized
++}
++
+ pub(crate) fn copy_mode_key_exits(code: KeyCode, modifiers: KeyModifiers) -> bool {
+     if modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+         return false;

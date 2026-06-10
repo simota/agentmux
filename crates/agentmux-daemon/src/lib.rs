@@ -22,7 +22,7 @@ pub(crate) use agentmux_context::{
     ContextBroker, ContextItem, ContextPackRequest, MailboxConfig, NewContextItem,
 };
 pub(crate) use agentmux_core::config::{
-    AutomationConfig, ContextConfig, DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
+    AgentmuxConfig, AutomationConfig, ContextConfig, DEFAULT_MESSAGE_INJECT_SEND_DELAY_MS,
     DEFAULT_MESSAGE_PASTE_ENTER_DELAY_MS, DEFAULT_RESULT_DETECTION_TAIL_BYTES,
 };
 pub(crate) use agentmux_core::{
@@ -43,7 +43,7 @@ pub(crate) use agentmux_message::{
 pub(crate) use agentmux_policy::{
     ApprovalEvent, ApprovalQueue, ApprovalQueueError, ApprovalRequest, PolicyDecision, PolicyEngine,
 };
-pub(crate) use agentmux_pty::{CTRL_C, PtyHandle, PtyReadEvent, PtySpawnSpec};
+pub(crate) use agentmux_pty::{CTRL_C, PtyExitStatus, PtyHandle, PtyReadEvent, PtySpawnSpec};
 pub(crate) use agentmux_store::{EventLog, EventLogEntry};
 pub(crate) use agentmux_terminal::TerminalParser;
 pub(crate) use agentmux_worktree::{
